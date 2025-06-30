@@ -1,0 +1,5 @@
+numpy==2.3.0
+orjson==3.10.18
+prompt_toolkit==3.0.51
+wcwidth==0.2.13
+websocket-client==1.8.0

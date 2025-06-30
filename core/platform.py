@@ -1,8 +1,9 @@
 import signal
 from pathlib import Path
-from core.registry import BinaryRegistry
+from core.global_registry import GlobalRegistry
+from core.feed_registry import FeedRegistry
 from core.writer import Writer
-from core.index import FeedIndex
+from core.index import ChunkIndex
 #from core.reader import FeedReader  # Assuming you have a reader implementation
 
 class Platform:
@@ -13,7 +14,7 @@ class Platform:
         self.base_path.mkdir(parents=True, exist_ok=True)
 
         # Binary registry instead of JSON
-        self.registry = BinaryRegistry(self.base_path)
+        self.registry = GlobalRegistry(self.base_path)
 
         # Process-local caches
         self.writers = {}
@@ -29,10 +30,10 @@ class Platform:
 
         return self.writers[feed_name]
 
-    def get_or_create_index(self, feed_name: str) -> FeedIndex:
+    def get_or_create_index(self, feed_name: str) -> ChunkIndex:
         """Get or create feed index"""
         if feed_name not in self.indexes:
-            self.indexes[feed_name] = FeedIndex(feed_name, self.base_path, create=True)
+            self.indexes[feed_name] = ChunkIndex(feed_name, 0, base_path=self.base_path, create=True)
 
         return self.indexes[feed_name]
 
