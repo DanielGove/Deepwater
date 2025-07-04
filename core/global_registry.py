@@ -14,7 +14,7 @@ class GlobalRegistry:
     HEADER_SIZE = 64  # [feed_count:8][reserved:56]
     FORMAT = '<32sQQI12x'
 
-    def __init__(self, base_path: Path, create: bool = False):
+    def __init__(self, base_path: Path):
         self.registry_path = base_path / "registry"
         self.registry_path.mkdir(parents=True, exist_ok=True)
         self.registry_file = self.registry_path / "global_registry.bin"

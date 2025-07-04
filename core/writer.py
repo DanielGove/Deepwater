@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 from multiprocessing import shared_memory
 from core.chunk import Chunk
+from core.index import ChunkIndex
+from core.feed_registry import FeedRegistry
 from utils.process import ProcessUtils
 
 class Writer:
@@ -16,6 +18,12 @@ class Writer:
         self.feed_name = feed_name
         self.config = config
         self.my_pid = ProcessUtils.get_current_pid()
+
+        # Try to resume existing feed
+        feed_exists = platform.registry.feed_exists(feed_name)
+        if not feed_exists:
+            print(f"🆕 Creating new feed '{feed_name}' (PID: {self.my_pid})")
+            self.platform.registry.register_feed(feed_name)
 
         # Extract callback before registry (functions can't be serialized)
         self.index_callback = config.pop('index_callback', None)
@@ -30,7 +38,7 @@ class Writer:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         # Registry and indexing
-        self.registry = platform.registry
+        self.registry = platform.registry.find_feed(feed_name)
         self.index = platform.get_or_create_index(feed_name)
 
         # Current chunk state

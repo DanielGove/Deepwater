@@ -47,6 +47,10 @@ class Platform:
         print(f"🛑 Received signal {signum}, shutting down...")
         self.close()
 
+    def feed_exists(self, feed_name: str) -> bool:
+        """Check if a feed exists in the registry"""
+        return self.registry.feed_exists(feed_name)
+
     def close(self):
         """Clean shutdown"""
         for writer in self.writers.values():

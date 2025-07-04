@@ -58,7 +58,7 @@ class FeedRegistry:
     
     def _init_shm(self, create: bool):
         """Initialize shared memory registry"""
-        shm_name = f"hft_reg_{self.feed_name.strip('\0')}"
+        shm_name = f"feed_reg_{self.feed_name.strip('\0')}"
         
         try:
             if create:
