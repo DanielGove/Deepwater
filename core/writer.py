@@ -37,9 +37,18 @@ class Writer:
         self.data_dir = platform.base_path / "data" / feed_name
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        # Registry and indexing
-        self.registry = platform.registry.find_feed(feed_name)
-        self.index = platform.get_or_create_index(feed_name)
+        # Registry TODO: ADD CONFIGURATION TO REGISTRY
+        if platform.registry.feed_exists(feed_name):
+            print(f"🔄 Resuming existing feed '{feed_name}' (PID: {self.my_pid})")
+            self.config = platform.registry.get_metadata(feed_name) # Standin for fetching config
+        else:
+            platform.registry.create_feed(feed_name)
+        
+        # NEEDS CONFIGURATION
+        self.registry = FeedRegistry(path=platform.base_path / "data" / feed_name / f"{feed_name}.reg", mode="w")
+
+        # will be based on the feed's CONFIGURATION
+        #self.index = platform.get_or_create_index(feed_name)
 
         # Current chunk state
         self.current_chunk = None
@@ -49,37 +58,6 @@ class Writer:
 
         # Thread safety
         self.lock = threading.Lock()
-
-        # CRITICAL: Crash recovery logic
-        self._crash_recovery_initialization()
-
-    def _crash_recovery_initialization(self):
-        """CORNERSTONE: Bulletproof crash recovery logic"""
-        print(f"🔄 Starting crash recovery for feed '{self.feed_name}' (PID: {self.my_pid})")
-
-        # Step 1: Check for existing active writer (prevent multiple writers)
-        existing_chunk_info = self.registry.find_latest_chunk(self.feed_name)
-
-        if existing_chunk_info:
-            chunk_id, location, is_shm = existing_chunk_info
-            print(f"📍 Found existing chunk {chunk_id}: {location} (SHM: {is_shm})")
-
-            if is_shm:
-                # Step 2: Try to attach to existing SHM chunk
-                if self._attempt_shm_recovery(location, chunk_id):
-                    print(f"✅ Successfully recovered SHM chunk {chunk_id}")
-                    return
-                else:
-                    print(f"⚠️  SHM chunk {chunk_id} recovery failed, creating new chunk")
-            else:
-                print(f"📁 Last chunk {chunk_id} is on disk, creating new SHM chunk")
-                self.current_chunk_id = chunk_id + 1
-        else:
-            print(f"🆕 No existing chunks found, creating first chunk")
-            self.current_chunk_id = 0
-
-        # Step 3: Create new SHM chunk
-        self._create_new_chunk()
 
     def _attempt_shm_recovery(self, chunk_name: str, chunk_id: int) -> bool:
         """Attempt to recover from existing SHM chunk"""

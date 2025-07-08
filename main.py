@@ -80,6 +80,7 @@ class FeedController:
     def subscribe_product(self, product_id: str):
         """Subscribe to a product"""
         try:
+            product_id = product_id.upper()
             self.engine.subscribe(product_id)
             self.stats['products'].add(product_id)
             print(f"📡 Subscribed to {product_id}")
@@ -90,6 +91,7 @@ class FeedController:
     def unsubscribe_product(self, product_id: str):
         """Unsubscribe from a product"""
         try:
+            product_id = product_id.upper()
             self.engine.unsubscribe(product_id)
             self.stats['products'].discard(product_id)
             print(f"📡 Unsubscribed from {product_id}")
@@ -219,7 +221,7 @@ class FeedController:
                         self.stats['l2_updates'] += orderbook.update_count
                         orderbook.update_count = 0  # Reset counter
             
-            self.stats['total_messages'] = self.engine.message_queue.qsize()
+            self.stats['total_messages'] = self.engine.msg_queue.qsize()
             
         except Exception as e:
             print(f"⚠️ Stats update error: {e}")
@@ -308,7 +310,7 @@ def control_loop():
                         print("📊 Live monitoring for 30 seconds...")
                         for i in range(30):
                             print(f"\r⏱️  {30-i}s remaining - "
-                                  f"Queue: {controller.engine.message_queue.qsize()}, "
+                                  f"Queue: {controller.engine.msg_queue.qsize()}, "
                                   f"Products: {len(controller.stats['products'])}, "
                                   f"Running: {controller.running}     ", end='')
                             time.sleep(1)

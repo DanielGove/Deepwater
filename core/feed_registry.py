@@ -205,8 +205,12 @@ class FeedRegistry:
         return range(start_idx, end_idx)
 
     def get_latest_chunk_idx(self) -> Optional[int]:
-        count = self.chunk_count
-        return count - 1 if count > 0 else None
+        return self.chunk_count - 1 if self.chunk_count > 0 else None
+    
+    def get_latest_chunk(self) -> Optional[ChunkMeta]:
+        if self.chunk_count == 0:
+            return None
+        return self.get_chunk(self.chunk_count - 1)
 
     def iter_chunk_indices(self) -> Iterator[int]:
         return range(self.chunk_count)

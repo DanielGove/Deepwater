@@ -1,11 +1,21 @@
-from websocket import create_connection, WebSocketTimeoutException, WebSocketConnectionClosedException
 import threading
-import signal
 import orjson
 import queue
 import time
+import struct
+from io import BytesIO
+from websocket import create_connection, WebSocketTimeoutException, WebSocketConnectionClosedException
 
-from .order_book import OrderBookIngestor, TradeIngestor, parse_ns_timestamp
+from core.platform import Platform
+from calendar import timegm
+
+def parse_ns_timestamp(ts: str) -> int:
+    seconds = timegm((
+        int(ts[0:4]), int(ts[5:7]), int(ts[8:10]),
+        int(ts[11:13]), int(ts[14:16]), int(ts[17:19])
+    ))
+    nanos = int(ts[20:-1].ljust(9, '0'))
+    return seconds * 1_000_000_000 + nanos
 
 class MarketDataEngine:
     def __init__(self):
@@ -18,35 +28,38 @@ class MarketDataEngine:
         self._is_running = False
         self._should_run = False
         self._ws = None
-        self._recv_thread = None
-        self._processing_thread = None
-        self.message_queue = queue.Queue()
+        self.recv_thread = None
+        self.proc_thread = None
+        self.msg_queue = queue.Queue()
 
         """ Data Management """
-        self.order_books = dict()
-        self.last_sequence_number = None
+        self.last_seq_num = None
+        self.platform = Platform()
+        self.trade_writers = {}
+        self.book_writers = {}
 
     def start(self):
         """ Start the Websocket connection """
         if not self._is_running:
             self._should_run = True
-            self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
-            self._processing_thread = threading.Thread(target=self._process_loop, daemon=True)
-            self._recv_thread.start()
-            self._processing_thread.start()
+            self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
+            self.proc_thread = threading.Thread(target=self._process_loop, daemon=True)
+            self.recv_thread.start()
+            self.proc_thread.start()
+            self._is_running = True
             print("▶️  Engine Started")
 
     def stop(self):
         """ Stop the websocket and finish processing """
-        print("⏸️  Engine Stopping...")
         self._should_run = False
-        if self._recv_thread and self._recv_thread.is_alive():
+        if self.recv_thread and self._recv_thread.is_alive():
             print("⏳ Waiting for receive thread to finish...")
-            self._recv_thread.join()
-        if self._processing_thread and self._processing_thread.is_alive():
+            self.recv_thread.join()
+        if self.proc_thread and self._processing_thread.is_alive():
             print("⏳ Waiting for processing thread to finish...")
-            self._processing_thread.join()
-        print("⏸️  Engine Stopped...")
+            self.proc_thread.join()
+        self._is_running = False
+        print("⏸️  Engine Stopped")
 
     def _recv_loop(self):
         """ Listen to the websocket and write messages to queue 
@@ -55,13 +68,8 @@ class MarketDataEngine:
             try:
                 print(f"🌐 Connecting to {self.uri}")
                 self._ws = create_connection(self.uri, max_size=None)
-                self._ws.settimeout(2)  # Set a timeout for the connection ❤️ 
-                print("🧩 Connected.")
-
-                self._ws.send(orjson.dumps({
-                    "type": "subscribe",
-                    "channel": "heartbeats"
-                }))
+                self._ws.settimeout(2)  # Set a timeout for the connection ❤️
+                self._ws.send(orjson.dumps({"type": "subscribe", "channel": "heartbeats"}))
                 print("❤️  Established Heartbeat")
 
                 if self.product_ids:
@@ -70,7 +78,7 @@ class MarketDataEngine:
                 while self._should_run:
                     try:
                         message = self._ws.recv()
-                        self.message_queue.put(message)
+                        self.msg_queue.put(message)
                     except WebSocketTimeoutException:
                         print("⏳ No message received, waiting...")
             
@@ -87,41 +95,51 @@ class MarketDataEngine:
                 if self._should_run:
                     print("🔁 Reconnecting in 5 seconds...")
                     time.sleep(5)
-    
+
     def _process_loop(self):
         """ Process messages from the queue """
-        while self._should_run or not self.message_queue.empty():
+        while self._should_run or not self.msg_queue.empty():
             try:
-                message = self.message_queue.get(timeout=1)
-                self.message_queue.task_done()
+                message = self.msg_queue.get(timeout=1)
+                self.msg_queue.task_done()
                 data = orjson.loads(message)
 
                 seq_num = data.get("sequence_num")
-                if self.last_sequence_number is None:
-                    self.last_sequence_number = seq_num
-                elif seq_num != self.last_sequence_number + 1:
-                    print(f"⚠️ Sequence gap: {self.last_sequence_number} -> {seq_num}")
-                self.last_sequence_number = seq_num
+                if self.last_seq_num is None:
+                    self.last_seq_num = seq_num
+                elif seq_num != self.last_seq_num + 1:
+                    print(f"⚠️ Sequence gap: {self.last_seq_num} -> {seq_num}")
+                self.last_seq_num = seq_num
 
                 channel = data.get("channel")
-                timestamp = data.get("timestamp")
+                timestamp = parse_ns_timestamp(data.get("timestamp"))
                 events = data.get("events")
                 
                 for event in events:
                     if channel == "l2_data":
-                        product_id = event["product_id"]
-                        if product_id not in self.order_books:
-                            self.order_books[product_id] = OrderBookIngestor(product_id)
-                        self.order_books[product_id](timestamp, event)
-
+                        pid = event["product_id"]
+                        if pid not in self.book_writers:
+                            self.book_writers[pid] = self.platform.create_feed(f"CB-L2-{pid}")
+                        for update in event.get("updates", []):
+                            ev_ns = parse_ns_timestamp(update.get("event_time"))
+                            side = b'B' if update.get("side") == "bid" else b'A'
+                            price = float(update["price_level"])
+                            qty = float(update["new_quantity"])
+                            packed = struct.pack("<cc6xQQQdd16x", b'U', side, timestamp, ev_ns, time.time_ns(), price, qty)
+                            self.book_writers[pid].write(ev_ns, packed)
                     elif channel == "market_trades":
                         trades = event["trades"]
                         for trade in trades:
-                            product_id = trade["product_id"]
-                            if product_id not in self.order_books:
-                                self.order_books[product_id] = TradeIngestor(product_id)
-                            self.order_books[product_id](timestamp, trade)
-                            print((time.time_ns()-parse_ns_timestamp(timestamp))/1000000)
+                            pid = trade["product_id"]
+                            if pid not in self.trade_writers:
+                                self.trade_writers[pid] = self.platform.create_feed(f"CB-TRADES-{pid}")
+                            ev_ns = parse_ns_timestamp(trade["time"])
+                            trade_id = int(trade["trade_id"])
+                            side = b'B' if trade["side"] == "BUY" else b'S'
+                            price = float(trade["price"])
+                            size = float(trade["size"])
+                            packed = struct.pack("<cc6xQQQQdd8x", b'T', side, trade_id, ev_ns, timestamp, time.time_ns(), price, size)
+                            self.trade_writers[pid].write(ev_ns, packed)
 
             except queue.Empty:
                 continue  # No messages to process, continue waiting
@@ -174,7 +192,7 @@ class MarketDataEngine:
         connected = "🟢 Yes" if self.is_connected() else "🔴 No"
         products = ", ".join(self.product_ids) or "🚫 None"
         channels = ", ".join(self.channels) or "🚫 None"
-        queue_size = self.message_queue.qsize()
+        queue_size = self.msg_queue.qsize()
 
         print(
             f"\n🧠 Engine Status:\n"

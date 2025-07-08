@@ -67,7 +67,7 @@ class GlobalRegistry:
         while left < right:
             mid = (left + right) // 2
             mid_name = self._read_entry(mid)[:self.FEED_NAME_LEN]
-            if mid_name < name_bytes:
+            if bytes(mid_name) < name_bytes:
                 left = mid + 1
             else:
                 right = mid
@@ -81,7 +81,7 @@ class GlobalRegistry:
             mid_entry = self._read_entry(mid)
             if mid_entry[:self.FEED_NAME_LEN] == name_bytes:
                 return mid
-            elif mid_entry[:self.FEED_NAME_LEN] < name_bytes:
+            elif bytes(mid_entry[:self.FEED_NAME_LEN]) < name_bytes:
                 left = mid + 1
             else:
                 right = mid - 1
