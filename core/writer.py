@@ -11,8 +11,6 @@ from core.feed_registry import FeedRegistry
 from utils.process import ProcessUtils
 
 class Writer:
-    """Writer with bulletproof crash recovery"""
-
     def __init__(self, platform, feed_name: str, config: dict):
         self.platform = platform
         self.feed_name = feed_name
@@ -23,7 +21,17 @@ class Writer:
         feed_exists = platform.registry.feed_exists(feed_name)
         if not feed_exists:
             print(f"🆕 Creating new feed '{feed_name}' (PID: {self.my_pid})")
-            self.platform.registry.register_feed(feed_name)
+            self.platform.registry.register_feed(feed_name, config)
+        else:
+            print(f"🔄 Resuming existing feed '{feed_name}' (PID: {self.my_pid})")
+            self.config = platform.registry.get_metadata(feed_name)
+
+        # TODO: NEEDS CONFIGURATION
+        self.registry = FeedRegistry(path=platform.base_path / "data" / feed_name / f"{feed_name}.reg", mode="w")
+
+        # will be based on the feed's CONFIGURATION
+        #self.index = platform.get_or_create_index(feed_name)
+
 
         # Extract callback before registry (functions can't be serialized)
         self.index_callback = config.pop('index_callback', None)
@@ -172,46 +180,38 @@ class Writer:
         except Exception as e:
             raise RuntimeError(f"Failed to create chunk: {e}")
 
-    def write(self, timestamp: int, data: Union[bytes, np.ndarray], force_index: bool = False) -> int:
-        """ATOMIC record writing with crash recovery support"""
-        with self.lock:
-            # Convert data to bytes
-            if isinstance(data, np.ndarray):
-                record_data = data.tobytes()
-            else:
-                record_data = bytes(data)
+    def write(self, timestamp: int, record_data: bytes, force_index: bool = False) -> int:
+        """ Fast path record writing """
+        record_size = len(record_data)
 
-            # Calculate total record size: timestamp(8) + length(4) + data
-            record_size = 12 + len(record_data)
+        # Check if need new chunk
+        if record_size > self.current_chunk.available_space():
+            self._rotate_chunk()
 
-            # Check if need new chunk
-            if record_size > self.current_chunk.available_space():
-                self._rotate_chunk()
+        # ATOMIC OPERATION: All-or-nothing record write
+        position = self.write_position
 
-            # ATOMIC OPERATION: All-or-nothing record write
-            position = self.write_position
+        # 1. Write record data to chunk
+        header = struct.pack('<QI', timestamp, len(record_data))
+        record_bytes = header + record_data
 
-            # 1. Write record data to chunk
-            header = struct.pack('<QI', timestamp, len(record_data))
-            record_bytes = header + record_data
+        new_position = self.current_chunk.write_bytes(position, record_bytes)
 
-            new_position = self.current_chunk.write_bytes(position, record_bytes)
+        # 2. Update chunk metadata atomically
+        self.current_chunk.header.write_pos = new_position
+        self.current_chunk.header.record_count += 1
+        self.current_chunk.header.end_time = timestamp
+        self.current_chunk.header.last_update = time.time_ns()
 
-            # 2. Update chunk metadata atomically
-            self.current_chunk.header.write_pos = new_position
-            self.current_chunk.header.record_count += 1
-            self.current_chunk.header.end_time = timestamp
-            self.current_chunk.header.last_update = time.time_ns()
+        # 3. Update index if needed (based on feed callback)
+        if force_index or (self.index_callback and self.index_callback(memoryview(record_data), timestamp)):
+            self.index.add_entry(timestamp, self.current_chunk_id, position, 1 if force_index else 0)
 
-            # 3. Update index if needed (based on feed callback)
-            if force_index or (self.index_callback and self.index_callback(memoryview(record_data), timestamp)):
-                self.index.add_entry(timestamp, self.current_chunk_id, position, 1 if force_index else 0)
+        # Update local state
+        self.write_position = new_position
+        self.total_records += 1
 
-            # Update local state
-            self.write_position = new_position
-            self.total_records += 1
-
-            return self.total_records
+        return self.total_records
 
     def _rotate_chunk(self):
         """Atomic chunk rotation"""
@@ -241,32 +241,31 @@ class Writer:
 
     def close(self):
         """Clean shutdown with ownership release"""
-        with self.lock:
-            print(f"🛑 Shutting down writer for '{self.feed_name}' (PID: {self.my_pid})")
+        print(f"🛑 Shutting down writer for '{self.feed_name}' (PID: {self.my_pid})")
 
-            if self.current_chunk:
-                # Release ownership before closing
-                self.current_chunk.header.owner_pid = 0
-                self.current_chunk.header.last_update = time.time_ns()
+        if self.current_chunk:
+            # Release ownership before closing
+            self.current_chunk.header.owner_pid = 0
+            self.current_chunk.header.last_update = time.time_ns()
 
-                if self.persist:
-                    try:
-                        file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
-                        self.current_chunk.persist_to_disk(str(file_path))
-
-                        self.registry.register_chunk(
-                            self.feed_name,
-                            self.current_chunk_id,
-                            str(file_path),
-                            False
-                        )
-                        print(f"💾 Final persist of chunk {self.current_chunk_id}")
-                    except Exception as e:
-                        print(f"⚠️  Could not persist final chunk: {e}")
-
+            if self.persist:
                 try:
-                    self.current_chunk.close()
-                    if self.current_chunk.is_shm:
-                        self.current_chunk.unlink()
+                    file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
+                    self.current_chunk.persist_to_disk(str(file_path))
+
+                    self.registry.register_chunk(
+                        self.feed_name,
+                        self.current_chunk_id,
+                        str(file_path),
+                        False
+                    )
+                    print(f"💾 Final persist of chunk {self.current_chunk_id}")
                 except Exception as e:
-                    print(f"⚠️  Could not close chunk: {e}")
+                    print(f"⚠️  Could not persist final chunk: {e}")
+
+            try:
+                self.current_chunk.close()
+                if self.current_chunk.is_shm:
+                    self.current_chunk.unlink()
+            except Exception as e:
+                print(f"⚠️  Could not close chunk: {e}")
