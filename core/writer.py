@@ -15,112 +15,64 @@ class Writer:
         self.platform = platform
         self.feed_name = feed_name
         self.config = config
+        self.current_chunk_meta = None
         self.my_pid = ProcessUtils.get_current_pid()
 
-        # Try to resume existing feed
-        feed_exists = platform.registry.feed_exists(feed_name)
-        if not feed_exists:
-            print(f"🆕 Creating new feed '{feed_name}' (PID: {self.my_pid})")
-            self.platform.registry.register_feed(feed_name, config)
-        else:
-            print(f"🔄 Resuming existing feed '{feed_name}' (PID: {self.my_pid})")
-            self.config = platform.registry.get_metadata(feed_name)
 
-        # TODO: NEEDS CONFIGURATION
-        self.registry = FeedRegistry(path=platform.base_path / "data" / feed_name / f"{feed_name}.reg", mode="w")
-
-        # will be based on the feed's CONFIGURATION
-        #self.index = platform.get_or_create_index(feed_name)
-
-
-        # Extract callback before registry (functions can't be serialized)
-        self.index_callback = config.pop('index_callback', None)
-
-        # Configuration
-        self.chunk_size = config.get('chunk_size_mb', 64) * 1024 * 1024
-        self.retention_hours = config.get('retention_hours', 24)
-        self.persist = config.get('persist', True)
-
-        # Directory setup
-        self.data_dir = platform.base_path / "data" / feed_name
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-
-        # Registry TODO: ADD CONFIGURATION TO REGISTRY
-        if platform.registry.feed_exists(feed_name):
-            print(f"🔄 Resuming existing feed '{feed_name}' (PID: {self.my_pid})")
-            self.config = platform.registry.get_metadata(feed_name) # Standin for fetching config
-        else:
-            platform.registry.create_feed(feed_name)
-        
-        # NEEDS CONFIGURATION
-        self.registry = FeedRegistry(path=platform.base_path / "data" / feed_name / f"{feed_name}.reg", mode="w")
-
-        # will be based on the feed's CONFIGURATION
-        #self.index = platform.get_or_create_index(feed_name)
-
-        # Current chunk state
-        self.current_chunk = None
-        self.current_chunk_id = 0
-        self.write_position = 0
-        self.total_records = 0
-
-        # Thread safety
-        self.lock = threading.Lock()
-
-    def _attempt_shm_recovery(self, chunk_name: str, chunk_id: int) -> bool:
-        """Attempt to recover from existing SHM chunk"""
         try:
-            # Try to attach to existing SHM
-            chunk = Chunk(chunk_name, self.chunk_size, create=False)
+            # Try to resume existing feed
+            feed_exists = platform.registry.feed_exists(feed_name)
+            if not feed_exists:
+                print(f"🆕 Creating new feed '{feed_name}' (PID: {self.my_pid})")
+                self.platform.register_feed(feed_name, config)
 
-            # Step 2a: Validate chunk integrity
-            if not chunk.header.validate_checksum():
-                print(f"❌ Chunk {chunk_id} failed checksum validation")
-                chunk.close()
-                return False
-
-            # Step 2b: Check current owner
-            current_owner = chunk.header.owner_pid
-
-            if current_owner == 0:
-                # No owner, take it
-                print(f"🔓 Chunk {chunk_id} has no owner, taking ownership")
-            elif current_owner == self.my_pid:
-                # Already owned by us (restart of same process)
-                print(f"🔄 Chunk {chunk_id} already owned by us")
-            elif ProcessUtils.is_process_alive(current_owner):
-                # Active owner exists, fail
-                print(f"❌ Chunk {chunk_id} owned by active process {current_owner}")
-                chunk.close()
-                raise RuntimeError(f"Chunk owned by active process {current_owner}")
+                # TODO: NEEDS CONFIGURATION
+                self.registry = FeedRegistry(path=platform.base_path / "data" / feed_name / f"{feed_name}.reg", mode="w")
             else:
-                # Dead owner, take over
-                print(f"💀 Taking over chunk {chunk_id} from dead process {current_owner}")
+                print(f"🔄 Resuming existing feed '{feed_name}' (PID: {self.my_pid})")
+                self.config = platform.registry.get_metadata(feed_name)
 
-            # Step 2c: Take ownership
-            chunk.header.owner_pid = self.my_pid
-            chunk.header.last_update = time.time_ns()
+                # TODO: NEEDS CONFIGURATION
+                self.registry = FeedRegistry(path=platform.base_path / "data" / feed_name / f"{feed_name}.reg", mode="w")
+                self.current_chunk_meta = self.registry.get_latest_chunk()
 
-            # Step 2d: Find last valid record position
-            valid_position = self._find_last_valid_record(chunk)
+            # will be based on the feed's CONFIGURATION
+            #self.index = platform.get_or_create_index(feed_name)
 
-            if valid_position < chunk.header.write_pos:
-                print(f"🔧 Corrected write position from {chunk.header.write_pos} to {valid_position}")
-                chunk.header.write_pos = valid_position
+            # Extract callback before registry (functions can't be serialized)
+            self.index_callback = config.pop('index_callback', None)
 
-            # Step 2e: Resume from exact position
-            self.current_chunk = chunk
-            self.current_chunk_id = chunk_id
-            self.write_position = chunk.header.write_pos
+            # Configuration
+            self.chunk_size = config.get('chunk_size_mb', 64) * 1024 * 1024
+            self.retention_hours = config.get('retention_hours', 24)
+            self.persist = config.get('persist', True)
 
-            print(f"🎯 Resumed at chunk {chunk_id}, position {self.write_position}, "
-                  f"record count {chunk.header.record_count}")
+            # Directory setup
+            self.data_dir = platform.base_path / "data" / feed_name
+            self.data_dir.mkdir(parents=True, exist_ok=True)
 
-            return True
+            # Start up with a new chunk
+            self._create_new_chunk()
 
+            
+            # will be based on the feed's CONFIGURATION
+            #self.index = platform.get_or_create_index(feed_name)
+        
         except Exception as e:
-            print(f"❌ SHM recovery failed: {e}")
-            return False
+            # Defensive cleanup if FeedRegistry itself partly initialized
+            if hasattr(self, "registry") and self.registry is not None:
+                try:
+                    self.registry.close()
+                except Exception:
+                    pass
+
+            if hasattr(self, "current_chunk") and self.current_chunk is not None:
+                try:
+                    self.current_chunk.unlink()
+                except Exception:
+                    pass   
+            
+            raise
 
     def _find_last_valid_record(self, chunk) -> int:
         """Find the last valid record position in chunk"""
@@ -154,28 +106,36 @@ class Writer:
 
     def _create_new_chunk(self):
         """Create new SHM chunk with ownership"""
-        chunk_name = f"{self.feed_name}-{self.current_chunk_id}"
+
+        if self.current_chunk_meta is not None:
+            new_chunk_id = self.current_chunk_meta.chunk_id
+        else:
+            new_chunk_id = 1
+
+        chunk_name = f"{self.feed_name}-{new_chunk_id:08d}"
 
         try:
             self.current_chunk = Chunk(chunk_name, self.chunk_size, create=True)
+            self._write_pos = self.current_chunk.header.write_pos_view()
 
             # Initialize ownership and times
             now = time.time_ns()
+            self._write_pos[0] = self.current_chunk.header.SIZE
             self.current_chunk.header.owner_pid = self.my_pid
             self.current_chunk.header.start_time = now
-            self.current_chunk.header.end_time = now
+            self.current_chunk.header.end_time = 0
             self.current_chunk.header.last_update = now
 
             # Register with registry
             self.registry.register_chunk(
-                self.feed_name,
-                self.current_chunk_id,
-                chunk_name,
-                True
+                now,
+                0,
+                new_chunk_id,
+                self.chunk_size,
+                0
             )
-
-            self.write_position = 0
-            print(f"✨ Created new SHM chunk {self.current_chunk_id} (PID: {self.my_pid})")
+            
+            print(f"✨ Created new SHM chunk {new_chunk_id} (PID: {self.my_pid})")
 
         except Exception as e:
             raise RuntimeError(f"Failed to create chunk: {e}")
@@ -189,29 +149,25 @@ class Writer:
             self._rotate_chunk()
 
         # ATOMIC OPERATION: All-or-nothing record write
-        position = self.write_position
 
         # 1. Write record data to chunk
         header = struct.pack('<QI', timestamp, len(record_data))
         record_bytes = header + record_data
 
-        new_position = self.current_chunk.write_bytes(position, record_bytes)
+        new_position = self.current_chunk.write_bytes(self._write_pos[0], record_bytes)
 
         # 2. Update chunk metadata atomically
-        self.current_chunk.header.write_pos = new_position
+        self._write_pos[0] = new_position
         self.current_chunk.header.record_count += 1
         self.current_chunk.header.end_time = timestamp
         self.current_chunk.header.last_update = time.time_ns()
 
         # 3. Update index if needed (based on feed callback)
         if force_index or (self.index_callback and self.index_callback(memoryview(record_data), timestamp)):
-            self.index.add_entry(timestamp, self.current_chunk_id, position, 1 if force_index else 0)
+            self.index.add_entry(timestamp, self.current_chunk_id, self._write_pos[0], 1 if force_index else 0)
 
         # Update local state
-        self.write_position = new_position
-        self.total_records += 1
-
-        return self.total_records
+        return self._write_pos[0]
 
     def _rotate_chunk(self):
         """Atomic chunk rotation"""

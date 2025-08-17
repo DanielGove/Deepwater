@@ -19,6 +19,10 @@ class ChunkHeader:
     def write_pos(self) -> int:
         return int(self._header[0])
 
+    def write_pos_view(self) -> memoryview:
+        """Direct 8-byte view into write_pos (little-endian)"""
+        return memoryview(self.buffer)[0:8].cast("Q")
+
     @write_pos.setter
     def write_pos(self, value: int):
         self._header[0] = value
@@ -117,40 +121,24 @@ class Chunk:
             self.buffer = memoryview(self.shm.buf)
             self.is_shm = True
 
-        # Header management
         self.header = ChunkHeader(self.buffer)
-        self.data_offset = ChunkHeader.SIZE
-        self.data_size = size - self.data_offset
-
-        # Initialize header if creating
-        if create and not file_path:
-            self.header.write_pos = 0
-            self.header.record_count = 0
-            self.header.start_time = 0
-            self.header.end_time = 0
-            self.header.owner_pid = 0
-            self.header.last_update = 0
 
     def write_bytes(self, position: int, data: bytes) -> int:
         """Write bytes and return new position"""
-        if position + len(data) > self.data_size:
+        if position + len(data) > self.size:
             raise ValueError(f"Write would exceed chunk capacity")
-
-        offset = self.data_offset + position
-        self.buffer[offset:offset + len(data)] = data
+        self.buffer[position:position + len(data)] = data
         return position + len(data)
 
     def read_bytes(self, position: int, length: int) -> bytes:
         """Read bytes from chunk"""
-        if position + length > self.data_size:
+        if position + length > self.size:
             raise ValueError(f"Read would exceed chunk capacity")
-
-        offset = self.data_offset + position
-        return bytes(self.buffer[offset:offset + length])
+        return bytes(self.buffer[position:position + length])
 
     def available_space(self) -> int:
         """Available space for writing"""
-        return self.data_size - self.header.write_pos
+        return self.size - self.header.write_pos
 
     def persist_to_disk(self, path: str):
         """Save SHM chunk to disk file"""

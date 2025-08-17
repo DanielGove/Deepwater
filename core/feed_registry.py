@@ -23,16 +23,18 @@ CHUNK_START_OFFSET = 0
 CHUNK_END_OFFSET = 8
 CHUNK_ID_OFFSET = 16
 CHUNK_SIZE_OFFSET = 24
-CHUNK_STATUS_OFFSET = 32
+CHUNK_WRITE_POS_OFFSET = 32
+CHUNK_STATUS_OFFSET = 40
 
 class ChunkMeta:
     __slots__ = ("start_time", "end_time", "chunk_id", "size", "status")
 
-    def __init__(self, start_time: int, end_time: int, chunk_id: int, size: int, status: int):
+    def __init__(self, start_time: int, end_time: int, chunk_id: int, size: int, write_position: int, status: int):
         self.start_time = start_time
         self.end_time = end_time
         self.chunk_id = chunk_id
         self.size = size
+        self.write_position = write_position
         self.status = status
 
 class FeedRegistry:
@@ -46,8 +48,7 @@ class FeedRegistry:
 
         total_size = HEADER_SIZE + (max_chunks << 6)
 
-        flags = os.O_RDWR | os.O_CREAT
-        self.fd = os.open(path, flags)
+        self.fd = os.open(path, os.O_RDWR | os.O_CREAT)
 
         if self.is_writer:
             try:
@@ -90,26 +91,19 @@ class FeedRegistry:
                 raise IndexError(f"Registry at maximum size: {self.max_chunks}")
             new_max = min(self.max_chunks * 2, 1048576)  # Double it, cap at 1M
             self._resize_file(new_max)
-
-        if chunk_id is None or size is None or status is None:
-            def_size = int.from_bytes(self._mv[8:16], 'little')
-            def_chunk_id = int.from_bytes(self._mv[16:24], 'little')
-            def_status = self._mv[24]
-            chunk_id = chunk_id or def_chunk_id
-            size = size or def_size
-            status = status or def_status
-
+        
         offset = HEADER_SIZE + (count << 6)
         self._mv[offset + CHUNK_START_OFFSET:offset + CHUNK_END_OFFSET] = start_time.to_bytes(8, 'little')
         self._mv[offset + CHUNK_END_OFFSET:offset + CHUNK_ID_OFFSET] = end_time.to_bytes(8, 'little')
         self._mv[offset + CHUNK_ID_OFFSET:offset + CHUNK_SIZE_OFFSET] = chunk_id.to_bytes(8, 'little')
-        self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_STATUS_OFFSET] = size.to_bytes(8, 'little')
+        self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_WRITE_POS_OFFSET] = size.to_bytes(8, 'little')
+        self._mv[offset + CHUNK_WRITE_POS_OFFSET:offset + CHUNK_STATUS_OFFSET] = b'\x00\x00\x00\x00\x00\x00\x00\x00'
         self._mv[offset + CHUNK_STATUS_OFFSET] = status
 
         new_count = count + 1
         self._mv[0:8] = new_count.to_bytes(8, 'little')
 
-        return count
+        return new_count
     
     def _resize_file(self, new_max_chunks: int):
         """Resize file and remap for writer. Readers will handle this separately."""
@@ -148,9 +142,10 @@ class FeedRegistry:
         start = int.from_bytes(self._mv[offset + CHUNK_START_OFFSET:offset + CHUNK_END_OFFSET], 'little')
         end = int.from_bytes(self._mv[offset + CHUNK_END_OFFSET:offset + CHUNK_ID_OFFSET], 'little')
         chunk_id = int.from_bytes(self._mv[offset + CHUNK_ID_OFFSET:offset + CHUNK_SIZE_OFFSET], 'little')
-        size = int.from_bytes(self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_STATUS_OFFSET], 'little')
+        size = int.from_bytes(self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_WRITE_POS_OFFSET], 'little')
+        write_pos = int.from_bytes(self._mv[offset + CHUNK_WRITE_POS_OFFSET:offset + CHUNK_STATUS_OFFSET], 'little')
         status = self._mv[offset + CHUNK_STATUS_OFFSET]
-        return ChunkMeta(start, end, chunk_id, size, status)
+        return ChunkMeta(start, end, chunk_id, size, write_pos, status)
 
     def _binary_search_start_time(self, target_time: int) -> int:
         left, right = 0, self.chunk_count
@@ -225,6 +220,14 @@ class FeedRegistry:
             raise PermissionError("Read-only mode")
         offset = HEADER_SIZE + (index << 6) + CHUNK_STATUS_OFFSET
         self._mv[offset] = status
+
+    def increment_chunk_write_position(self, index: int, increment: int):
+        if not self.is_writer:
+            raise PermissionError("Read-only mode")
+        offset = HEADER_SIZE + (index << 6) + CHUNK_WRITE_POS_OFFSET
+        current_pos = int.from_bytes(self._mv[offset:offset+8], 'little')
+        new_pos = current_pos + increment
+        self._mv[offset:offset+8] = new_pos.to_bytes(8, 'little')
 
     def find_chunk_by_id(self, chunk_id: int) -> Optional[int]:
         count = self.chunk_count

@@ -90,7 +90,7 @@ class GlobalRegistry:
     def feed_exists(self, name: str) -> bool:
         return self._find_feed_idx(name) is not None
 
-    def register_feed(self, name: str) -> bool:
+    def register_feed(self, name: str, config: dict) -> bool:
         self._lock()
         try:
             if self.feed_exists(name):

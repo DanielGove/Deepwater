@@ -25,10 +25,14 @@ class Platform:
 
     def create_feed(self, feed_name: str, **config) -> Writer:
         """Create or get feed writer with crash recovery"""
-        if feed_name not in self.writers:
-            self.writers[feed_name] = Writer(self, feed_name, config)
+        return Writer(self, feed_name, config)
+    
+    def register_feed(self, feed_name: str, config: dict):
+        self.registry.register_feed(feed_name, config)
 
-        return self.writers[feed_name]
+        # Create the directory for the feed
+        feed_dir = self.base_path / "data" / feed_name
+        feed_dir.mkdir(parents=True, exist_ok=True)
 
     def get_or_create_index(self, feed_name: str) -> ChunkIndex:
         """Get or create feed index"""

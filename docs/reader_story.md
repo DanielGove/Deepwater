@@ -6,7 +6,7 @@ This story describes how a reader process discovers a feed, accesses its registr
 
 ---
 
-## Components Used
+## Components Used``
 
 | Component           | Location                         | Description                                                                  |
 | ------------------- | -------------------------------- | ---------------------------------------------------------------------------- |

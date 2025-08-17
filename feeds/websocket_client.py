@@ -141,8 +141,8 @@ class MarketDataEngine:
                             packed = struct.pack("<cc6xQQQQdd8x", b'T', side, trade_id, ev_ns, timestamp, time.time_ns(), price, size)
                             self.trade_writers[pid].write(ev_ns, packed)
 
-            except queue.Empty:
-                continue  # No messages to process, continue waiting
+            # except queue.Empty:
+            #     continue  # No messages to process, continue waiting
             except Exception as e:
                 print(f"🚫 Processing error: {e}")
 
