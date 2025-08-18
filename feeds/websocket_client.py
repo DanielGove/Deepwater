@@ -3,7 +3,6 @@ import orjson
 import queue
 import time
 import struct
-from io import BytesIO
 from websocket import create_connection, WebSocketTimeoutException, WebSocketConnectionClosedException
 
 from core.platform import Platform
@@ -52,12 +51,16 @@ class MarketDataEngine:
     def stop(self):
         """ Stop the websocket and finish processing """
         self._should_run = False
-        if self.recv_thread and self._recv_thread.is_alive():
+        if self.recv_thread and self.recv_thread.is_alive():
             print("⏳ Waiting for receive thread to finish...")
             self.recv_thread.join()
-        if self.proc_thread and self._processing_thread.is_alive():
+        if self.proc_thread and self.proc_thread.is_alive():
             print("⏳ Waiting for processing thread to finish...")
             self.proc_thread.join()
+        for writer in self.trade_writers.values():
+            writer.close()
+        for writer in self.book_writers.values():
+            writer.close()
         self._is_running = False
         print("⏸️  Engine Stopped")
 
@@ -125,7 +128,7 @@ class MarketDataEngine:
                             side = b'B' if update.get("side") == "bid" else b'A'
                             price = float(update["price_level"])
                             qty = float(update["new_quantity"])
-                            packed = struct.pack("<cc6xQQQdd16x", b'U', side, timestamp, ev_ns, time.time_ns(), price, qty)
+                            packed = struct.pack("<cc6xQQQdd4x", b'U', side, timestamp, ev_ns, time.time_ns(), price, qty)
                             self.book_writers[pid].write(ev_ns, packed)
                     elif channel == "market_trades":
                         trades = event["trades"]
@@ -138,7 +141,7 @@ class MarketDataEngine:
                             side = b'B' if trade["side"] == "BUY" else b'S'
                             price = float(trade["price"])
                             size = float(trade["size"])
-                            packed = struct.pack("<cc6xQQQQdd8x", b'T', side, trade_id, ev_ns, timestamp, time.time_ns(), price, size)
+                            packed = struct.pack("<2xccQQQQdd", b'T', side, trade_id, ev_ns, timestamp, time.time_ns(), price, size)
                             self.trade_writers[pid].write(ev_ns, packed)
 
             # except queue.Empty:

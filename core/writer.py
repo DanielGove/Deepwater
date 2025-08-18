@@ -1,10 +1,6 @@
-import threading
 import time
 import struct
-from typing import Union, Optional, Tuple
 from pathlib import Path
-import numpy as np
-from multiprocessing import shared_memory
 from core.chunk import Chunk
 from core.index import ChunkIndex
 from core.feed_registry import FeedRegistry
@@ -17,7 +13,6 @@ class Writer:
         self.config = config
         self.current_chunk_meta = None
         self.my_pid = ProcessUtils.get_current_pid()
-
 
         try:
             # Try to resume existing feed
@@ -36,8 +31,7 @@ class Writer:
                 self.registry = FeedRegistry(path=platform.base_path / "data" / feed_name / f"{feed_name}.reg", mode="w")
                 self.current_chunk_meta = self.registry.get_latest_chunk()
 
-            # will be based on the feed's CONFIGURATION
-            #self.index = platform.get_or_create_index(feed_name)
+            # self.index = platform.get_or_create_index(feed_name)
 
             # Extract callback before registry (functions can't be serialized)
             self.index_callback = config.pop('index_callback', None)
@@ -54,10 +48,7 @@ class Writer:
             # Start up with a new chunk
             self._create_new_chunk()
 
-            
-            # will be based on the feed's CONFIGURATION
-            #self.index = platform.get_or_create_index(feed_name)
-        
+
         except Exception as e:
             # Defensive cleanup if FeedRegistry itself partly initialized
             if hasattr(self, "registry") and self.registry is not None:
@@ -73,12 +64,12 @@ class Writer:
                     pass   
             
             raise
-
+    
     def _find_last_valid_record(self, chunk) -> int:
         """Find the last valid record position in chunk"""
         position = 0
 
-        while position < chunk.header.write_pos:
+        while position < self._write_pos[0]:
             try:
                 # Try to read record header
                 if position + 12 > chunk.data_size:
@@ -89,7 +80,7 @@ class Writer:
 
                 # Validate record
                 total_len = 12 + data_len
-                if position + total_len > chunk.header.write_pos:
+                if position + total_len > self._write_pos[0]:
                     # Incomplete record, this is where we should resume
                     break
 
@@ -108,7 +99,7 @@ class Writer:
         """Create new SHM chunk with ownership"""
 
         if self.current_chunk_meta is not None:
-            new_chunk_id = self.current_chunk_meta.chunk_id
+            new_chunk_id = self.current_chunk_meta.chunk_id + 1
         else:
             new_chunk_id = 1
 
@@ -116,15 +107,20 @@ class Writer:
 
         try:
             self.current_chunk = Chunk(chunk_name, self.chunk_size, create=True)
-            self._write_pos = self.current_chunk.header.write_pos_view()
+            self._write_pos = self.current_chunk.header.write_pos
+            self._record_count = self.current_chunk.header.record_cnt
+            self._start_time = self.current_chunk.header.start_time
+            self._end_time = self.current_chunk.header.end_time
+            self._last_update = self.current_chunk.header.last_update
+            self._owner_pid = self.current_chunk.header.owner_pid
 
             # Initialize ownership and times
             now = time.time_ns()
             self._write_pos[0] = self.current_chunk.header.SIZE
-            self.current_chunk.header.owner_pid = self.my_pid
-            self.current_chunk.header.start_time = now
-            self.current_chunk.header.end_time = 0
-            self.current_chunk.header.last_update = now
+            self._owner_pid[0] = self.my_pid
+            self._start_time[0] = now
+            self._end_time[0] = 0
+            self._last_update[0] = 0
 
             # Register with registry
             self.registry.register_chunk(
@@ -158,9 +154,8 @@ class Writer:
 
         # 2. Update chunk metadata atomically
         self._write_pos[0] = new_position
-        self.current_chunk.header.record_count += 1
-        self.current_chunk.header.end_time = timestamp
-        self.current_chunk.header.last_update = time.time_ns()
+        self._record_count[0] += 1
+        self._last_update[0] = timestamp
 
         # 3. Update index if needed (based on feed callback)
         if force_index or (self.index_callback and self.index_callback(memoryview(record_data), timestamp)):
@@ -176,19 +171,19 @@ class Writer:
             file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
             self.current_chunk.persist_to_disk(str(file_path))
 
-            # Update registry
-            self.registry.register_chunk(
-                self.feed_name,
-                self.current_chunk_id,
-                str(file_path),
-                False
-            )
+            # # Update registry
+            # self.registry.register_chunk(
+            #     self.feed_name,
+            #     self.current_chunk_id,
+            #     str(file_path),
+            #     False
+            # )
 
             print(f"💾 Persisted chunk {self.current_chunk_id} to {file_path}")
 
         # Close current chunk and release ownership
         if self.current_chunk:
-            self.current_chunk.header.owner_pid = 0  # Release ownership
+            self._owner_pid[0] = 0  # Release ownership
             self.current_chunk.close()
 
         # Create new chunk
@@ -201,27 +196,26 @@ class Writer:
 
         if self.current_chunk:
             # Release ownership before closing
-            self.current_chunk.header.owner_pid = 0
-            self.current_chunk.header.last_update = time.time_ns()
+            self._owner_pid[0]  = 0
+            self._end_time = time.time_ns
 
             if self.persist:
                 try:
-                    file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
+                    file_path = self.data_dir / f"{self.current_chunk.name}.dat"
                     self.current_chunk.persist_to_disk(str(file_path))
 
-                    self.registry.register_chunk(
-                        self.feed_name,
-                        self.current_chunk_id,
-                        str(file_path),
-                        False
-                    )
-                    print(f"💾 Final persist of chunk {self.current_chunk_id}")
+                    # TODO: Update registry with the latest chunk whatever
+
+                    print(f"💾 Final persist of chunk {self.current_chunk.name}")
                 except Exception as e:
                     print(f"⚠️  Could not persist final chunk: {e}")
 
             try:
                 self.current_chunk.close()
-                if self.current_chunk.is_shm:
-                    self.current_chunk.unlink()
             except Exception as e:
                 print(f"⚠️  Could not close chunk: {e}")
+        
+        try:
+            self.registry.close()
+        except Exception as e:
+            print(f"⚠️  Could not close registry: {e}")

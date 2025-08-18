@@ -27,7 +27,7 @@ CHUNK_WRITE_POS_OFFSET = 32
 CHUNK_STATUS_OFFSET = 40
 
 class ChunkMeta:
-    __slots__ = ("start_time", "end_time", "chunk_id", "size", "status")
+    __slots__ = ("start_time", "end_time", "chunk_id", "size", "write_position", "status")
 
     def __init__(self, start_time: int, end_time: int, chunk_id: int, size: int, write_position: int, status: int):
         self.start_time = start_time
@@ -46,9 +46,11 @@ class FeedRegistry:
         self.max_chunks = max_chunks
         self.is_writer = (mode == "w")
 
-        total_size = HEADER_SIZE + (max_chunks << 6)
+        desired_size = HEADER_SIZE + (max_chunks << 6)
+        already_exists = os.path.exists(path)
 
         self.fd = os.open(path, os.O_RDWR | os.O_CREAT)
+        current_size = os.fstat(self.fd).st_size
 
         if self.is_writer:
             try:
@@ -56,17 +58,22 @@ class FeedRegistry:
             except BlockingIOError:
                 raise RuntimeError("Feed registry locked by another writer")
 
-            os.posix_fallocate(self.fd, 0, total_size)
+            if current_size < desired_size:
+                os.posix_fallocate(self.fd, 0, desired_size)
+                current_size = desired_size
 
-            if os.fstat(self.fd).st_size == total_size:
+            if (not already_exists) or current_size == 0:
                 header_data = HEADER_STRUCT.pack(0, default_size, default_chunk_id, default_status)
                 os.pwrite(self.fd, header_data, 0)
+                current_size = desired_size
 
-        self.mm = mmap.mmap(self.fd, total_size, mmap.MAP_SHARED,
+        self.mm = mmap.mmap(self.fd, current_size, mmap.MAP_SHARED,
                             mmap.PROT_WRITE | mmap.PROT_READ)
         self._mv = memoryview(self.mm)
 
     def close(self):
+        self._mv.release()
+        self.mm.flush()
         self.mm.close()
         os.close(self.fd)
 
@@ -102,7 +109,7 @@ class FeedRegistry:
 
         new_count = count + 1
         self._mv[0:8] = new_count.to_bytes(8, 'little')
-
+        self.mm.flush()
         return new_count
     
     def _resize_file(self, new_max_chunks: int):

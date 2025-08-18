@@ -10,87 +10,27 @@ class ChunkHeader:
     #         owner_pid(8) + last_update(8) + checksum(8) + reserved(16) = 64 bytes
     SIZE = 64
 
-    def __init__(self, buffer: memoryview, offset: int = 0):
-        self.buffer = buffer
-        self.offset = offset
-        self._header = np.frombuffer(buffer[offset:offset + self.SIZE], dtype=np.int64)
+    __slots__ = (
+        "write_pos", "record_cnt", "start_time",
+        "end_time", "owner_pid", "last_update",
+    )
 
-    @property
-    def write_pos(self) -> int:
-        return int(self._header[0])
-
-    def write_pos_view(self) -> memoryview:
-        """Direct 8-byte view into write_pos (little-endian)"""
-        return memoryview(self.buffer)[0:8].cast("Q")
-
-    @write_pos.setter
-    def write_pos(self, value: int):
-        self._header[0] = value
-        self._update_checksum()
-
-    @property
-    def record_count(self) -> int:
-        return int(self._header[1])
-
-    @record_count.setter
-    def record_count(self, value: int):
-        self._header[1] = value
-        self._update_checksum()
-
-    @property
-    def start_time(self) -> int:
-        return int(self._header[2])
-
-    @start_time.setter
-    def start_time(self, value: int):
-        self._header[2] = value
-        self._update_checksum()
-
-    @property
-    def end_time(self) -> int:
-        return int(self._header[3])
-
-    @end_time.setter
-    def end_time(self, value: int):
-        self._header[3] = value
-        self._update_checksum()
-
-    @property
-    def owner_pid(self) -> int:
-        return int(self._header[4])
-
-    @owner_pid.setter
-    def owner_pid(self, value: int):
-        self._header[4] = value
-        self._update_checksum()
-
-    @property
-    def last_update(self) -> int:
-        return int(self._header[5])
-
-    @last_update.setter
-    def last_update(self, value: int):
-        self._header[5] = value
-        self._update_checksum()
-
-    @property
-    def checksum(self) -> int:
-        return int(self._header[6])
-
-    def _update_checksum(self):
-        """Update checksum of header data (excluding checksum field itself)"""
-        data = self._header[:6].tobytes()  # All fields except checksum
-        self._header[6] = hash(data) & 0x7FFFFFFFFFFFFFFF  # Keep positive
-
-    def validate_checksum(self) -> bool:
-        """Validate header integrity"""
-        expected = hash(self._header[:6].tobytes()) & 0x7FFFFFFFFFFFFFFF
-        return self.checksum == expected
+    def __init__(self, buffer: memoryview):
+        self.write_pos    = buffer[0 :8 ].cast("Q")
+        self.record_cnt   = buffer[8 :16].cast("Q")
+        self.start_time   = buffer[16:24].cast("Q")
+        self.end_time     = buffer[24:32].cast("Q")
+        self.last_update  = buffer[32:40].cast("Q")
+        self.owner_pid    = buffer[40:48].cast("Q")
 
     def cleanup(self):
         """Clean up references for proper SHM closure"""
-        self._header = None
-        self.buffer = None
+        self.write_pos.release()
+        self.record_cnt.release()
+        self.start_time.release()
+        self.end_time.release()
+        self.last_update.release()
+        self.owner_pid.release()
 
 
 class Chunk:
@@ -138,7 +78,7 @@ class Chunk:
 
     def available_space(self) -> int:
         """Available space for writing"""
-        return self.size - self.header.write_pos
+        return self.size - self.header.write_pos[0]
 
     def persist_to_disk(self, path: str):
         """Save SHM chunk to disk file"""
@@ -147,28 +87,12 @@ class Chunk:
 
     def close(self):
         if self.is_shm:
-            try:
-                if hasattr(self, 'header'):
-                    self.header.cleanup()
-                self.buffer = None
-                self.shm.close()
-            except Exception:
-                pass
+            self.header.cleanup()
+            self.buffer = None
+            self.shm.close()
+            self.shm.unlink()
         else:
-            try:
-                if hasattr(self, 'header'):
-                    self.header.cleanup()
-                self.buffer = None
-                if hasattr(self, 'mmap'):
-                    self.mmap.close()
-                if hasattr(self, 'file'):
-                    self.file.close()
-            except Exception:
-                pass
-
-    def unlink(self):
-        if self.is_shm:
-            try:
-                self.shm.unlink()
-            except Exception:
-                pass
+            self.header.cleanup()
+            self.buffer = None
+            self.mmap.close()
+            self.file.close()
