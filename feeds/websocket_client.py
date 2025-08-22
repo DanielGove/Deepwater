@@ -88,8 +88,8 @@ class RollingP99:
         return _ff(tmp[k])
 
 # ======= record formats (unchanged) =======
-_PACK_TRADE = struct.Struct("<2xccQQQQdd")   # 'T',side,trade_id,ev_ns,ws_ts_ns,proc_ns,price,size
-_PACK_L2    = struct.Struct("<cc6xQQQdd4x")  # 'U',side,ws_ts,ev_ns,proc_ts,price,qty
+_PACK_TRADE = struct.Struct("<cc14xQQQQdd")   # 'T',side,trade_id,ev_ns,ws_ts_ns,proc_ns,price,size
+_PACK_L2    = struct.Struct("<cc6xQQQdd16x")  # 'U',side,ws_ts,ev_ns,proc_ts,price,qty
 
 # ======= Engine =======
 
@@ -121,8 +121,8 @@ class MarketDataEngine:
         # data buffers (minimize alloc)
         self._rec_trade = _PACK_TRADE.size
         self._rec_l2 = _PACK_L2.size
-        self._buf_trade = bytearray(self._rec_trade)
-        self._buf_l2 = bytearray(self._rec_l2)
+        self._buf_trade = bytearray(self._rec_trade*64)
+        self._buf_l2 = bytearray(self._rec_l2*64)
         # platform
         self.platform = Platform()
         self.trade_writers: Dict[str, Any] = {}
@@ -338,7 +338,6 @@ class MarketDataEngine:
                     trades = ev.get("trades")
                     for tr in trades:
                         pid = tr.get("product_id")
-                        if not pid: continue
                         wr = self._ensure_trade_writer(pid)
                         ev_ns = parse_ns_timestamp(tr.get("time").encode('ascii'))
                         side  = b'B' if tr.get("side") == "BUY" else b'S'
@@ -346,6 +345,7 @@ class MarketDataEngine:
                         tid   = int(tr.get("trade_id") or 0)
                         _PACK_TRADE.pack_into(self._buf_trade, 0, b'T', side, tid, ev_ns, t_in_ns, base_proc, price, size)
                         wr.write(ev_ns, mv_trade[:self._rec_trade])
+
                 self._trade_rate[pid].incr(1, len(obj))
                 self._lat_trade[pid].add_us(int((_perf_ns() - base_proc)//1000))
 
@@ -353,15 +353,22 @@ class MarketDataEngine:
                 events = obj.get("events")
                 for ev in events:
                     pid = ev.get("product_id")
-                    if not pid: continue
                     wr = self._ensure_l2_writer(pid)
                     updates = ev.get("updates")
-                    for u in updates:
-                        ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
-                        side  = b'B' if (u.get("side") == "bid") else b'A'
-                        price = _ff(u.get("price_level")); qty = _ff(u.get("new_quantity"))
-                        _PACK_L2.pack_into(self._buf_l2, 0, b'U', side, t_in_ns, ev_ns, base_proc, price, qty)
-                        wr.write(ev_ns, mv_l2[:self._rec_l2])
+                    n_updates = len(updates)
+                    batch = 0
+                    while batch < n_updates:
+                        u0=0
+                        for u in updates[batch:batch+64]:
+                            ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
+                            side  = b'B' if (u.get("side") == "bid") else b'A'
+                            price = _ff(u.get("price_level")); qty = _ff(u.get("new_quantity"))
+                            _PACK_L2.pack_into(self._buf_l2, u0<<6, b'U', side, t_in_ns, ev_ns, base_proc, price, qty)
+                            u0+=1
+                        # Batch write
+                        wr.write(_perf_ns(), mv_l2[:u0<<6])
+                        batch += 64
+
                 self._l2_rate[pid].incr(1, len(obj))
                 self._lat_l2[pid].add_us(int((_perf_ns() - base_proc)//1000))
             
