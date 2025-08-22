@@ -36,13 +36,13 @@ class ChunkMeta:
         self.status = status
 
 class FeedRegistry:
-    __slots__ = ("path", "max_chunks", "fd", "mm", "is_writer", "_mv")
+    __slots__ = ("path", "max_chunks", "fd", "mm", "is_writer", "_mv", "_chunk_count")
 
     def __init__(self, path: str, max_chunks: int = 65535, mode: str = "r",
                  default_size: int = 0, default_status: int = STATUS_UNKNOWN):
         self.path = path
         self.max_chunks = max_chunks
-        self.is_writer = (mode == "w")
+        self.is_writer = mode == "w"
 
         desired_size = HEADER_SIZE + (max_chunks << 6)
         already_exists = os.path.exists(path)
@@ -68,10 +68,11 @@ class FeedRegistry:
         self.mm = mmap.mmap(self.fd, current_size, mmap.MAP_SHARED,
                             mmap.PROT_WRITE | mmap.PROT_READ)
         self._mv = memoryview(self.mm)
-        self._chunk_count[0] = self._mv[0:8].cast("Q")
+        self._chunk_count = self._mv[0:8].cast("Q")
 
     def close(self):
         self._mv.release()
+        self._chunk_count.release()
         self.mm.flush()
         self.mm.close()
         os.close(self.fd)
