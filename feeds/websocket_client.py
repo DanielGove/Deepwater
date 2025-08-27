@@ -1,5 +1,5 @@
 # feeds/websocket_client.py
-import threading, socket, orjson, queue, time, struct, sys, traceback
+import threading, socket, orjson, queue, time, struct
 from websocket import create_connection, WebSocketTimeoutException, WebSocketConnectionClosedException
 from calendar import timegm
 from typing import Dict, Iterable, Optional, Tuple, Any, List
@@ -36,60 +36,52 @@ def parse_ns_timestamp(ts):
     nanos = 10000*d2(20)+100*d2(22)#+d2(24)
     return secs*1_000_000_000 + nanos
 
-class SlidingRate:
-    '''Fixed 1s buckets over a short window (default 10s). Non-destructive snapshots.'''
-    __slots__ = ("window","_b","_lock")
-    def __init__(self, window: int = 10):
-        self.window = max(1, int(window))
-        self._b: Dict[int, Tuple[int,int]] = {}
-        self._lock = threading.Lock()
-    def incr(self, n: int, by: int, sec: Optional[int] = None) -> None:
-        s = _now_s() if sec is None else sec
-        with self._lock:
-            c,b = self._b.get(s, (0,0))
-            self._b[s] = (c+n, b+by)
-            cutoff = s - self.window + 1
-            for k in list(self._b.keys()):
-                if k < cutoff: self._b.pop(k, None)
-    def snapshot(self) -> dict:
-        now = _now_s()
-        def span(sp: int) -> Tuple[float,float]:
-            start = now - sp + 1
-            c=b=0
-            with self._lock:
-                for ts,(cc,bb) in self._b.items():
-                    if start <= ts <= now:
-                        c += cc; b += bb
-            sp = _ff(max(1, sp))
-            return c/sp, (b/(1024*1024))/sp
-        r1,m1 = span(1)
-        r10,m10 = span(min(self.window, 10))
-        return {"rps_1s": r1, "MBps_1s": m1, "rps_10s": r10, "MBps_10s": m10}
-
-class RollingP99:
-    '''Ring sampler in µs; p99 via partial sort on snapshot (cap defaults to 4096).'''
-    __slots__=("buf","cap","n","i","_lock")
-    def __init__(self, cap: int = 256):
-        self.cap = max(256, int(cap)); self.buf=[0]*self.cap; self.n=0; self.i=0
-        self._lock = threading.Lock()
-    def add_us(self, v_us: int) -> None:
-        if v_us < 0: v_us = 0
-        with self._lock:
-            self.buf[self.i] = v_us
-            self.i = (self.i + 1) % self.cap
-            self.n = self.cap if self.n == self.cap else self.n + 1
-    def p99(self) -> float:
-        with self._lock:
-            n = self.n
-            if n == 0: return 0.0
-            tmp = self.buf[:n]  # copy only used portion
-        tmp.sort()
-        k = max(0, int(0.99 * (n - 1)))
-        return _ff(tmp[k])
-
 # ======= record formats (unchanged) =======
 _PACK_TRADE = struct.Struct("<cc14xQQQQdd")   # 'T',side,trade_id,ev_ns,ws_ts_ns,proc_ns,price,size
 _PACK_L2    = struct.Struct("<cc6xQQQdd16x")  # 'U',side,ws_ts,ev_ns,proc_ts,price,qty
+
+def trades_spec(pid: str) -> dict:
+    return {
+        "feed_name": f"CB-TRADES-{pid}",
+        "mode": "UF",
+        "fields": [
+            {"name":"ws_ts_ns",   "type":"uint64", "desc":"ws recv timestamp (ns)"},
+            {"name":"type",       "type":"char",   "desc":"record type 'T'"},
+            {"name":"side",       "type":"char",   "desc":"B=buy,S=sell"},
+            {"name":"_",          "type":"_14",    "desc":"padding"},
+            {"name":"trade_id",   "type":"uint64", "desc":"exchange trade id"},
+            {"name":"ev_ns",      "type":"uint64", "desc":"event timestamp (ns)"},
+            {"name":"proc_ns",    "type":"uint64", "desc":"processing timestamp (ns)"},
+            {"name":"price",      "type":"float64","desc":"trade price"},
+            {"name":"size",       "type":"float64","desc":"trade size"},
+        ],
+        "ts_col": "ws_ts_ns",
+        "chunk_size_mb": 16,
+        "retention_hours": 2,
+        "persist": True
+    }
+
+def l2_spec(pid: str) -> dict:
+    return {
+        "feed_name": f"CB-L2-{pid}",
+        "mode": "UF",
+        "fields": [
+            {"name":"ws_ts_ns",   "type":"uint64", "desc":"ws recv timestamp (ns)"},
+            {"name":"type",       "type":"char",   "desc":"record type 'U'"},
+            {"name":"side",       "type":"char",   "desc":"B=bid,A=ask"},
+            {"name":"_",          "type":"_6",     "desc":"padding"},
+            {"name":"ev_ns",      "type":"uint64", "desc":"event timestamp (ns)"},
+            {"name":"proc_ns",    "type":"uint64", "desc":"processing timestamp (ns)"},
+            {"name":"price",      "type":"float64","desc":"price level"},
+            {"name":"qty",        "type":"float64","desc":"new quantity at level"},
+            {"name":"_",          "type":"_16",    "desc":"padding"},
+        ],
+        "ts_col": "ws_ts_ns",
+        "chunk_size_mb": 16,
+        "retention_hours": 2,
+        "persist": True,
+        "index_playback": True
+    }
 
 # ======= Engine =======
 
@@ -107,32 +99,33 @@ class MarketDataEngine:
         self.uri = uri
         self.channels = ["market_trades", "level2"]
         self.sample_size = int(sample_size)
-        # state
+
+        # Engine State
         self._should_run = False
         self._ws = None
         self._pid_lock = threading.Lock()
         self.product_ids: set[str] = set()
+
         # threads
         self.recv_thread: Optional[threading.Thread] = None
         self.proc_thread: Optional[threading.Thread] = None
-        # bounded queue (drop-oldest)
+
+        # message queue (drop-oldest)
         self.msg_queue: "queue.Queue[tuple[int,str]]" = queue.Queue(maxsize=max_queue)
         self.queue_hwm = 0
+
+        # platform
+        self.platform = Platform(base_path="./platform_data")
+        self.trade_writers: Dict[str, Any] = {}
+        self.book_writers:  Dict[str, Any] = {}
+
         # data buffers (minimize alloc)
         self._rec_trade = _PACK_TRADE.size
         self._rec_l2 = _PACK_L2.size
         self._buf_trade = bytearray(self._rec_trade*64)
         self._buf_l2 = bytearray(self._rec_l2*64)
-        # platform
-        self.platform = Platform()
-        self.trade_writers: Dict[str, Any] = {}
-        self.book_writers:  Dict[str, Any] = {}
+
         # metrics
-        self._total_rate = SlidingRate(10)          # packet-level
-        self._trade_rate: Dict[str, SlidingRate] = {}
-        self._l2_rate:    Dict[str, SlidingRate] = {}
-        self._lat_trade:  Dict[str, RollingP99] = {}
-        self._lat_l2:     Dict[str, RollingP99] = {}
         self._seq_gap_trades = 0
         self._last_seq: int = -1
 
@@ -264,7 +257,6 @@ class MarketDataEngine:
                     except Exception:
                         break
                     ts_ns = _now_ns()
-                    self._total_rate.incr(1, len(msg))
                     try:
                         put_nowait((ts_ns, msg))
                     except queue.Full:
@@ -292,19 +284,17 @@ class MarketDataEngine:
     def _ensure_trade_writer(self, pid: str):
         wr = self.trade_writers.get(pid)
         if wr is None:
-            wr = self.platform.create_feed(f"CB-TRADES-{pid}")
-            self.trade_writers[pid] = wr
-            self._trade_rate[pid] = SlidingRate(10)
-            self._lat_trade[pid] = RollingP99(self.sample_size)
+            feed_spec = trades_spec(pid)
+            self.platform.create_feed(feed_spec)
+            self.trade_writers[pid] = self.platform.create_writer(feed_spec["feed_name"])
         return wr
 
     def _ensure_l2_writer(self, pid: str):
         wr = self.book_writers.get(pid)
         if wr is None:
-            wr = self.platform.create_feed(f"CB-L2-{pid}")
-            self.book_writers[pid] = wr
-            self._l2_rate[pid] = SlidingRate(10)
-            self._lat_l2[pid] = RollingP99(self.sample_size)
+            feed_spec = l2_spec(pid)
+            wr = self.platform.create_feed(feed_spec)
+            self.book_writers[pid] = self.platform.create_writer(feed_spec["feed_name"], batch_size=64)
         return wr
 
     def _proc_loop(self) -> None:        
@@ -340,19 +330,17 @@ class MarketDataEngine:
                         pid = tr.get("product_id")
                         wr = self._ensure_trade_writer(pid)
                         ev_ns = parse_ns_timestamp(tr.get("time").encode('ascii'))
-                        side  = b'B' if tr.get("side") == "BUY" else b'S'
+                        side  = tr.get("side")[0].encode('ascii') # 'B' or 'S'
                         price = _ff(tr.get("price")); size = _ff(tr.get("size"))
                         tid   = int(tr.get("trade_id") or 0)
                         _PACK_TRADE.pack_into(self._buf_trade, 0, b'T', side, tid, ev_ns, t_in_ns, base_proc, price, size)
                         wr.write(ev_ns, mv_trade[:self._rec_trade])
 
-                self._trade_rate[pid].incr(1, len(obj))
-                self._lat_trade[pid].add_us(int((_perf_ns() - base_proc)//1000))
-
             elif ch == "l2_data":
                 events = obj.get("events")
                 for ev in events:
                     pid = ev.get("product_id")
+                    l2_type = ev.get("type")[0].encode('ascii')  # 'U' or 'S'
                     wr = self._ensure_l2_writer(pid)
                     updates = ev.get("updates")
                     n_updates = len(updates)
@@ -361,16 +349,21 @@ class MarketDataEngine:
                         u0=0
                         for u in updates[batch:batch+64]:
                             ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
-                            side  = b'B' if (u.get("side") == "bid") else b'A'
+                            side  = u.get("side")[0].encode('ascii')  # 'B' or 'A'
                             price = _ff(u.get("price_level")); qty = _ff(u.get("new_quantity"))
-                            _PACK_L2.pack_into(self._buf_l2, u0<<6, b'U', side, t_in_ns, ev_ns, base_proc, price, qty)
+                            _PACK_L2.pack_into(self._buf_l2, u0<<6, l2_type, side, t_in_ns, ev_ns, base_proc, price, qty)
                             u0+=1
                         # Batch write
                         wr.write(_perf_ns(), mv_l2[:u0<<6])
                         batch += 64
+            
+            elif ch == "subscriptions":
+                pass
+            elif ch == "heartbeats":
+                pass
 
-                self._l2_rate[pid].incr(1, len(obj))
-                self._lat_l2[pid].add_us(int((_perf_ns() - base_proc)//1000))
+            else:
+                raise NotImplementedError("Unknown channel")
             
             # else: heartbeats/acks ignored
             done()
