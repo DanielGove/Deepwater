@@ -37,8 +37,8 @@ def parse_ns_timestamp(ts):
     return secs*1_000_000_000 + nanos
 
 # ======= record formats (unchanged) =======
-_PACK_TRADE = struct.Struct("<cc14xQQQQdd")   # 'T',side,trade_id,ev_ns,ws_ts_ns,proc_ns,price,size
-_PACK_L2    = struct.Struct("<cc6xQQQdd16x")  # 'U',side,ws_ts,ev_ns,proc_ts,price,qty
+_PACK_TRADE = struct.Struct("<Qcc14xQQQdd")   # 'T',side,trade_id,ev_ns,ws_ts_ns,proc_ns,price,size
+_PACK_L2    = struct.Struct("<Qcc6xQQdd16x")  # 'U',side,ws_ts,ev_ns,proc_ts,price,qty
 
 def trades_spec(pid: str) -> dict:
     return {
@@ -287,6 +287,7 @@ class MarketDataEngine:
             feed_spec = trades_spec(pid)
             self.platform.create_feed(feed_spec)
             self.trade_writers[pid] = self.platform.create_writer(feed_spec["feed_name"])
+            wr = self.trade_writers[pid]
         return wr
 
     def _ensure_l2_writer(self, pid: str):
@@ -294,7 +295,8 @@ class MarketDataEngine:
         if wr is None:
             feed_spec = l2_spec(pid)
             wr = self.platform.create_feed(feed_spec)
-            self.book_writers[pid] = self.platform.create_writer(feed_spec["feed_name"], batch_size=64)
+            self.book_writers[pid] = self.platform.create_writer(feed_spec["feed_name"])
+            wr = self.book_writers[pid]
         return wr
 
     def _proc_loop(self) -> None:        
@@ -333,8 +335,8 @@ class MarketDataEngine:
                         side  = tr.get("side")[0].encode('ascii') # 'B' or 'S'
                         price = _ff(tr.get("price")); size = _ff(tr.get("size"))
                         tid   = int(tr.get("trade_id") or 0)
-                        _PACK_TRADE.pack_into(self._buf_trade, 0, b'T', side, tid, ev_ns, t_in_ns, base_proc, price, size)
-                        wr.write(ev_ns, mv_trade[:self._rec_trade])
+                        _PACK_TRADE.pack_into(self._buf_trade, 0, t_in_ns, b'T', side, tid, ev_ns, base_proc, price, size)
+                        wr.write(t_in_ns, mv_trade[:self._rec_trade])
 
             elif ch == "l2_data":
                 events = obj.get("events")
@@ -351,10 +353,10 @@ class MarketDataEngine:
                             ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
                             side  = u.get("side")[0].encode('ascii')  # 'B' or 'A'
                             price = _ff(u.get("price_level")); qty = _ff(u.get("new_quantity"))
-                            _PACK_L2.pack_into(self._buf_l2, u0<<6, l2_type, side, t_in_ns, ev_ns, base_proc, price, qty)
+                            _PACK_L2.pack_into(self._buf_l2, u0<<6, t_in_ns, l2_type, side, ev_ns, base_proc, price, qty)
                             u0+=1
                         # Batch write
-                        wr.write(_perf_ns(), mv_l2[:u0<<6])
+                        wr.write(t_in_ns, mv_l2[:u0<<6])
                         batch += 64
             
             elif ch == "subscriptions":

@@ -104,7 +104,7 @@ def save_layout(feed_dir: Path | str, layout: Dict) -> None:
 
 def load_layout(feed_dir: Path | str) -> Dict:
     feed_dir = Path(feed_dir)
-    return json.loads((feed_dir / "layout.json").read_text())
+    return json.loads((feed_dir / "record_format.json").read_text())
 
 
 # ------------------------------ unit tests -----------------------------------

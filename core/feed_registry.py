@@ -5,7 +5,7 @@ import fcntl
 from typing import Iterator, Optional
 
 # Only keep struct for initial setup - eliminate from hot paths
-CHUNK_STRUCT = struct.Struct("<QQQQB39x")  # start, end, chunk_id, size, status + padding = 64 bytes
+CHUNK_STRUCT = struct.Struct("<QQQQQQQB7x")  # start, end, write_pos, num_records, chunk_id, size, status + padding = 64 bytes
 HEADER_STRUCT = struct.Struct("<QQB59x")  # chunk_count, default_size, default_status + padding = 64 bytes
 
 # No helper functions - direct inline operations for maximum speed
@@ -21,19 +21,119 @@ STATUS_EXPIRED = 3
 # Precomputed offsets for direct memory access
 CHUNK_START_OFFSET = 0
 CHUNK_END_OFFSET = 8
-CHUNK_ID_OFFSET = 16
-CHUNK_SIZE_OFFSET = 24
-CHUNK_STATUS_OFFSET = 32
+CHUNK_WRITE_POS_OFFSET = 16
+CHUNK_NUM_RECORDS_OFFSET = 24
+CHUNK_LAST_UPDATE_OFFSET = 32
+CHUNK_ID_OFFSET = 40
+CHUNK_SIZE_OFFSET = 48
+CHUNK_STATUS_OFFSET = 56
+
+# Offsets already defined in your file:
+# CHUNK_START_OFFSET = 0
+# CHUNK_END_OFFSET   = 8
+# CHUNK_ID_OFFSET    = 16
+# CHUNK_SIZE_OFFSET  = 24
+# CHUNK_STATUS_OFFSET= 32
+# CHUNK_SIZE         = 64
 
 class ChunkMeta:
-    __slots__ = ("start_time", "end_time", "chunk_id", "size", "status")
+    """
+    Zero-copy, mutable view over a single 64-byte chunk record.
+    Reads and writes go directly to the underlying mmapped memory.
+    """
+    __slots__ = ("_mv", "_start", "_end", "_wp", "_nr", "_lu", "_id", "_size", "_status")
 
-    def __init__(self, start_time: int, end_time: int, chunk_id: int, size: int, status: int):
-        self.start_time = start_time
-        self.end_time = end_time
-        self.chunk_id = chunk_id
-        self.size = size
-        self.status = status
+    def __init__(self, chunk_record: memoryview):
+        self._mv = chunk_record
+        self._start  = chunk_record[CHUNK_START_OFFSET:CHUNK_END_OFFSET].cast("Q")
+        self._end    = chunk_record[CHUNK_END_OFFSET:CHUNK_WRITE_POS_OFFSET].cast("Q")
+        self._wp     = chunk_record[CHUNK_WRITE_POS_OFFSET:CHUNK_NUM_RECORDS_OFFSET].cast("Q")
+        self._nr     = chunk_record[CHUNK_NUM_RECORDS_OFFSET: CHUNK_LAST_UPDATE_OFFSET].cast("Q")
+        self._lu     = chunk_record[CHUNK_LAST_UPDATE_OFFSET: CHUNK_ID_OFFSET].cast("Q")
+        self._id     = chunk_record[CHUNK_ID_OFFSET:CHUNK_SIZE_OFFSET].cast("Q")
+        self._size   = chunk_record[CHUNK_SIZE_OFFSET:CHUNK_STATUS_OFFSET].cast("Q")
+        self._status = chunk_record[CHUNK_STATUS_OFFSET:CHUNK_STATUS_OFFSET+1].cast("B")
+
+    @property
+    def start_time(self) -> int:
+        return int(self._start[0])
+    @start_time.setter
+    def start_time(self, v: int) -> None:
+        self._start[0] = int(v)
+
+    @property
+    def end_time(self) -> int:
+        return int(self._end[0])
+    @end_time.setter
+    def end_time(self, v: int) -> None:
+        self._end[0] = int(v)
+
+    @property
+    def write_pos(self) -> int:
+        return int(self._wp[0])
+    @write_pos.setter
+    def write_pos(self, v: int) -> None:
+        self._wp[0] = int(v)
+
+    @property
+    def num_records(self) -> int:
+        return int(self._nr[0])
+    @num_records.setter
+    def num_records(self, v: int) -> None:
+        self._nr[0] = int(v)
+
+    @property
+    def last_update(self) -> int:
+        return int(self._lu[0])
+    @last_update.setter
+    def last_update(self, v: int) -> None:
+        self._lu[0] = int(v)
+
+    @property
+    def chunk_id(self) -> int:
+        return int(self._id[0])
+    @chunk_id.setter
+    def chunk_id(self, v: int) -> None:
+        raise Exception("Cannot overwrite chunk id in registry")
+
+    @property
+    def size(self) -> int:
+        return int(self._size[0])
+    @size.setter
+    def size(self, v: int) -> None:
+        self._size[0] = int(v)
+
+    @property
+    def status(self) -> int:
+        return int(self._status[0])
+    @status.setter
+    def status(self, v: int) -> None:
+        # clamp to 0..255 to avoid ValueError from casted B view
+        self._status[0] = int(v) & 0xFF
+
+    # Optional helpers
+    def as_tuple(self) -> tuple[int,int,int,int,int]:
+        return (self.start_time, self.end_time, self.chunk_id, self.size, self.status)
+
+    def release(self) -> None:
+        # Release views (important before closing the mmap on some Python builds)
+        try: self._start.release()
+        except Exception: pass
+        try: self._end.release()
+        except Exception: pass
+        try: self._id.release()
+        except Exception: pass
+        try: self._size.release()
+        except Exception: pass
+        try: self._status.release()
+        except Exception: pass
+        try: self._mv.release()
+        except Exception: pass
+
+    def __repr__(self) -> str:
+        return (f"ChunkMeta(start={self.start_time}, end={self.end_time}, "
+                f"id={self.chunk_id}, size={self.size}, status={self.status})")
+
 
 class FeedRegistry:
     __slots__ = ("path", "max_chunks", "fd", "mm", "is_writer", "_mv", "_chunk_count")
@@ -83,8 +183,7 @@ class FeedRegistry:
         def_status = self._mv[24]
         return def_size, def_chunk_id, def_status
 
-    def register_chunk(self, start_time: int, end_time: int, chunk_id: int = None,
-                        size: int = None, status: int = None) -> int:
+    def register_chunk(self, start_time: int, chunk_id: int = None, size: int = None, status: int = None) -> int:
         if not self.is_writer:
             raise PermissionError("Read-only mode")
 
@@ -96,7 +195,10 @@ class FeedRegistry:
         
         offset = HEADER_SIZE + (self._chunk_count[0]<< 6)
         self._mv[offset + CHUNK_START_OFFSET:offset + CHUNK_END_OFFSET] = start_time.to_bytes(8, 'little')
-        self._mv[offset + CHUNK_END_OFFSET:offset + CHUNK_ID_OFFSET] = end_time.to_bytes(8, 'little')
+        self._mv[offset + CHUNK_END_OFFSET:offset + CHUNK_WRITE_POS_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"            # End Time, write position,
+        self._mv[offset + CHUNK_WRITE_POS_OFFSET:offset + CHUNK_NUM_RECORDS_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"    # and number of records
+        self._mv[offset + CHUNK_NUM_RECORDS_OFFSET:offset + CHUNK_LAST_UPDATE_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"           # all initialize to 0
+        self._mv[offset + CHUNK_LAST_UPDATE_OFFSET:offset + CHUNK_ID_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"
         self._mv[offset + CHUNK_ID_OFFSET:offset + CHUNK_SIZE_OFFSET] = chunk_id.to_bytes(8, 'little')
         self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_STATUS_OFFSET] = size.to_bytes(8, 'little')
         self._mv[offset + CHUNK_STATUS_OFFSET] = status
@@ -132,18 +234,9 @@ class FeedRegistry:
         offset = HEADER_SIZE + (index << 6) + CHUNK_END_OFFSET
         return int.from_bytes(self._mv[offset:offset+8], 'little')
 
-    def get_chunk_raw(self, index: int) -> memoryview:
+    def get_chunk_metadata(self, index: int) -> memoryview:
         offset = HEADER_SIZE + (index << 6)
-        return self._mv[offset:offset + CHUNK_SIZE]
-
-    def get_chunk(self, index: int) -> ChunkMeta:
-        offset = HEADER_SIZE + (index << 6)
-        start = int.from_bytes(self._mv[offset + CHUNK_START_OFFSET:offset + CHUNK_END_OFFSET], 'little')
-        end = int.from_bytes(self._mv[offset + CHUNK_END_OFFSET:offset + CHUNK_ID_OFFSET], 'little')
-        chunk_id = int.from_bytes(self._mv[offset + CHUNK_ID_OFFSET:offset + CHUNK_SIZE_OFFSET], 'little')
-        size = int.from_bytes(self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_STATUS_OFFSET], 'little')
-        status = self._mv[offset + CHUNK_STATUS_OFFSET]
-        return ChunkMeta(start, end, chunk_id, size, status)
+        return ChunkMeta(self._mv[offset:offset + CHUNK_SIZE])
 
     def _binary_search_start_time(self, target_time: int) -> int:
         left, right = 0, self._chunk_count[0]
@@ -211,12 +304,6 @@ class FeedRegistry:
     def iter_chunks_meta(self) -> Iterator[ChunkMeta]:
         for i in range(self._chunk_count[0]):
             yield self.get_chunk(i)
-
-    def update_chunk_status(self, index: int, status: int):
-        if not self.is_writer:
-            raise PermissionError("Read-only mode")
-        offset = HEADER_SIZE + (index << 6) + CHUNK_STATUS_OFFSET
-        self._mv[offset] = status
 
     def find_chunk_by_id(self, chunk_id: int) -> Optional[int]:
         for i in range(self._chunk_count[0]):
