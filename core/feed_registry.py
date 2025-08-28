@@ -5,7 +5,7 @@ import fcntl
 from typing import Iterator, Optional
 
 # Only keep struct for initial setup - eliminate from hot paths
-CHUNK_STRUCT = struct.Struct("<QQQQQQQB7x")  # start, end, write_pos, num_records, chunk_id, size, status + padding = 64 bytes
+CHUNK_STRUCT = struct.Struct("<QQQQQQQB7x")  # start, end, write_pos, num_records, last_update, chunk_id, size, status + padding = 64 bytes
 HEADER_STRUCT = struct.Struct("<QQB59x")  # chunk_count, default_size, default_status + padding = 64 bytes
 
 # No helper functions - direct inline operations for maximum speed
@@ -27,14 +27,6 @@ CHUNK_LAST_UPDATE_OFFSET = 32
 CHUNK_ID_OFFSET = 40
 CHUNK_SIZE_OFFSET = 48
 CHUNK_STATUS_OFFSET = 56
-
-# Offsets already defined in your file:
-# CHUNK_START_OFFSET = 0
-# CHUNK_END_OFFSET   = 8
-# CHUNK_ID_OFFSET    = 16
-# CHUNK_SIZE_OFFSET  = 24
-# CHUNK_STATUS_OFFSET= 32
-# CHUNK_SIZE         = 64
 
 class ChunkMeta:
     """
