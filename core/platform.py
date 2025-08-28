@@ -91,7 +91,7 @@ class Platform:
 
         # 3) persist lifecycle defaults into GlobalRegistry (create or update)
         lifecycle = {
-            "chunk_size_bytes": int(spec.get("chunk_size_mb", 64)) * 1024 * 1024,
+            "chunk_size_bytes": int(spec.get("chunk_size_mb", 64)*1024*1024),
             "rotate_s":         int(spec.get("rotate_s", 3600)),
             "retention_hours":  int(spec.get("retention_hours", 72)),
             "persist":          bool(spec.get("persist", True)),

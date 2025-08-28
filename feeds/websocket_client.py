@@ -56,7 +56,7 @@ def trades_spec(pid: str) -> dict:
             {"name":"size",       "type":"float64","desc":"trade size"},
         ],
         "ts_col": "ws_ts_ns",
-        "chunk_size_mb": 16,
+        "chunk_size_mb": 128/1024,
         "retention_hours": 2,
         "persist": True
     }
@@ -77,7 +77,7 @@ def l2_spec(pid: str) -> dict:
             {"name":"_",          "type":"_16",    "desc":"padding"},
         ],
         "ts_col": "ws_ts_ns",
-        "chunk_size_mb": 16,
+        "chunk_size_mb": 128/1024,
         "retention_hours": 2,
         "persist": True,
         "index_playback": True

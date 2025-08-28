@@ -140,25 +140,19 @@ class Writer:
 
     def _rotate_chunk(self):
         """Atomic chunk rotation"""
-        if self.current_chunk and self.persist:
-            # Persist current chunk to disk
+        if self.current_chunk is None:
+            raise Exception("Cannot rotate out of a non-existing chunk")
+
+        if self.persist:
+            # 0: Persist current chunk to disk
             file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
             self.current_chunk.persist_to_disk(str(file_path))
-
-            # Update registry
-            self.registry.register_chunk(
-                time.time_ns(),0,self.current_chunk_id,
-                self.config.get("chunk_size_bytes"),1
-            )
-
             print(f"💾 Persisted chunk {self.current_chunk_id} to {file_path}")
 
-        # Close current chunk and release ownership
-        if self.current_chunk:
-            self.current_chunk.header.owner_pid = 0  # Release ownership
-            self.current_chunk.close()
+        # 3: Close current chunk
+        self.current_chunk.close()
 
-        # Create new chunk
+        # 4: Create new chunk
         self.current_chunk_id += 1
         self._create_new_chunk()
 
@@ -178,7 +172,7 @@ class Writer:
                         self.current_chunk.persist_to_disk(str(file_path))
 
                         self.registry.register_chunk(
-                            time.time_ns(),0,self.current_chunk_id,
+                            time.time_ns(),self.current_chunk_id,
                             self.config.get("chunk_size_bytes"),1
                         )
                         print(f"💾 Final persist of chunk {self.current_chunk_id}")
