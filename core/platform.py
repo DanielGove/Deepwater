@@ -38,10 +38,6 @@ class Platform:
         self._structs: Dict[str, Tuple[struct.Struct, int]] = {}  # name -> (Struct(fmt), ts_off)
         # self._indexes: Dict[str, ChunkIndex] = {}
 
-        # best-effort clean shutdown
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
-
     # -------------------------------------------------------------------------
     # FEED CREATION (idempotent, failsafe)
     # -------------------------------------------------------------------------
@@ -226,21 +222,6 @@ class Platform:
     # -------------------------------------------------------------------------
     def close(self):
         for w in list(self._writers.values()):
-            try: w.close()
-            except: pass
-        self._writers.clear()
-        # for r in list(self._readers.values()):
-        #     try: r.close()
-        #     except: pass
-        # self._readers.clear()
-        # for idx in list(self._indexes.values()):
-        #     try: idx.close()
-        #     except: pass
-        # self._indexes.clear()
+            w.close()
+        self._writers = dict()
         self.registry.close()
-
-    def _handle_signal(self, signum, _frame):
-        try:
-            self.close()
-        finally:
-            raise SystemExit(0)

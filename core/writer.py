@@ -16,7 +16,7 @@ class Writer:
     def __init__(self, platform, feed_name:str):
         self.platform = platform
         self.feed_name = feed_name
-        self.config = platform.lifecycle(feed_name)
+        self.feed_config = platform.lifecycle(feed_name)
         self.record_format = platform.get_record_format(feed_name)
         self.my_pid = ProcessUtils.get_current_pid()
 
@@ -25,14 +25,6 @@ class Writer:
         if not feed_exists:
             print(f"🆕 Creating new feed '{feed_name}' (PID: {self.my_pid})")
             self.platform.registry.register_feed(feed_name)
-
-        # Extract callback before registry (functions can't be serialized)
-        self.index_playback = self.config.get('index_playback')
-
-        # Configuration
-        self.chunk_size = self.config.get('chunk_size_bytes')
-        self.retention_hours = self.config.get('retention_hours')
-        self.persist = self.config.get('persist')
 
         # Where to store persisted chunks
         self.data_dir = platform.base_path / "data" / feed_name
@@ -44,8 +36,11 @@ class Writer:
 
         # Current chunk state
         self.current_chunk = None
-        self.current_chunk_id = 0
-        self.current_chunk_metadata = None
+        self.current_chunk_metadata = self.registry.get_latest_chunk()
+        if self.current_chunk_metadata is None:
+            self.current_chunk_id = 0
+        else:
+            self.current_chunk_id = self.current_chunk_metadata.chunk_id
         self._create_new_chunk()
 
         # Thread safety
@@ -84,16 +79,19 @@ class Writer:
     def _create_new_chunk(self):
         """Create new SHM chunk with ownership"""
         try:
-            chunk_name = f"{self.feed_name}-{self.current_chunk_id}"
-            self.current_chunk = Chunk(chunk_name, self.chunk_size, create=True)
 
-            # 1. Register a new chunk with registry
+            self.current_chunk_id += 1
             self.registry.register_chunk(
                 time.time_ns(),self.current_chunk_id,
-                self.config.get("chunk_size_bytes"),1
-            )
+                self.feed_config["chunk_size_bytes"],1)
 
-            # 2. Update the registry
+            if self.current_chunk is not None:
+                if self.feed_config["persist"]:
+                    file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
+                    self.current_chunk.persist_to_disk(str(file_path))
+                    print(f"💾 Persisted chunk {self.current_chunk_id} to {file_path}")
+                self.current_chunk.close()
+
             if self.current_chunk_metadata is not None:
                 self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
                 new_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
@@ -101,11 +99,14 @@ class Writer:
                 self.current_chunk_metadata.release()
             else:
                 new_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
+
             self.current_chunk_metadata = new_metadata
+            self.current_chunk = Chunk(f"{self.feed_name}-{self.current_chunk_id}", self.feed_config["chunk_size_bytes"], create=True)
 
             print(f"✨ Created new SHM chunk {self.current_chunk_id} (PID: {self.my_pid})")
 
         except Exception as e:
+            self.current_chunk_id -= 1
             raise RuntimeError(f"Failed to create chunk: {e}")
 
     def write(self, timestamp: int, data: Union[bytes, np.ndarray], force_index: bool = False) -> int:
@@ -121,8 +122,11 @@ class Writer:
             record_size = len(record_data)
 
             # Check if need new chunk
-            if record_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
-                self._rotate_chunk()
+            try:
+                if record_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
+                    self._create_new_chunk()
+            except Exception as e:
+                raise Exception(f"Worst exception ever: {e}")
 
             # 1. Write record data to chunk
             position = self.current_chunk_metadata.write_pos
@@ -137,51 +141,19 @@ class Writer:
             # if force_index or (self.index_callback and self.index_callback(memoryview(record_data), timestamp)):
             #     self.index.add_entry(timestamp, self.current_chunk_id, position, 1 if force_index else 0)
 
-
-    def _rotate_chunk(self):
-        """Atomic chunk rotation"""
-        if self.current_chunk is None:
-            raise Exception("Cannot rotate out of a non-existing chunk")
-
-        if self.persist:
-            # 0: Persist current chunk to disk
-            file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
-            self.current_chunk.persist_to_disk(str(file_path))
-            print(f"💾 Persisted chunk {self.current_chunk_id} to {file_path}")
-
-        # 3: Close current chunk
-        self.current_chunk.close()
-
-        # 4: Create new chunk
-        self.current_chunk_id += 1
-        self._create_new_chunk()
-
     def close(self):
         """Clean shutdown with ownership release"""
         with self.lock:
             print(f"🛑 Shutting down writer for '{self.feed_name}' (PID: {self.my_pid})")
-
             if self.current_chunk:
-                # Release ownership before closing
-                self.current_chunk.header.owner_pid = 0
-                self.current_chunk.header.last_update = time.time_ns()
-
-                if self.persist:
+                self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
+                if self.feed_config["persist"]:
                     try:
                         file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
                         self.current_chunk.persist_to_disk(str(file_path))
-
-                        self.registry.register_chunk(
-                            time.time_ns(),self.current_chunk_id,
-                            self.config.get("chunk_size_bytes"),1
-                        )
                         print(f"💾 Final persist of chunk {self.current_chunk_id}")
                     except Exception as e:
                         print(f"⚠️  Could not persist final chunk: {e}")
-
-                try:
-                    self.current_chunk.close()
-                    if self.current_chunk.is_shm:
-                        self.current_chunk.unlink()
-                except Exception as e:
-                    print(f"⚠️  Could not close chunk: {e}")
+                self.current_chunk_metadata.release()
+                self.registry.close()
+                self.current_chunk.close()

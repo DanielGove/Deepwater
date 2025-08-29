@@ -1,9 +1,9 @@
 # feeds/websocket_client.py
 import threading, socket, orjson, queue, time, struct
 from websocket import create_connection, WebSocketTimeoutException, WebSocketConnectionClosedException
-from calendar import timegm
 from typing import Dict, Iterable, Optional, Tuple, Any, List
 
+import signal
 import numba as _nb
 from fastnumbers import fast_float as _ff
 
@@ -56,7 +56,7 @@ def trades_spec(pid: str) -> dict:
             {"name":"size",       "type":"float64","desc":"trade size"},
         ],
         "ts_col": "ws_ts_ns",
-        "chunk_size_mb": 128/1024,
+        "chunk_size_mb": 16,
         "retention_hours": 2,
         "persist": True
     }
@@ -77,7 +77,7 @@ def l2_spec(pid: str) -> dict:
             {"name":"_",          "type":"_16",    "desc":"padding"},
         ],
         "ts_col": "ws_ts_ns",
-        "chunk_size_mb": 128/1024,
+        "chunk_size_mb": 16,
         "retention_hours": 2,
         "persist": True,
         "index_playback": True
@@ -129,6 +129,11 @@ class MarketDataEngine:
         self._seq_gap_trades = 0
         self._last_seq: int = -1
 
+        # Control flow
+        # best-effort clean shutdown
+        signal.signal(signal.SIGINT, self._handle_signal)
+        signal.signal(signal.SIGTERM, self._handle_signal)
+
     # ---- lifecycle ----
 
     def start(self) -> None:
@@ -140,20 +145,13 @@ class MarketDataEngine:
 
     def stop(self) -> None:
         self._should_run = False
-        try:
-            if self._ws is not None: self._ws.close()
-        except Exception:
-            pass
         for t in (self.recv_thread, self.proc_thread):
             if t and t.is_alive():
-                t.join(timeout=3.0)
-        # close writers predictably
-        for w in list(self.trade_writers.values()):
-            try: w.close()
-            except Exception: pass
-        for w in list(self.book_writers.values()):
-            try: w.close()
-            except Exception: pass
+                t.join()
+        if self._ws is not None: self._ws.close()
+        self.platform.close()
+        self.book_writers = dict()
+        self.trade_writers = dict()
 
     # ---- control ----
 
@@ -273,11 +271,6 @@ class MarketDataEngine:
                 # suppress stack prints in hot path
                 pass
             finally:
-                try:
-                    if self._ws: self._ws.close()
-                except Exception:
-                    pass
-                self._ws = None
                 if self._should_run:
                     time.sleep(0.5)  # small backoff
 
@@ -369,3 +362,9 @@ class MarketDataEngine:
             
             # else: heartbeats/acks ignored
             done()
+
+    def _handle_signal(self, signum, _frame):
+        try:
+            self.stop()
+        finally:
+            raise SystemExit(0)

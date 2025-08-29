@@ -109,18 +109,15 @@ class ChunkMeta:
 
     def release(self) -> None:
         # Release views (important before closing the mmap on some Python builds)
-        try: self._start.release()
-        except Exception: pass
-        try: self._end.release()
-        except Exception: pass
-        try: self._id.release()
-        except Exception: pass
-        try: self._size.release()
-        except Exception: pass
-        try: self._status.release()
-        except Exception: pass
-        try: self._mv.release()
-        except Exception: pass
+        self._start.release()
+        self._end.release()
+        self._wp.release()
+        self._nr.release()
+        self._lu.release()
+        self._id.release()
+        self._size.release()
+        self._status.release()
+        self._mv.release()
 
     def __repr__(self) -> str:
         return (f"ChunkMeta(start={self.start_time}, end={self.end_time}, "
@@ -167,6 +164,7 @@ class FeedRegistry:
         self._chunk_count.release()
         self.mm.flush()
         self.mm.close()
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
         os.close(self.fd)
 
     def _get_defaults(self) -> tuple[int, int, int]:
@@ -219,15 +217,15 @@ class FeedRegistry:
         self.max_chunks = new_max_chunks
 
     def _chunk_start_time(self, index: int) -> int:
-        offset = HEADER_SIZE + (index << 6) + CHUNK_START_OFFSET
+        offset = HEADER_SIZE + ((index-1) << 6) + CHUNK_START_OFFSET
         return int.from_bytes(self._mv[offset:offset+8], 'little')
 
     def _chunk_end_time(self, index: int) -> int:
-        offset = HEADER_SIZE + (index << 6) + CHUNK_END_OFFSET
+        offset = HEADER_SIZE + ((index-1) << 6) + CHUNK_END_OFFSET
         return int.from_bytes(self._mv[offset:offset+8], 'little')
 
     def get_chunk_metadata(self, index: int) -> memoryview:
-        offset = HEADER_SIZE + (index << 6)
+        offset = HEADER_SIZE + ((index-1) << 6)
         return ChunkMeta(self._mv[offset:offset + CHUNK_SIZE])
 
     def _binary_search_start_time(self, target_time: int) -> int:
@@ -288,14 +286,11 @@ class FeedRegistry:
     def get_latest_chunk(self) -> Optional[ChunkMeta]:
         if self._chunk_count[0] == 0:
             return None
-        return self.get_chunk(self._chunk_count[0] - 1)
-
-    def iter_chunk_indices(self) -> Iterator[int]:
-        return range(self._chunk_count[0])
+        return self.get_chunk_metadata(self._chunk_count[0] - 1)
 
     def iter_chunks_meta(self) -> Iterator[ChunkMeta]:
         for i in range(self._chunk_count[0]):
-            yield self.get_chunk(i)
+            yield self.get_chunk_metadata(i)
 
     def find_chunk_by_id(self, chunk_id: int) -> Optional[int]:
         for i in range(self._chunk_count[0]):
