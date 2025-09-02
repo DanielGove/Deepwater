@@ -30,6 +30,9 @@ class Chunk:
             self.buffer = memoryview(self.shm.buf)
             self.is_shm = True
 
+    def memview(self) -> memoryview:
+        return self.buffer
+
     def write_bytes(self, position: int, data: bytes) -> int:
         """Write bytes and return new position"""
         if position + len(data) > self.size:

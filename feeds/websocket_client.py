@@ -278,11 +278,12 @@ class MarketDataEngine:
                                 side  = tr.get("side")[0].encode('ascii') # 'B' or 'S'
                                 price = _ff(tr.get("price")); size = _ff(tr.get("size"))
                                 tid   = int(tr.get("trade_id") or 0)
-                                _PACK_TRADE.pack_into(self._buf_trade, 0, b'T', side, tid, ev_ns, price, size)
-                                wr.write(t_in_ns, mv_trade[:self._rec_trade])
+                                #_PACK_TRADE.pack_into(self._buf_trade, 0, b'T', side, tid, ev_ns, price, size)
+                                wr.write_values(b'T',side,tid,ev_ns,price,size)
                                 self._metrics.trade(pid, n=1, latency_us=_perf_ns()-t_in_ns)
 
                     elif ch == "l2_data":
+                        continue
                         events = obj.get("events")
                         for ev in events:
                             pid = ev.get("product_id")
@@ -314,9 +315,8 @@ class MarketDataEngine:
 
             except WebSocketConnectionClosedException:
                 pass
-            except Exception:
-                # suppress stack prints in hot path
-                pass
+            except Exception as e:
+                raise Exception(e)
             finally:
                 if self._should_run:
                     try:

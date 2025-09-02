@@ -43,39 +43,6 @@ class Writer:
             self.current_chunk_id = self.current_chunk_metadata.chunk_id
         self._create_new_chunk()
 
-        # Thread safety
-        self.lock = threading.Lock()
-
-    def _find_last_valid_record(self, chunk) -> int:
-        """Find the last valid record position in chunk"""
-        position = 0
-
-        while position < chunk.header.write_pos:
-            try:
-                # Try to read record header
-                if position + 12 > chunk.data_size:
-                    break
-
-                header_bytes = chunk.read_bytes(position, 12)
-                timestamp, data_len = struct.unpack('<QI', header_bytes)
-
-                # Validate record
-                total_len = 12 + data_len
-                if position + total_len > chunk.header.write_pos:
-                    # Incomplete record, this is where we should resume
-                    break
-
-                if timestamp == 0 or data_len > 1024*1024:  # Basic sanity checks
-                    break
-
-                position += total_len
-
-            except Exception:
-                # Corrupted record found
-                break
-
-        return position
-
     def _create_new_chunk(self):
         """Create new SHM chunk with ownership"""
         try:
@@ -109,50 +76,145 @@ class Writer:
             raise RuntimeError(f"Failed to create chunk: {e}")
 
     def write(self, timestamp: int, data: Union[bytes, np.ndarray], force_index: bool = False) -> int:
-        """ATOMIC record writing with crash recovery support"""
-        with self.lock:
-            # Convert data to bytes
-            if isinstance(data, np.ndarray):
-                record_data = data.tobytes()
-            else:
-                record_data = bytes(data)
+        # Convert data to bytes
+        if isinstance(data, np.ndarray):
+            record_data = data.tobytes()
+        else:
+            record_data = bytes(data)
 
-            # Calculate total record size: timestamp(8) + length(4) + data
-            record_size = len(record_data)
+        # Calculate total record size: timestamp(8) + length(4) + data
+        record_size = len(record_data)
 
-            # Check if need new chunk
+        # Check if need new chunk
+        try:
+            if record_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
+                self._create_new_chunk()
+        except Exception as e:
+            raise Exception(f"Worst exception ever: {e}")
+
+        # 1. Write record data to chunk
+        position = self.current_chunk_metadata.write_pos
+        new_position = self.current_chunk.write_bytes(position, record_data)
+
+        # 2. Update registry state
+        self.current_chunk_metadata.last_update = timestamp
+        self.current_chunk_metadata.write_pos = new_position
+        self.current_chunk_metadata.num_records += 1
+
+        # 3. Update index if needed (based on feed callback)
+        # if force_index or (self.index_callback and self.index_callback(memoryview(record_data), timestamp)):
+        #     self.index.add_entry(timestamp, self.current_chunk_id, position, 1 if force_index else 0)
+
+    # ====== NEW: schema-based value packing with staging/commit ======
+    def _ensure_schema_init(self):
+        if getattr(self, "_S", None) is not None:
+            return
+        rf = getattr(self, "record_format", None)
+        if not rf or "fmt" not in rf or "fields" not in rf:
+            raise RuntimeError("Writer.record_format missing 'fmt'/'fields'; cannot pack values.")
+        self._S = struct.Struct(rf["fmt"])
+        self._rec_size = self._S.size
+        self._chunk_mv = self.current_chunk.memview()
+        self._value_fields = [f.get("name") for f in rf["fields"] if f.get("name") != "_"]
+        # timestamp field name (optional). feed specs used 'ts_col' previously.
+        self._ts_field = rf.get("ts_col") or rf.get("ts") or None
+        try:
+            self._ts_idx = self._value_fields.index(self._ts_field) if self._ts_field else None
+        except ValueError:
+            self._ts_idx = None
+        # staging state
+        self._staging_active = False
+        self._staging_pos = 0
+        self._staging_count = 0
+        self._staging_last_ts = None
+
+    def _extract_ts_from_vals(self, vals):
+        if getattr(self, "_ts_idx", None) is not None and self._ts_idx < len(vals):
             try:
-                if record_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
-                    self._create_new_chunk()
-            except Exception as e:
-                raise Exception(f"Worst exception ever: {e}")
+                return int(vals[self._ts_idx])
+            except Exception:
+                pass
+        # fallback to wall clock if schema didn't specify ts
+        return int(time.time_ns())
 
-            # 1. Write record data to chunk
-            position = self.current_chunk_metadata.write_pos
-            new_position = self.current_chunk.write_bytes(position, record_data)
+    def write_values(self, *vals) -> int:
+        """Pack positional values according to schema and write immediately to SHM.
+        Does not accept kwargs. Uses schema order (non-padding fields).
+        Timestamp for metadata comes from the field named by 'ts_col' (if present) else wall clock.
+        """
+        self._ensure_schema_init()
+        ts = self._extract_ts_from_vals(vals)
+        record_size = self._rec_size
+        # rotate chunk if needed
+        if record_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
+            self._create_new_chunk()
+        self._S.pack_into(self._chunk_mv, self.current_chunk_metadata.write_pos, *vals)
+        # commit metadata
+        self.current_chunk_metadata.last_update = ts
+        self.current_chunk_metadata.write_pos += self._rec_size
+        self.current_chunk_metadata.num_records += 1
+        return self.current_chunk_metadata.write_pos
 
-            # 2. Update registry state
-            self.current_chunk_metadata.last_update = timestamp
-            self.current_chunk_metadata.write_pos = new_position
-            self.current_chunk_metadata.num_records += 1
+    def stage_values(self, *vals) -> int:
+        """Pack positional values and stage them (write bytes) without updating metadata.
+        Call commit_values() to publish staged rows atomically.
+        NOTE: this API assumes the same thread uses the writer during staging.
+        """
+        self._ensure_schema_init()
+        self._S.pack_into(self._rowbuf, 0, *vals)
+        ts = self._extract_ts_from_vals(vals)
+        # initialize staging window if not active
+        if not getattr(self, "_staging_active", False):
+            self._staging_active = True
+            self._staging_pos = self.current_chunk_metadata.write_pos
+            self._staging_count = 0
+            self._staging_last_ts = None
+        # rotate chunk if the staged record won't fit
+        if self._staging_pos + self._rec_size > self.current_chunk_metadata.size:
+            # start a new chunk for staging
+            self._create_new_chunk()
+            self._staging_pos = self.current_chunk_metadata.write_pos
+            self._staging_count = 0
+            self._staging_last_ts = None
+        # write bytes at the staging cursor (no registry update)
+        new_pos = self.current_chunk.write_bytes(self._staging_pos, self._rowmv[:self._rec_size])
+        self._staging_pos = new_pos
+        self._staging_count += 1
+        self._staging_last_ts = ts
+        return new_pos
 
-            # 3. Update index if needed (based on feed callback)
-            # if force_index or (self.index_callback and self.index_callback(memoryview(record_data), timestamp)):
-            #     self.index.add_entry(timestamp, self.current_chunk_id, position, 1 if force_index else 0)
+    def commit_values(self) -> int:
+        """Publish previously staged rows by updating metadata once.
+        Returns new write_pos. No-op if nothing staged.
+        """
+        # If schema hasn't been initialized yet, there is nothing staged.
+        if getattr(self, "_S", None) is None:
+            return self.current_chunk_metadata.write_pos
+        if not getattr(self, "_staging_active", False) or self._staging_count == 0:
+            return self.current_chunk_metadata.write_pos
+        self.current_chunk_metadata.last_update = (
+            self._staging_last_ts if self._staging_last_ts is not None else self.current_chunk_metadata.last_update
+        )
+        self.current_chunk_metadata.write_pos = self._staging_pos
+        self.current_chunk_metadata.num_records += self._staging_count
+        # reset staging
+        self._staging_active = False
+        self._staging_count = 0
+        self._staging_last_ts = None
+        return self.current_chunk_metadata.write_pos
 
     def close(self):
         """Clean shutdown with ownership release"""
-        with self.lock:
-            print(f"🛑 Shutting down writer for '{self.feed_name}' (PID: {self.my_pid})")
-            if self.current_chunk:
-                self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
-                if self.feed_config["persist"]:
-                    try:
-                        file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
-                        self.current_chunk.persist_to_disk(str(file_path))
-                        print(f"💾 Final persist of chunk {self.current_chunk_id}")
-                    except Exception as e:
-                        print(f"⚠️  Could not persist final chunk: {e}")
-                self.current_chunk_metadata.release()
-                self.registry.close()
-                self.current_chunk.close()
+        print(f"🛑 Shutting down writer for '{self.feed_name}' (PID: {self.my_pid})")
+        if self.current_chunk:
+            self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
+            if self.feed_config["persist"]:
+                try:
+                    file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
+                    self.current_chunk.persist_to_disk(str(file_path))
+                    print(f"💾 Final persist of chunk {self.current_chunk_id}")
+                except Exception as e:
+                    print(f"⚠️  Could not persist final chunk: {e}")
+            self.current_chunk_metadata.release()
+            self.registry.close()
+            self.current_chunk.close()
