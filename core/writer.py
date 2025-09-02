@@ -106,7 +106,6 @@ class Writer:
             print(f"✨ Created new SHM chunk {self.current_chunk_id} (PID: {self.my_pid})")
 
         except Exception as e:
-            self.current_chunk_id -= 1
             raise RuntimeError(f"Failed to create chunk: {e}")
 
     def write(self, timestamp: int, data: Union[bytes, np.ndarray], force_index: bool = False) -> int:
