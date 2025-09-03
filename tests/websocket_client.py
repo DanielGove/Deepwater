@@ -13,7 +13,7 @@ from core.platform import Platform  # unchanged platform substrate
 from utils.benchmarking import Metrics
 from utils.timestamps import parse_ns_timestamp
 
-# ======= tiny, allocation-aware helpers =======
+# ======= tiny allocation-aware helpers =======
 def _now_ns() -> int: return time.time_ns()
 def _perf_ns() -> int: return time.perf_counter_ns()
 
