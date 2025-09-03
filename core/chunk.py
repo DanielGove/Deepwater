@@ -54,8 +54,8 @@ class Chunk:
     def close(self):
         if self.is_shm:
             self.buffer = None
-            self.shm.close()
             self.shm.unlink()
+            self.shm.close()
         else:
             self.buffer = None
             self.mmap.close()

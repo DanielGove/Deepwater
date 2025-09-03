@@ -22,7 +22,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.application.current import get_app
 
 # Engine
-from feeds.websocket_client import MarketDataEngine
+from websocket_client import MarketDataEngine
 
 # ────────────────────────── stdout capture ──────────────────────────
 LOGFILE = os.environ.get("DW_UI_LOGFILE")  # optional path
@@ -89,10 +89,6 @@ def _sum_rates(block: Dict[str, Dict[str, Any]]) -> float:
         r = d.get("rates", {})
         total += float(r.get("rps_10s", 0.0))
     return total
-
-def _parse_products(arg: str) -> List[str]:
-    if not arg: return []
-    return [p.strip().upper() for p in arg.replace(",", " ").split() if p.strip()]
 
 # ────────────────────────── UI ──────────────────────────
 class DashboardApp:

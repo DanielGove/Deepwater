@@ -217,4 +217,5 @@ class Writer:
                     print(f"⚠️  Could not persist final chunk: {e}")
             self.current_chunk_metadata.release()
             self.registry.close()
+            self._chunk_mv = None
             self.current_chunk.close()

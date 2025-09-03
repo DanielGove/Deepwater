@@ -176,14 +176,14 @@ class FeedRegistry:
     def register_chunk(self, start_time: int, chunk_id: int = None, size: int = None, status: int = None) -> int:
         if not self.is_writer:
             raise PermissionError("Read-only mode")
-
+        self._chunk_count[0] += 1
         if self._chunk_count[0] >= self.max_chunks:
             if self.max_chunks >= 1048576:  # 1M chunks = 64MB, reasonable limit
                 raise IndexError(f"Registry at maximum size: {self.max_chunks}")
             new_max = min(self.max_chunks * 2, 1048576)  # Double it, cap at 1M
             self._resize_file(new_max)
         
-        offset = HEADER_SIZE + (self._chunk_count[0]<< 6)
+        offset = HEADER_SIZE + ((self._chunk_count[0]-1)<< 6)
         self._mv[offset + CHUNK_START_OFFSET:offset + CHUNK_END_OFFSET] = start_time.to_bytes(8, 'little')
         self._mv[offset + CHUNK_END_OFFSET:offset + CHUNK_WRITE_POS_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"            # End Time, write position,
         self._mv[offset + CHUNK_WRITE_POS_OFFSET:offset + CHUNK_NUM_RECORDS_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"    # and number of records
@@ -192,8 +192,7 @@ class FeedRegistry:
         self._mv[offset + CHUNK_ID_OFFSET:offset + CHUNK_SIZE_OFFSET] = chunk_id.to_bytes(8, 'little')
         self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_STATUS_OFFSET] = size.to_bytes(8, 'little')
         self._mv[offset + CHUNK_STATUS_OFFSET] = status
-
-        self._chunk_count[0] += 1
+        
         self.mm.flush()
         return self._chunk_count[0]
     
@@ -286,7 +285,7 @@ class FeedRegistry:
     def get_latest_chunk(self) -> Optional[ChunkMeta]:
         if self._chunk_count[0] == 0:
             return None
-        return self.get_chunk_metadata(self._chunk_count[0] - 1)
+        return self.get_chunk_metadata(self._chunk_count[0])
 
     def iter_chunks_meta(self) -> Iterator[ChunkMeta]:
         for i in range(self._chunk_count[0]):

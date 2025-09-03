@@ -3,43 +3,21 @@ import threading, socket, orjson, time, struct, signal
 from websocket import create_connection, WebSocketTimeoutException, WebSocketConnectionClosedException
 from typing import Dict, Iterable, Optional, Tuple, Any, List
 
-import numba as _nb
 from fastnumbers import fast_float as _ff
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.platform import Platform  # unchanged platform substrate
 from utils.benchmarking import Metrics
+from utils.timestamps import parse_ns_timestamp
 
 # ======= tiny, allocation-aware helpers =======
-
-def _now_s() -> int: return int(time.time())
 def _now_ns() -> int: return time.time_ns()
 def _perf_ns() -> int: return time.perf_counter_ns()
 
-@_nb.njit(cache=True, fastmath=True)
-def _days_from_civil(y: int, m: int, d:int):
-    y -= m <=  2
-    era = (y if y >= 0 else 400) // 400
-    yoe = y - era * 400
-    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
-    doe = yoe * 365 + yoe // 4 - yoe // 100 + yoe // 400 + doy
-    return era * 146097 + doe - 719468
-
-@_nb.njit(cache=True, fastmath=True)
-def parse_ns_timestamp(ts):
-    # digits to ints without slicing
-    def d2(i): return (ts[i]-48)*10+(ts[i+1]-48)
-    def d4(i): return (ts[i]-48)*1000+(ts[i+1]-48)*100+(ts[i+2]-48)*10+(ts[i+3]-48)
-    year = d4(0); month = d2(5); day = d2(8)
-    hour = d2(11); minute = d2(14); sec = d2(17)
-    days = _days_from_civil(year, month, day)
-    secs = days*86400+hour*3600+minute*60+sec
-    nanos = 10000*d2(20)+100*d2(22)#+d2(24)
-    return secs*1_000_000_000 + nanos
-
-# ======= record formats (unchanged) =======
-_PACK_TRADE = struct.Struct("<cc14xQQdd16x")
-_PACK_L2    = struct.Struct("<cc6xQdd")
-
+# ======= feed configuration =======
 def trades_spec(pid: str) -> dict:
     return {
         "feed_name": f"CB-TRADES-{pid}",
@@ -55,7 +33,7 @@ def trades_spec(pid: str) -> dict:
             {"name":"_",          "type":"_16",     "desc":"padding"},
         ],
         "ts_col": "ev_ns",
-        "chunk_size_mb": 16,
+        "chunk_size_mb": 1,
         "retention_hours": 2,
         "persist": True
     }
@@ -73,7 +51,7 @@ def l2_spec(pid: str) -> dict:
             {"name":"qty",        "type":"float64","desc":"new quantity at level"},
         ],
         "ts_col": "ev_ns",
-        "chunk_size_mb": 16,
+        "chunk_size_mb": 1,
         "retention_hours": 2,
         "persist": True,
         "index_playback": True
@@ -97,24 +75,15 @@ class MarketDataEngine:
         # Engine State
         self._should_run = False
         self._ws = None
-        self._pid_lock = threading.Lock()
         self.product_ids: set[str] = set()
 
         # single IO thread
         self.io_thread: Optional[threading.Thread] = None
 
         # platform
-        self.platform = Platform(base_path="./platform_data")
+        self.platform = Platform(base_path="/deepwater/data/coinbase-test")
         self.trade_writers: Dict[str, Any] = {}
         self.book_writers:  Dict[str, Any] = {}
-
-        # data buffers (minimize alloc)
-        self._rec_trade = _PACK_TRADE.size
-        self._rec_l2 = _PACK_L2.size
-        self._buf_size_trade = 64
-        self._buf_size_l2 = 512
-        self._buf_trade = bytearray(self._rec_trade*self._buf_size_trade)
-        self._buf_l2 = bytearray(self._rec_l2*self._buf_size_l2)
 
         # metrics
         self._seq_gap_trades = 0
@@ -132,6 +101,7 @@ class MarketDataEngine:
         self._should_run = True
         self.io_thread = threading.Thread(target=self._io_loop, name="ws-io", daemon=True)
         self.io_thread.start()
+        self._send_subscribe(self.product_ids)
 
     def stop(self) -> None:
         self._should_run = False
@@ -139,37 +109,36 @@ class MarketDataEngine:
             self.io_thread.join()
         if self._ws is not None:
             try: self._ws.close()
-            except Exception: pass
+            except Exception as e: print("WS close error:", e)
         self.platform.close()
         self.book_writers = dict()
         self.trade_writers = dict()
 
     # ---- control ----
 
-    def subscribe_many(self, product_ids: Iterable[str]) -> None:
-        with self._pid_lock:
-            for p in product_ids:
-                if p: self.product_ids.add(str(p).upper())
-            snapshot = tuple(sorted(self.product_ids))
-        self._send_subscribe(snapshot)
-
     def subscribe(self, product_id: str) -> None:
         if not product_id: return
-        with self._pid_lock:
-            self.product_ids.add(product_id.upper())
-            snapshot = tuple(sorted(self.product_ids))
-        self._send_subscribe(snapshot)
+        product_id = product_id.upper()
+
+        feed_spec = trades_spec(product_id)
+        self.platform.create_feed(feed_spec)
+        self.trade_writers[product_id] = self.platform.create_writer(feed_spec["feed_name"])
+
+        feed_spec = l2_spec(product_id)
+        self.platform.create_feed(feed_spec)
+        self.book_writers[product_id] = self.platform.create_writer(feed_spec["feed_name"])
+
+        self.product_ids.add(product_id)
+        self._send_subscribe((product_id,))
 
     def unsubscribe(self, product_id: str) -> None:
         if not product_id: return
         pid = product_id.upper()
-        with self._pid_lock:
-            self.product_ids.discard(pid)
+        self.product_ids.discard(pid)
         self._send_unsubscribe([pid])
 
     def list_products(self) -> list[str]:
-        with self._pid_lock:
-            return sorted(self.product_ids)
+        return sorted(self.product_ids)
 
     def is_connected(self) -> bool:
         return self._ws is not None
@@ -191,64 +160,42 @@ class MarketDataEngine:
         )
         self._ws.settimeout(2.0)
 
-    def _send_subscribe(self, snapshot: Tuple[str, ...]) -> None:
-        if not snapshot or self._ws is None: return
+    def _send_subscribe(self, product_id: Tuple[str]) -> None:
+        if self._ws is None: return
         try:
             self._ws.send(orjson.dumps({"type":"subscribe","channel":"heartbeats"}))
-            self._ws.send(orjson.dumps({"type":"subscribe","channel":"market_trades","product_ids":list(snapshot)}))
-            self._ws.send(orjson.dumps({"type":"subscribe","channel":"level2","product_ids":list(snapshot)}))
+            self._ws.send(orjson.dumps({"type":"subscribe","channel":"market_trades","product_ids":product_id}))
+            self._ws.send(orjson.dumps({"type":"subscribe","channel":"level2","product_ids":product_id}))
         except Exception:
             pass
 
-    def _send_unsubscribe(self, targets: List[str]) -> None:
-        if not targets or self._ws is None: return
+    def _send_unsubscribe(self, targets: Tuple[str]) -> None:
+        if self._ws is None: return
         try:
             self._ws.send(orjson.dumps({"type":"unsubscribe","channel":"market_trades","product_ids":targets}))
             self._ws.send(orjson.dumps({"type":"unsubscribe","channel":"level2","product_ids":targets}))
         except Exception:
             pass
 
-    def _ensure_trade_writer(self, pid: str):
-        wr = self.trade_writers.get(pid)
-        if wr is None:
-            feed_spec = trades_spec(pid)
-            self.platform.create_feed(feed_spec)
-            self.trade_writers[pid] = self.platform.create_writer(feed_spec["feed_name"])
-            wr = self.trade_writers[pid]
-        return wr
-
-    def _ensure_l2_writer(self, pid: str):
-        wr = self.book_writers.get(pid)
-        if wr is None:
-            feed_spec = l2_spec(pid)
-            wr = self.platform.create_feed(feed_spec)
-            self.book_writers[pid] = self.platform.create_writer(feed_spec["feed_name"])
-            wr = self.book_writers[pid]
-        return wr
-
     # ---- unified IO loop: recv + process ----
 
     def _io_loop(self) -> None:
         loads = orjson.loads
-        mv_trade = memoryview(self._buf_trade)
-        mv_l2 = memoryview(self._buf_l2)
-
         while self._should_run:
             try:
                 self._connect()
+                
                 # resubscribe
-                with self._pid_lock:
-                    snapshot = tuple(sorted(self.product_ids))
-                if snapshot: self._send_subscribe(snapshot)
+                self._send_subscribe(self.product_ids)
 
                 # main recv→process loop
                 while self._should_run:
                     try:
                         raw = self._ws.recv()
                     except WebSocketTimeoutException:
-                        continue
+                        raise WebSocketConnectionClosedException("WS recv timeout")
                     except Exception:
-                        break
+                        raise Exception("WS recv error")
 
                     t_in_ns = _perf_ns()
                     self._metrics.ingress(len(raw), 1)
@@ -256,7 +203,7 @@ class MarketDataEngine:
                     try:
                         obj = loads(raw)
                     except Exception:
-                        continue
+                        raise Exception("JSON decode error NEED TO MAKE THIS SAVE TO FILE")
 
                     # sequence gaps (unchanged)
                     seq = obj.get("sequence_num")
@@ -273,37 +220,25 @@ class MarketDataEngine:
                             trades = ev.get("trades")
                             for tr in trades:
                                 pid = tr.get("product_id")
-                                wr = self._ensure_trade_writer(pid)
                                 ev_ns = parse_ns_timestamp(tr.get("time").encode('ascii'))
-                                side  = tr.get("side")[0].encode('ascii') # 'B' or 'S'
+                                side  = tr.get("side")[0].encode("ascii") # 'B' or 'S'
                                 price = _ff(tr.get("price")); size = _ff(tr.get("size"))
                                 tid   = int(tr.get("trade_id") or 0)
-                                #_PACK_TRADE.pack_into(self._buf_trade, 0, b'T', side, tid, ev_ns, price, size)
-                                wr.write_values(b'T',side,tid,ev_ns,price,size)
-                                self._metrics.trade(pid, n=1, latency_us=_perf_ns()-t_in_ns)
+                                self.trade_writers[pid].write_values(b'T',side,tid,ev_ns,price,size)
+                            self._metrics.trade(pid, n=len(trades), latency_us=_now_ns()-parse_ns_timestamp(obj.get("timestamp").encode("ascii")))
 
                     elif ch == "l2_data":
-                        continue
                         events = obj.get("events")
                         for ev in events:
                             pid = ev.get("product_id")
                             l2_type = ev.get("type")[0].encode('ascii')  # 'U' or 'S'
-                            wr = self._ensure_l2_writer(pid)
                             updates = ev.get("updates")
-                            n_updates = len(updates)
-                            batch = 0
-                            while batch < n_updates:
-                                u0=0
-                                for u in updates[batch:batch+self._buf_size_l2]:
-                                    ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
-                                    side  = u.get("side")[0].encode('ascii')  # 'B' or 'A'
-                                    price = _ff(u.get("price_level")); qty = _ff(u.get("new_quantity"))
-                                    _PACK_L2.pack_into(self._buf_l2, u0*self._rec_l2, l2_type, side, ev_ns, price, qty)
-                                    u0+=1
-                                # Batch write
-                                wr.write(t_in_ns, mv_l2[:u0*self._rec_l2])
-                                batch += self._buf_size_l2
-                            self._metrics.l2(pid, n=n_updates, latency_us=_perf_ns()-t_in_ns)
+                            for u in updates:
+                                ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
+                                side  = u.get("side")[0].encode("ascii")  # 'B' or 'A'
+                                price = _ff(u.get("price_level")); qty = _ff(u.get("new_quantity"))
+                                self.book_writers[pid].write_values(l2_type, side, ev_ns, price, qty)
+                            self._metrics.l2(pid, n=len(updates), latency_us=_now_ns()-parse_ns_timestamp(obj.get("timestamp").encode("ascii")))
 
                     elif ch == "subscriptions":
                         pass
@@ -316,15 +251,15 @@ class MarketDataEngine:
             except WebSocketConnectionClosedException:
                 pass
             except Exception as e:
-                raise Exception(e)
+                print("WS ERROR:", e)
             finally:
                 if self._should_run:
                     try:
-                        if self._ws is not None:
-                            self._ws.close()
+                        self.stop()
                     except Exception:
                         pass
                     time.sleep(0.5)  # small backoff
+                    self.start()
 
     def _handle_signal(self, signum, _frame):
         try:
