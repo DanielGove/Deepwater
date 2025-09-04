@@ -44,7 +44,6 @@ class Writer:
         self._create_new_chunk()
 
     def _create_new_chunk(self):
-        """Create new SHM chunk with ownership"""
         try:
 
             self.current_chunk_id += 1
@@ -56,7 +55,6 @@ class Writer:
                 if self.feed_config["persist"]:
                     file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
                     self.current_chunk.persist_to_disk(str(file_path))
-                    print(f"💾 Persisted chunk {self.current_chunk_id} to {file_path}")
                 self._chunk_mv = None
                 self.current_chunk.close()
 
@@ -72,40 +70,25 @@ class Writer:
             self.current_chunk = Chunk(f"{self.feed_name}-{self.current_chunk_id}", self.feed_config["chunk_size_bytes"], create=True)
             self._chunk_mv = self.current_chunk.memview()
 
-            print(f"✨ Created new SHM chunk {self.current_chunk_id} (PID: {self.my_pid})")
-
         except Exception as e:
-            raise RuntimeError(f"Failed to create chunk: {e}")
+            raise
 
     def write(self, timestamp: int, data: Union[bytes, np.ndarray], force_index: bool = False) -> int:
-        # Convert data to bytes
         if isinstance(data, np.ndarray):
             record_data = data.tobytes()
         else:
             record_data = bytes(data)
 
-        # Calculate total record size: timestamp(8) + length(4) + data
         record_size = len(record_data)
+        if record_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
+            self._create_new_chunk()
 
-        # Check if need new chunk
-        try:
-            if record_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
-                self._create_new_chunk()
-        except Exception as e:
-            raise Exception(f"Worst exception ever: {e}")
-
-        # 1. Write record data to chunk
         position = self.current_chunk_metadata.write_pos
         new_position = self.current_chunk.write_bytes(position, record_data)
 
-        # 2. Update registry state
         self.current_chunk_metadata.last_update = timestamp
         self.current_chunk_metadata.write_pos = new_position
         self.current_chunk_metadata.num_records += 1
-
-        # 3. Update index if needed (based on feed callback)
-        # if force_index or (self.index_callback and self.index_callback(memoryview(record_data), timestamp)):
-        #     self.index.add_entry(timestamp, self.current_chunk_id, position, 1 if force_index else 0)
 
     # ====== NEW: schema-based value packing with staging/commit ======
     def _ensure_schema_init(self):
@@ -139,9 +122,8 @@ class Writer:
         return int(time.time_ns())
 
     def write_values(self, *vals) -> int:
-        """Pack positional values according to schema and write immediately to SHM.
+        """Pack positional values according to schema and write directly to SHM.
         Does not accept kwargs. Uses schema order (non-padding fields).
-        Timestamp for metadata comes from the field named by 'ts_col' (if present) else wall clock.
         """
         self._ensure_schema_init()
         ts = self._extract_ts_from_vals(vals)
@@ -156,6 +138,7 @@ class Writer:
         self.current_chunk_metadata.num_records += 1
         return self.current_chunk_metadata.write_pos
 
+    # TODO
     def stage_values(self, *vals) -> int:
         """Pack positional values and stage them (write bytes) without updating metadata.
         Call commit_values() to publish staged rows atomically.
@@ -184,6 +167,7 @@ class Writer:
         self._staging_last_ts = ts
         return new_pos
 
+    # TODO
     def commit_values(self) -> int:
         """Publish previously staged rows by updating metadata once.
         Returns new write_pos. No-op if nothing staged.
@@ -206,16 +190,14 @@ class Writer:
 
     def close(self):
         """Clean shutdown with ownership release"""
-        print(f"🛑 Shutting down writer for '{self.feed_name}' (PID: {self.my_pid})")
         if self.current_chunk:
             self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
             if self.feed_config["persist"]:
                 try:
                     file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
                     self.current_chunk.persist_to_disk(str(file_path))
-                    print(f"💾 Final persist of chunk {self.current_chunk_id}")
                 except Exception as e:
-                    print(f"⚠️  Could not persist final chunk: {e}")
+                    print(f"⚠️  Could not persist final chunk {e}")
             self.current_chunk_metadata.release()
             self.registry.close()
             self._chunk_mv = None

@@ -48,60 +48,60 @@ class ChunkMeta:
 
     @property
     def start_time(self) -> int:
-        return int(self._start[0])
+        return self._start[0]
     @start_time.setter
     def start_time(self, v: int) -> None:
-        self._start[0] = int(v)
+        self._start[0] = v
 
     @property
     def end_time(self) -> int:
-        return int(self._end[0])
+        return self._end[0]
     @end_time.setter
     def end_time(self, v: int) -> None:
-        self._end[0] = int(v)
+        self._end[0] = v
 
     @property
     def write_pos(self) -> int:
-        return int(self._wp[0])
+        return self._wp[0]
     @write_pos.setter
     def write_pos(self, v: int) -> None:
-        self._wp[0] = int(v)
+        self._wp[0] = v
 
     @property
     def num_records(self) -> int:
-        return int(self._nr[0])
+        return self._nr[0]
     @num_records.setter
     def num_records(self, v: int) -> None:
-        self._nr[0] = int(v)
+        self._nr[0] = v
 
     @property
     def last_update(self) -> int:
-        return int(self._lu[0])
+        return self._lu[0]
     @last_update.setter
     def last_update(self, v: int) -> None:
-        self._lu[0] = int(v)
+        self._lu[0] = v
 
     @property
     def chunk_id(self) -> int:
-        return int(self._id[0])
+        return self._id[0]
     @chunk_id.setter
     def chunk_id(self, v: int) -> None:
         raise Exception("Cannot overwrite chunk id in registry")
 
     @property
     def size(self) -> int:
-        return int(self._size[0])
+        return self._size[0]
     @size.setter
     def size(self, v: int) -> None:
-        self._size[0] = int(v)
+        self._size[0] = v
 
     @property
     def status(self) -> int:
-        return int(self._status[0])
+        return self._status[0]
     @status.setter
     def status(self, v: int) -> None:
         # clamp to 0..255 to avoid ValueError from casted B view
-        self._status[0] = int(v) & 0xFF
+        self._status[0] = v & 0xFF
 
     # Optional helpers
     def as_tuple(self) -> tuple[int,int,int,int,int]:
@@ -180,7 +180,7 @@ class FeedRegistry:
         if self._chunk_count[0] >= self.max_chunks:
             if self.max_chunks >= 1048576:  # 1M chunks = 64MB, reasonable limit
                 raise IndexError(f"Registry at maximum size: {self.max_chunks}")
-            new_max = min(self.max_chunks * 2, 1048576)  # Double it, cap at 1M
+            new_max = min(1 + self.max_chunks * 2, 1048576)  # Double it, cap at 1M
             self._resize_file(new_max)
         
         offset = HEADER_SIZE + ((self._chunk_count[0]-1)<< 6)
