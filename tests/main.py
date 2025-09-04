@@ -16,6 +16,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, VSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.widgets import TextArea
+from prompt_toolkit.document import Document
 from prompt_toolkit.filters import has_focus
 from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -101,6 +102,7 @@ class DashboardApp:
         self._mode = "dash"  # or "logs"
         self._snap_cache: Dict[str, Any] = {}
         self._snap_ts = 0.0
+        self._last_log_len = 0
 
         # capture ring
         self._ring = deque(maxlen=5000)
@@ -190,19 +192,28 @@ class DashboardApp:
     # ───────────── layout switching ─────────────
     def _show_logs(self):
         self._mode = "logs"
-        self._refresh_logs()
+        self._refresh_logs(force=True)
         self.app.layout.container = self._logs_root
         self.app.invalidate()
+
+    def _refresh_logs(self, force: bool = False):
+        # Called every frame while in logs mode (see _render_header)
+        # Only redraw when new lines arrived (cheap)
+        if not force and self._last_log_len == len(self._ring):
+            return
+        text = "\n".join(self._ring)
+        self._last_log_len = len(self._ring)
+        # Set text and move cursor to end for auto-scroll
+        self.logs_view.buffer.set_document(
+            Document(text=text, cursor_position=len(text)),
+            bypass_readonly=True
+        )
 
     def _show_dash(self):
         self._mode = "dash"
         self.app.layout.container = self._dash_root
         self.app.layout.focus(self.cmd)
         self.app.invalidate()
-
-    def _refresh_logs(self):
-        # Called on every frame while in logs mode
-        self.logs_view.text = "\n".join(self._ring)
 
     # ───────────── snapshots ─────────────
     def _snapshot(self) -> dict:

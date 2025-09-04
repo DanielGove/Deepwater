@@ -2,20 +2,19 @@
 import threading, socket, orjson, time, struct, signal
 from websocket import create_connection, WebSocketTimeoutException, WebSocketConnectionClosedException
 from typing import Dict, Iterable, Optional, Tuple, Any, List
-
 from fastnumbers import fast_float as _ff
 
 import sys
+import logging
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
+log = logging.getLogger("dw.ws")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 from core.platform import Platform  # unchanged platform substrate
 from utils.benchmarking import Metrics
 from utils.timestamps import parse_ns_timestamp
-
-# ======= tiny allocation-aware helpers =======
-def _now_ns() -> int: return time.time_ns()
-def _perf_ns() -> int: return time.perf_counter_ns()
 
 # ======= feed configuration =======
 def trades_spec(pid: str) -> dict:
@@ -33,7 +32,7 @@ def trades_spec(pid: str) -> dict:
             {"name":"_",          "type":"_16",     "desc":"padding"},
         ],
         "ts_col": "ev_ns",
-        "chunk_size_mb": 1,
+        "chunk_size_mb": 0.1,
         "retention_hours": 2,
         "persist": True
     }
@@ -51,11 +50,21 @@ def l2_spec(pid: str) -> dict:
             {"name":"qty",        "type":"float64","desc":"new quantity at level"},
         ],
         "ts_col": "ev_ns",
-        "chunk_size_mb": 1,
+        "chunk_size_mb": 0.1,
         "retention_hours": 2,
         "persist": True,
         "index_playback": True
     }
+
+# ======= tiny allocation-aware helpers =======
+def _now_ns() -> int: return time.time_ns()
+def _perf_ns() -> int: return time.perf_counter_ns()
+
+def _backoff():
+    b = 0.5
+    while True:
+        yield b
+        b = min(b*2.0, 15.0)
 
 # ======= Engine =======
 
@@ -94,6 +103,12 @@ class MarketDataEngine:
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
+        # Dead socket detection
+        self._hb_last = time.monotonic()
+        self._msg_last = time.monotonic()
+        self._hb_timeout = 12.0     # seconds with no heartbeats -> reconnect
+        self._msg_timeout = 12.0    # seconds with no messages  -> reconnect
+
     # ---- lifecycle ----
 
     def start(self) -> None:
@@ -101,18 +116,20 @@ class MarketDataEngine:
         self._should_run = True
         self.io_thread = threading.Thread(target=self._io_loop, name="ws-io", daemon=True)
         self.io_thread.start()
-        self._send_subscribe(self.product_ids)
+        for pid in self.product_ids:
+            self.subscribe(pid)
 
     def stop(self) -> None:
         self._should_run = False
-        if self.io_thread and self.io_thread.is_alive():
-            self.io_thread.join()
         if self._ws is not None:
             try: self._ws.close()
-            except Exception as e: print("WS close error:", e)
+            except Exception as e: log.warning("WS close error: %s", e)
+            self._ws = None
+        if self.io_thread and self.io_thread.is_alive():
+            self.io_thread.join(timeout=2.0)
         self.platform.close()
-        self.book_writers = dict()
-        self.trade_writers = dict()
+        self.book_writers.clear()
+        self.trade_writers.clear()
 
     # ---- control ----
 
@@ -160,42 +177,61 @@ class MarketDataEngine:
         )
         self._ws.settimeout(2.0)
 
-    def _send_subscribe(self, product_id: Tuple[str]) -> None:
+    def _send_subscribe(self, product_ids) -> None:
         if self._ws is None: return
         try:
+            pids = tuple(product_ids or ())
             self._ws.send(orjson.dumps({"type":"subscribe","channel":"heartbeats"}))
-            self._ws.send(orjson.dumps({"type":"subscribe","channel":"market_trades","product_ids":product_id}))
-            self._ws.send(orjson.dumps({"type":"subscribe","channel":"level2","product_ids":product_id}))
-        except Exception:
-            pass
+            self._ws.send(orjson.dumps({"type":"subscribe","channel":"market_trades","product_ids":pids}))
+            self._ws.send(orjson.dumps({"type":"subscribe","channel":"level2","product_ids":pids}))
+        except Exception as e:
+            log.warning("subscribe error: %s", e, exc_info=True)
 
-    def _send_unsubscribe(self, targets: Tuple[str]) -> None:
+    def _send_unsubscribe(self, targets) -> None:
         if self._ws is None: return
         try:
-            self._ws.send(orjson.dumps({"type":"unsubscribe","channel":"market_trades","product_ids":targets}))
-            self._ws.send(orjson.dumps({"type":"unsubscribe","channel":"level2","product_ids":targets}))
-        except Exception:
-            pass
+            pids = tuple(targets or ())
+            self._ws.send(orjson.dumps({"type":"unsubscribe","channel":"market_trades","product_ids":pids}))
+            self._ws.send(orjson.dumps({"type":"unsubscribe","channel":"level2","product_ids":pids}))
+        except Exception as e:
+            log.warning("unsubscribe error: %s", e, exc_info=True)
 
     # ---- unified IO loop: recv + process ----
 
     def _io_loop(self) -> None:
         loads = orjson.loads
-        while self._should_run:
+        for delay in _backoff():
+            if not self._should_run:
+                return
             try:
                 self._connect()
-                
-                # resubscribe
+                log.info("WS connected %s", self.uri)
                 self._send_subscribe(self.product_ids)
 
-                # main recv→process loop
+                # Reset liveness
+                self._hb_last = time.monotonic()
+                self._msg_last = time.monotonic()
+
                 while self._should_run:
                     try:
                         raw = self._ws.recv()
+                        if not raw:
+                            raise WebSocketConnectionClosedException("recv returned None/empty")
                     except WebSocketTimeoutException:
-                        raise WebSocketConnectionClosedException("WS recv timeout")
-                    except Exception:
-                        raise Exception("WS recv error")
+                        # treat as liveness issue; fall through to timeout checks below
+                        raw = None
+                    except WebSocketConnectionClosedException:
+                        raise
+                    except Exception as e:
+                        raise WebSocketConnectionClosedException(f"WS recv error: {e!s}")
+
+                    now = time.monotonic()
+                    # liveness: no msgs or heartbeats too long -> reconnect
+                    if (now - self._msg_last) > self._msg_timeout and (now - self._hb_last) > self._hb_timeout:
+                        raise WebSocketConnectionClosedException("liveness timeout")
+
+                    if raw is None:
+                        continue
 
                     t_in_ns = _perf_ns()
                     self._metrics.ingress(len(raw), 1)
@@ -203,7 +239,16 @@ class MarketDataEngine:
                     try:
                         obj = loads(raw)
                     except Exception:
-                        raise Exception("JSON decode error NEED TO MAKE THIS SAVE TO FILE")
+                        # don’t kill the session; count & continue (TODO: write bad frames to disk if you want)
+                        log.warning("JSON decode error (frame skipped)")
+                        continue
+
+                    ch = obj.get("channel")
+                    if ch == "heartbeats":
+                        self._hb_last = now
+                        continue
+
+                    self._msg_last = now
 
                     # sequence gaps (unchanged)
                     seq = obj.get("sequence_num")
@@ -212,54 +257,60 @@ class MarketDataEngine:
                             self._seq_gap_trades += 1
                         self._last_seq = int(seq)
 
-                    ch = obj.get("channel")
-
                     if ch == "market_trades":
-                        events = obj.get("events")
+                        events = obj.get("events") or ()
                         for ev in events:
-                            trades = ev.get("trades")
+                            trades = ev.get("trades") or ()
+                            pid = None
                             for tr in trades:
                                 pid = tr.get("product_id")
                                 ev_ns = parse_ns_timestamp(tr.get("time").encode('ascii'))
-                                side  = tr.get("side")[0].encode("ascii") # 'B' or 'S'
+                                side  = tr.get("side")[0].encode("ascii")
                                 price = _ff(tr.get("price")); size = _ff(tr.get("size"))
                                 tid   = int(tr.get("trade_id") or 0)
                                 self.trade_writers[pid].write_values(b'T',side,tid,ev_ns,price,size)
-                            self._metrics.trade(pid, n=len(trades), latency_us=_now_ns()-parse_ns_timestamp(obj.get("timestamp").encode("ascii")))
+                            if pid is not None:
+                                self._metrics.trade(pid, n=len(trades), latency_us=_perf_ns()-t_in_ns)
 
                     elif ch == "l2_data":
-                        events = obj.get("events")
+                        events = obj.get("events") or ()
                         for ev in events:
                             pid = ev.get("product_id")
                             l2_type = ev.get("type")[0].encode('ascii')  # 'U' or 'S'
-                            updates = ev.get("updates")
+                            updates = ev.get("updates") or ()
+                            # atomic publish is OK to add later; today we keep your write_values shape
                             for u in updates:
                                 ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
-                                side  = u.get("side")[0].encode("ascii")  # 'B' or 'A'
+                                side  = u.get("side")[0].encode("ascii")
                                 price = _ff(u.get("price_level")); qty = _ff(u.get("new_quantity"))
                                 self.book_writers[pid].write_values(l2_type, side, ev_ns, price, qty)
-                            self._metrics.l2(pid, n=len(updates), latency_us=_now_ns()-parse_ns_timestamp(obj.get("timestamp").encode("ascii")))
+                            self._metrics.l2(pid, n=len(updates), latency_us=_perf_ns()-t_in_ns)
 
                     elif ch == "subscriptions":
-                        pass
-                    elif ch == "heartbeats":
+                        # fine to ignore
                         pass
                     else:
-                        # Unknown channel; keep loop going
-                        raise Exception("Unknown Channel:", ch)
+                        # Unknown channel? log & continue (don’t crash)
+                        log.debug("unknown channel: %r", ch)
 
-            except WebSocketConnectionClosedException:
-                pass
+                # should_run flipped false -> exit thread cleanly
+                return
+
+            except WebSocketConnectionClosedException as e:
+                log.warning("WS closed: %s", e)
             except Exception as e:
-                print("WS ERROR:", e)
+                log.error("WS ERROR: %s", e, exc_info=True)
             finally:
-                if self._should_run:
-                    try:
-                        self.stop()
-                    except Exception:
-                        pass
-                    time.sleep(0.5)  # small backoff
-                    self.start()
+                # Clean up socket only; do NOT recursively restart here
+                if self._ws is not None:
+                    try: self._ws.close()
+                    except Exception: pass
+                    self._ws = None
+
+            if not self._should_run:
+                return
+            log.info("Reconnecting in %.2fs", delay)
+            time.sleep(delay)
 
     def _handle_signal(self, signum, _frame):
         try:

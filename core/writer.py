@@ -57,6 +57,7 @@ class Writer:
                     file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
                     self.current_chunk.persist_to_disk(str(file_path))
                     print(f"💾 Persisted chunk {self.current_chunk_id} to {file_path}")
+                self._chunk_mv = None
                 self.current_chunk.close()
 
             if self.current_chunk_metadata is not None:
@@ -69,6 +70,7 @@ class Writer:
 
             self.current_chunk_metadata = new_metadata
             self.current_chunk = Chunk(f"{self.feed_name}-{self.current_chunk_id}", self.feed_config["chunk_size_bytes"], create=True)
+            self._chunk_mv = self.current_chunk.memview()
 
             print(f"✨ Created new SHM chunk {self.current_chunk_id} (PID: {self.my_pid})")
 
@@ -114,7 +116,6 @@ class Writer:
             raise RuntimeError("Writer.record_format missing 'fmt'/'fields'; cannot pack values.")
         self._S = struct.Struct(rf["fmt"])
         self._rec_size = self._S.size
-        self._chunk_mv = self.current_chunk.memview()
         self._value_fields = [f.get("name") for f in rf["fields"] if f.get("name") != "_"]
         # timestamp field name (optional). feed specs used 'ts_col' previously.
         self._ts_field = rf.get("ts_col") or rf.get("ts") or None
