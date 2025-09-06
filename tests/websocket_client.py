@@ -32,7 +32,7 @@ def trades_spec(pid: str) -> dict:
             {"name":"_",          "type":"_16",     "desc":"padding"},
         ],
         "ts_col": "ev_ns",
-        "chunk_size_mb": 2,
+        "chunk_size_mb": 0.0625,
         "retention_hours": 2,
         "persist": True
     }
@@ -50,7 +50,7 @@ def l2_spec(pid: str) -> dict:
             {"name":"qty",        "type":"float64","desc":"new quantity at level"},
         ],
         "ts_col": "ev_ns",
-        "chunk_size_mb": 16,
+        "chunk_size_mb": 0.0625,
         "retention_hours": 2,
         "persist": True,
         "index_playback": True
@@ -279,11 +279,13 @@ class MarketDataEngine:
                             l2_type = ev.get("type")[0].encode('ascii')  # 'U' or 'S'
                             updates = ev.get("updates") or ()
                             # atomic publish is OK to add later; today we keep your write_values shape
+                            idx = True
                             for u in updates:
                                 ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
                                 side  = u.get("side")[0].encode("ascii")
                                 price = _ff(u.get("price_level")); qty = _ff(u.get("new_quantity"))
-                                self.book_writers[pid].write_values(l2_type, side, ev_ns, price, qty)
+                                self.book_writers[pid].write_values(l2_type, side, ev_ns, price, qty, create_index=idx)
+                                idx = False
                             self._metrics.l2(pid, n=len(updates), latency_us=_perf_ns()-t_in_ns)
 
                     elif ch == "subscriptions":

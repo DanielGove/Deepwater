@@ -1,4 +1,7 @@
-numpy==2.3.0
+fastnumbers==5.1.1
+llvmlite==0.44.0
+numba==0.61.2
+numpy==2.2.6
 orjson==3.10.18
 prompt_toolkit==3.0.51
 wcwidth==0.2.13

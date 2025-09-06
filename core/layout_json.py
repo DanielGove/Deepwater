@@ -50,7 +50,10 @@ def build_layout(fields: List[Dict], *, ts_col: str, endian: str = "<") -> Dict:
         "fmt": "<...>",                   # struct format string
         "record_size": <int>,             # bytes
         "fields": [{"name","type","offset","size"}, ...],
-        "ts": {"name","offset","size","endian"},
+        "ts_name": <str>,
+        "ts_offset": <int>,
+        "ts_size": <int>,
+        "ts_endian": <...endian?? idk i cant fucking remember and this doesnt matter>,
         "version": 1
       }
     """
@@ -88,10 +91,12 @@ def build_layout(fields: List[Dict], *, ts_col: str, endian: str = "<") -> Dict:
         "fmt": fmt,
         "record_size": size,
         "fields": out_fields,
-        "ts": {"name": ts_col, "offset": ts_off, "size": 8, "endian": endian},
+        "ts_name": ts_col,
+        "ts_offset": ts_off,
+        "ts_size": 8,
+        "ts_endian": endian,
         "version": 1,
     }
-
 
 def save_layout(feed_dir: Path | str, layout: Dict) -> None:
     feed_dir = Path(feed_dir)

@@ -54,7 +54,6 @@ class IndexRecord:
         return (self.timestamp, self.offset, self.size)
 
     def release(self) -> None:
-        # Release views (important before closing the mmap on some Python builds)
         self._timestamp.release()
         self._offset.release()
         self._size.release()
@@ -64,21 +63,21 @@ class IndexRecord:
         return (f"IndexRecord(start={self.timestamp}, offset={self.offset}, size={self.size})")
 
 class ChunkIndex:
-    #__slots__ = ("path", "max_chunks", "fd", "mm", "is_writer", "_mv", "_index_count")
+    __slots__ = ("file_path", "max_indices", "is_shm", "file", "fd", "mmap", "_mv", "_index_count")
 
-    def __init__(self, name: str = None, max_indexes: int = 2047, create: bool = False, file_path: str = None):
-        self.path = file_path
-        self.max_indexes = max_indexes
-        size = HEADER_SIZE + (max_indexes * INDEX_SIZE)
+    def __init__(self, name: str = None, max_indices: int = 2047, create: bool = False, directory: str = None):
+        self.file_path = directory/name
+        self.max_indices = max_indices
+        size = HEADER_SIZE + (max_indices * INDEX_SIZE)
 
-        if file_path:
-            already_exists = os.path.exists(file_path)
+        if self.file_path:
+            already_exists = os.path.exists(self.file_path)
             if create and not already_exists:
-                already_exists = os.path.exists(file_path)
-                with open(file_path, 'wb') as f:
+                already_exists = os.path.exists(self.file_path)
+                with open(self.file_path, 'wb') as f:
                     f.write(b'\x00' * size)
 
-            self.file = open(file_path, 'r+b')
+            self.file = open(self.file_path, 'r+b')
             self.mmap = mmap.mmap(self.file.fileno(), size)
             self._mv = memoryview(self.mmap)
             self.is_shm = False
@@ -100,18 +99,15 @@ class ChunkIndex:
             self.shm.close()
             self.shm.unlink()
         else:
+            self.mmap.flush()
             self.mmap.close()
             self.file.close()
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-            os.close(self.fd)
 
     def create_index(self, timestamp: int, offset: int = None, size: int = None) -> int:
-        if not self.is_writer:
-            raise PermissionError("Read-only mode")
         offset = HEADER_SIZE + (self._index_count[0] * INDEX_SIZE)
         self._mv[offset + TIMESTAMP_OFFSET:offset + OFFSET_WITHIN_THE_INDEX_STRUCT_OF_THE_VALUE_THAT_REPRESENTS_THE_OFFSET_OF_THE_RECORD_WITHIN_THE_CHUNK] = timestamp.to_bytes(8, 'little')
         self._mv[offset + OFFSET_WITHIN_THE_INDEX_STRUCT_OF_THE_VALUE_THAT_REPRESENTS_THE_OFFSET_OF_THE_RECORD_WITHIN_THE_CHUNK:offset + SIZE_OFFSET] = offset.to_bytes(8, 'little')
-        self._mv[offset + SIZE_OFFSET:offset + 8] = size.to_bytes(8, 'little')
+        self._mv[offset + SIZE_OFFSET:offset + SIZE_OFFSET + 8] = size.to_bytes(8, 'little')
         self._index_count[0] += 1
         return self._index_count[0]
 

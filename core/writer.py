@@ -30,12 +30,11 @@ class Writer:
         self.data_dir = platform.base_path / "data" / feed_name
 
         # Registry and indexing
-        # self.registry = platform.registry.get_metadata(feed_name)
         self.registry = FeedRegistry(platform.base_path/"data"/feed_name/f"{feed_name}.reg", mode='w')
-        #self.index = platform.get_or_create_index(feed_name)
 
         # Current chunk state
         self.current_chunk = None
+        self.chunk_index = None
         self.current_chunk_metadata = self.registry.get_latest_chunk()
         if self.current_chunk_metadata is None:
             self.current_chunk_id = 0
@@ -44,36 +43,36 @@ class Writer:
         self._create_new_chunk()
 
     def _create_new_chunk(self):
-        try:
+        self.current_chunk_id += 1
+        self.registry.register_chunk(
+            time.time_ns(),self.current_chunk_id,
+            self.feed_config["chunk_size_bytes"],1)
 
-            self.current_chunk_id += 1
-            self.registry.register_chunk(
-                time.time_ns(),self.current_chunk_id,
-                self.feed_config["chunk_size_bytes"],1)
+        if self.current_chunk is not None:
+            if self.feed_config["persist"]:
+                file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
+                self.current_chunk.persist_to_disk(str(file_path))
+            self._chunk_mv = None
+            self.current_chunk.close()
 
-            if self.current_chunk is not None:
-                if self.feed_config["persist"]:
-                    file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
-                    self.current_chunk.persist_to_disk(str(file_path))
-                self._chunk_mv = None
-                self.current_chunk.close()
+        if self.current_chunk_metadata is not None:
+            self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
+            new_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
+            new_metadata.start_time = self.current_chunk_metadata.end_time
+            self.current_chunk_metadata.release()
+        else:
+            new_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
 
-            if self.current_chunk_metadata is not None:
-                self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
-                new_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
-                new_metadata.start_time = self.current_chunk_metadata.end_time
-                self.current_chunk_metadata.release()
-            else:
-                new_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
+        self.current_chunk_metadata = new_metadata
+        self.current_chunk = Chunk(f"{self.feed_name}-{self.current_chunk_id}", self.feed_config["chunk_size_bytes"], create=True)
+        self._chunk_mv = self.current_chunk.memview()
 
-            self.current_chunk_metadata = new_metadata
-            self.current_chunk = Chunk(f"{self.feed_name}-{self.current_chunk_id}", self.feed_config["chunk_size_bytes"], create=True)
-            self._chunk_mv = self.current_chunk.memview()
+        if self.feed_config.get("index_playback") is True:
+            if self.chunk_index is not None:
+                self.chunk_index.close()
+            self.chunk_index = ChunkIndex(name=f"{self.feed_name}-{self.current_chunk_id}.idx", create=True, directory=self.platform.data_path/self.feed_name)
 
-        except Exception as e:
-            raise
-
-    def write(self, timestamp: int, data: Union[bytes, np.ndarray], force_index: bool = False) -> int:
+    def write(self, timestamp: int, data: Union[bytes, np.ndarray], create_index: bool = False) -> int:
         if isinstance(data, np.ndarray):
             record_data = data.tobytes()
         else:
@@ -85,12 +84,13 @@ class Writer:
 
         position = self.current_chunk_metadata.write_pos
         new_position = self.current_chunk.write_bytes(position, record_data)
+        if create_index and self.chunk_index is not None:
+            self.chunk_index.create_index(timestamp, self.current_chunk_metadata, 0)
 
         self.current_chunk_metadata.last_update = timestamp
         self.current_chunk_metadata.write_pos = new_position
         self.current_chunk_metadata.num_records += 1
 
-    # ====== NEW: schema-based value packing with staging/commit ======
     def _ensure_schema_init(self):
         if getattr(self, "_S", None) is not None:
             return
@@ -121,7 +121,7 @@ class Writer:
         # fallback to wall clock if schema didn't specify ts
         return int(time.time_ns())
 
-    def write_values(self, *vals) -> int:
+    def write_values(self, *vals, create_index=False) -> int:
         """Pack positional values according to schema and write directly to SHM.
         Does not accept kwargs. Uses schema order (non-padding fields).
         """
@@ -132,7 +132,11 @@ class Writer:
         if record_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
             self._create_new_chunk()
         self._S.pack_into(self._chunk_mv, self.current_chunk_metadata.write_pos, *vals)
-        # commit metadata
+        if create_index and self.chunk_index is not None:
+            self.chunk_index.create_index(
+                self._chunk_mv[self.current_chunk_metadata.write_pos+self.record_format.get("ts_offset"):self.current_chunk_metadata.write_pos+self.record_format.get("ts_offset")+self.record_format.get("ts_size")].cast("Q")[0],
+                self.current_chunk_metadata.write_pos, 0
+            )
         self.current_chunk_metadata.last_update = ts
         self.current_chunk_metadata.write_pos += self._rec_size
         self.current_chunk_metadata.num_records += 1
@@ -199,6 +203,8 @@ class Writer:
                 except Exception as e:
                     print(f"⚠️  Could not persist final chunk {e}")
             self.current_chunk_metadata.release()
+            if self.feed_config.get("index_playback") is True:
+                self.chunk_index.close()
             self.registry.close()
             self._chunk_mv = None
             self.current_chunk.close()
