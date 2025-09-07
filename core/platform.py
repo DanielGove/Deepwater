@@ -9,11 +9,8 @@ from typing import Dict, Optional, Tuple
 
 from core.global_registry import GlobalRegistry
 from core.layout_json import build_layout, save_layout, load_layout
-# ORM bits you already have:
-from core.feed_registry import FeedRegistry          # per-feed binary reg (chunks, times)  # TODO: confirm API
-from core.writer import Writer                        # your existing writer; loads layout.json itself
-# from core.uf_reader import UFReader                # TODO: add your reader impl
-# from core.index import ChunkIndex                  # TODO: if/when you build UF/NUF chunk indices
+from core.feed_registry import FeedRegistry
+from core.writer import Writer
 
 
 class Platform:
@@ -96,7 +93,7 @@ class Platform:
         if not self.registry.feed_exists(name):
             self.registry.register_feed(name, lifecycle)
         else:
-            self.registry.update_lifecycle(name, **lifecycle)
+            self.registry.update_metadata(name, **lifecycle)
 
         # 4) keep full app spec for ops/debug (optional)
         (fdir / "config.json").write_bytes(orjson.dumps(spec))
@@ -163,7 +160,7 @@ class Platform:
 
     def lifecycle(self, feed_name: str) -> dict:
         """Return lifecycle defaults from the global registry."""
-        lc = self.registry.get_lifecycle(feed_name)
+        lc = self.registry.get_metadata(feed_name)
         if lc is None:
             raise KeyError(f"feed '{feed_name}' not found in registry")
         return lc
@@ -175,13 +172,8 @@ class Platform:
 
     def list_feeds(self) -> list[dict]:
         """Linear scan of registry entries (small; fine for ops)."""
-        n = self.registry.feed_count()
-        out = []
-        for i in range(n):
-            md = self.registry._unpack_entry(self.registry._read_raw(i))  # small internal helper; OK for ops
-            out.append(md)
-        return out
-
+        return self.registry.list_feeds()
+    
     def describe_feed(self, feed_name: str) -> dict:
         """Combine registry lifecycle + layout summary for ops."""
         md = self.registry.get_metadata(feed_name)
