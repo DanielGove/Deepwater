@@ -74,7 +74,7 @@ class GlobalRegistry:
     def feed_exists(self, name: str) -> bool:
         return self._find_feed_offset(name) > 0
     def list_feeds(self):
-        return [self.mmap[offset:offset+32].rstrip(b'\x00') for offset in range(self.HEADER_SIZE, self.HEADER_SIZE+self.feed_count*self.ENTRY_SIZE,self.ENTRY_SIZE)]
+        return [self.mmap[offset:offset+32].rstrip(b'\x00').decode() for offset in range(self.HEADER_SIZE, self.HEADER_SIZE+self.feed_count*self.ENTRY_SIZE,self.ENTRY_SIZE)]
 
     # ---------- public API ----------
     def register_feed(self, name: str, lifecycle: dict, now_ns: int = 0) -> bool:

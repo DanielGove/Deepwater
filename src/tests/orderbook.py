@@ -11,5 +11,6 @@ from core.platform import Platform
 if __name__ == "__main__":
     dw_platform = Platform(base_path="/deepwater/data/coinbase-test")
     feeds = dw_platform.list_feeds()
-    print(feeds)
-    #reader = dw_platform.create_reader(feed_name="CB-L2-XRP-USD")
+    reader = dw_platform.create_reader(feed_name=feeds[0])
+    record = reader.get_latest_record()
+    print(record)

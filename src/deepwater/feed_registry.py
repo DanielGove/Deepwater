@@ -5,12 +5,12 @@ import fcntl
 from typing import Iterator, Optional
 
 # Only keep struct for initial setup - eliminate from hot paths
-CHUNK_STRUCT = struct.Struct("<QQQQQQQB7x")  # start, end, write_pos, num_records, last_update, chunk_id, size, status + padding = 64 bytes
-HEADER_STRUCT = struct.Struct("<QQB59x")  # chunk_count, default_size, default_status + padding = 64 bytes
+CHUNK_STRUCT = struct.Struct("<QQQQQQQB71x")  # start, end, write_pos, num_records, last_update, chunk_id, size, status + padding = 128 bytes
+HEADER_STRUCT = struct.Struct("<QQB111x")  # chunk_count, default_size, default_status + padding = 128 bytes
 
 # No helper functions - direct inline operations for maximum speed
-CHUNK_SIZE = 64  # Power of 2 for bit shifting
-HEADER_SIZE = 64
+CHUNK_SIZE = CHUNK_STRUCT.size
+HEADER_SIZE = HEADER_STRUCT.size
 
 # Status constants
 STATUS_UNKNOWN = 0
@@ -133,7 +133,7 @@ class FeedRegistry:
         self.max_chunks = max_chunks
         self.is_writer = mode == "w"
 
-        desired_size = HEADER_SIZE + (max_chunks << 6)
+        desired_size = HEADER_SIZE + (max_chunks * CHUNK_SIZE)
         already_exists = os.path.exists(path)
 
         self.fd = os.open(path, os.O_RDWR | os.O_CREAT)
@@ -178,12 +178,12 @@ class FeedRegistry:
             raise PermissionError("Read-only mode")
         self._chunk_count[0] += 1
         if self._chunk_count[0] >= self.max_chunks:
-            if self.max_chunks >= 1048576:  # 1M chunks = 64MB, reasonable limit
+            if self.max_chunks >= 1048576:  # 1M chunks = 128MB, reasonable limit
                 raise IndexError(f"Registry at maximum size: {self.max_chunks}")
             new_max = min(1 + self.max_chunks * 2, 1048576)  # Double it, cap at 1M
             self._resize_file(new_max)
         
-        offset = HEADER_SIZE + ((self._chunk_count[0]-1)<< 6)
+        offset = HEADER_SIZE + ((self._chunk_count[0]-1) * CHUNK_SIZE)
         self._mv[offset + CHUNK_START_OFFSET:offset + CHUNK_END_OFFSET] = start_time.to_bytes(8, 'little')
         self._mv[offset + CHUNK_END_OFFSET:offset + CHUNK_WRITE_POS_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"            # End Time, write position,
         self._mv[offset + CHUNK_WRITE_POS_OFFSET:offset + CHUNK_NUM_RECORDS_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"    # and number of records
@@ -201,7 +201,7 @@ class FeedRegistry:
         if not self.is_writer:
             raise PermissionError("Read-only mode")
         
-        new_total_size = HEADER_SIZE + (new_max_chunks << 6)
+        new_total_size = HEADER_SIZE + (new_max_chunks * CHUNK_SIZE)
         
         # Extend the file
         os.posix_fallocate(self.fd, 0, new_total_size)
@@ -216,15 +216,15 @@ class FeedRegistry:
         self.max_chunks = new_max_chunks
 
     def _chunk_start_time(self, index: int) -> int:
-        offset = HEADER_SIZE + ((index-1) << 6) + CHUNK_START_OFFSET
+        offset = HEADER_SIZE + ((index-1) * CHUNK_SIZE) + CHUNK_START_OFFSET
         return int.from_bytes(self._mv[offset:offset+8], 'little')
 
     def _chunk_end_time(self, index: int) -> int:
-        offset = HEADER_SIZE + ((index-1) << 6) + CHUNK_END_OFFSET
+        offset = HEADER_SIZE + ((index-1) * CHUNK_SIZE) + CHUNK_END_OFFSET
         return int.from_bytes(self._mv[offset:offset+8], 'little')
 
     def get_chunk_metadata(self, index: int) -> memoryview:
-        offset = HEADER_SIZE + ((index-1) << 6)
+        offset = HEADER_SIZE + ((index-1) * CHUNK_SIZE)
         return ChunkMeta(self._mv[offset:offset + CHUNK_SIZE])
 
     def _binary_search_start_time(self, target_time: int) -> int:
@@ -293,7 +293,7 @@ class FeedRegistry:
 
     def find_chunk_by_id(self, chunk_id: int) -> Optional[int]:
         for i in range(self._chunk_count[0]):
-            offset = HEADER_SIZE + (i << 6) + CHUNK_ID_OFFSET
+            offset = HEADER_SIZE + (i * CHUNK_SIZE) + CHUNK_ID_OFFSET
             val = int.from_bytes(self._mv[offset:offset+8], 'little')
             if val == chunk_id:
                 return i

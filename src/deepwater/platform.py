@@ -7,10 +7,11 @@ import orjson
 import struct
 from typing import Dict, Optional, Tuple
 
-from core.global_registry import GlobalRegistry
-from core.layout_json import build_layout, save_layout, load_layout
-from core.feed_registry import FeedRegistry
-from core.writer import Writer
+from .global_registry import GlobalRegistry
+from .layout_json import build_layout, save_layout, load_layout
+from .feed_registry import FeedRegistry
+from .writer import Writer
+from .reader import Reader
 
 
 class Platform:
@@ -30,10 +31,9 @@ class Platform:
 
         # process-local caches
         self._writers: Dict[str, Writer] = {}
-        # self._readers: Dict[str, UFReader] = {}
+        self._readers: Dict[str, Reader] = {}
         self._layouts: Dict[str, dict] = {}
         self._structs: Dict[str, Tuple[struct.Struct, int]] = {}  # name -> (Struct(fmt), ts_off)
-        # self._indexes: Dict[str, ChunkIndex] = {}
 
     # -------------------------------------------------------------------------
     # FEED CREATION (idempotent, failsafe)
@@ -117,6 +117,13 @@ class Platform:
             w = Writer(self, feed_name)
             self._writers[feed_name] = w
         return w
+    
+    def create_reader(self, feed_name: str):
+        r = self._readers.get(feed_name)
+        if r is None:
+            r = Reader(self, feed_name)
+            self._readers[feed_name] = r
+        return r
 
     # def open_reader(self, feed_name: str) -> UFReader:
     #     """TODO: wire your reader impl; should mmap the latest chunk and use layout.json."""
@@ -193,21 +200,6 @@ class Platform:
             "first_time": md["first_time"],
             "last_time": md["last_time"],
         }
-
-    # -------------------------------------------------------------------------
-    # INDEX / TAIL (optional hooks; keep stubs if not ready)
-    # -------------------------------------------------------------------------
-    # def get_or_create_chunk_index(self, feed_name: str):
-    #     """TODO: return a ChunkIndex for UF/NUF once implemented."""
-    #     idx = self._indexes.get(feed_name)
-    #     if idx is None:
-    #         idx = ChunkIndex(feed_name, 0, base_path=self.base_path, create=True)
-    #         self._indexes[feed_name] = idx
-    #     return idx
-
-    # def tail_latest(self, feed_name: str):
-    #     """TODO: read tail.meta for O(1) latest (ts, file_off, rec_size)."""
-    #     raise NotImplementedError
 
     # -------------------------------------------------------------------------
     # SHUTDOWN

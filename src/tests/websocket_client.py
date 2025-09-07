@@ -24,14 +24,16 @@ def trades_spec(pid: str) -> dict:
         "fields": [
             {"name":"type",       "type":"char",   "desc":"record type 'T'"},
             {"name":"side",       "type":"char",   "desc":"B=buy,S=sell"},
-            {"name":"_",          "type":"_14",    "desc":"padding"},
+            {"name":"_",          "type":"_6",    "desc":"padding"},
             {"name":"trade_id",   "type":"uint64", "desc":"exchange trade id"},
+            {"name":"packet_ns",  "type":"uint64", "desc":"time packet was sent (ns)"},
+            {"name":"recv_ns",    "type":"uint64", "desc":"time packet was received (ns)"},
+            {"name":"proc_ns",    "type":"uint64", "desc":"time packet was ingested (ns)"},
             {"name":"ev_ns",      "type":"uint64", "desc":"event timestamp (ns)"},
             {"name":"price",      "type":"float64","desc":"trade price"},
             {"name":"size",       "type":"float64","desc":"trade size"},
-            {"name":"_",          "type":"_16",     "desc":"padding"},
         ],
-        "ts_col": "ev_ns",
+        "ts_col": "proc_ns",
         "chunk_size_mb": 0.0625,
         "retention_hours": 2,
         "persist": True
@@ -45,11 +47,15 @@ def l2_spec(pid: str) -> dict:
             {"name":"type",       "type":"char",   "desc":"record type 'U'"},
             {"name":"side",       "type":"char",   "desc":"B=bid,A=ask"},
             {"name":"_",          "type":"_6",     "desc":"padding"},
+            {"name":"packet_ns",  "type":"uint64", "desc":"time packet was sent (ns)"},
+            {"name":"recv_ns",    "type":"uint64", "desc":"time packet was received (ns)"},
+            {"name":"proc_ns",    "type":"uint64", "desc":"time packet was ingested (ns)"},
             {"name":"ev_ns",      "type":"uint64", "desc":"event timestamp (ns)"},
             {"name":"price",      "type":"float64","desc":"price level"},
             {"name":"qty",        "type":"float64","desc":"new quantity at level"},
+            {"name":"_",          "type":"_8",     "desc":"padding"},
         ],
-        "ts_col": "ev_ns",
+        "ts_col": "proc_ns",
         "chunk_size_mb": 0.0625,
         "retention_hours": 2,
         "persist": True,
@@ -208,15 +214,13 @@ class MarketDataEngine:
                 log.info("WS connected %s", self.uri)
                 self._send_subscribe(self.product_ids)
 
-                # Reset liveness
-                self._hb_last = time.monotonic()
-                self._msg_last = time.monotonic()
-
                 while self._should_run:
                     try:
                         raw = self._ws.recv()
                         if not raw:
                             raise WebSocketConnectionClosedException("recv returned None/empty")
+                        recv_ns = _now_ns()
+                        self._metrics.ingress(len(raw), 1)
                     except WebSocketTimeoutException:
                         # treat as liveness issue; fall through to timeout checks below
                         raw = None
@@ -225,32 +229,17 @@ class MarketDataEngine:
                     except Exception as e:
                         raise WebSocketConnectionClosedException(f"WS recv error: {e!s}")
 
-                    now = time.monotonic()
-                    # liveness: no msgs or heartbeats too long -> reconnect
-                    if (now - self._msg_last) > self._msg_timeout and (now - self._hb_last) > self._hb_timeout:
-                        raise WebSocketConnectionClosedException("liveness timeout")
-
-                    if raw is None:
-                        continue
-
-                    t_in_ns = _perf_ns()
-                    self._metrics.ingress(len(raw), 1)
-
                     try:
                         obj = loads(raw)
                     except Exception:
-                        # don’t kill the session; count & continue (TODO: write bad frames to disk if you want)
+                        # TODO: write bad frames to disk if you want)
                         log.warning("JSON decode error (frame skipped)")
                         continue
 
                     ch = obj.get("channel")
                     if ch == "heartbeats":
-                        self._hb_last = now
                         continue
 
-                    self._msg_last = now
-
-                    # sequence gaps (unchanged)
                     seq = obj.get("sequence_num")
                     if seq is not None:
                         if int(seq) != self._last_seq+1:
@@ -258,6 +247,7 @@ class MarketDataEngine:
                         self._last_seq = int(seq)
 
                     if ch == "market_trades":
+                        packet_ns = parse_ns_timestamp(obj.get("timestamp").encode('ascii'))
                         events = obj.get("events") or ()
                         for ev in events:
                             trades = ev.get("trades") or ()
@@ -268,25 +258,25 @@ class MarketDataEngine:
                                 side  = tr.get("side")[0].encode("ascii")
                                 price = _ff(tr.get("price")); size = _ff(tr.get("size"))
                                 tid   = int(tr.get("trade_id") or 0)
-                                self.trade_writers[pid].write_values(b'T',side,tid,ev_ns,price,size)
+                                self.trade_writers[pid].write_values(b'T',side,tid,packet_ns,recv_ns,_now_ns(),ev_ns,price,size)
                             if pid is not None:
-                                self._metrics.trade(pid, n=len(trades), latency_us=_perf_ns()-t_in_ns)
+                                self._metrics.trade(pid, n=len(trades), latency_us=_now_ns()-recv_ns)
 
                     elif ch == "l2_data":
+                        packet_ns = parse_ns_timestamp(obj.get("timestamp").encode('ascii'))
                         events = obj.get("events") or ()
                         for ev in events:
                             pid = ev.get("product_id")
                             l2_type = ev.get("type")[0].encode('ascii')  # 'U' or 'S'
                             updates = ev.get("updates") or ()
-                            # atomic publish is OK to add later; today we keep your write_values shape
                             idx = True
                             for u in updates:
                                 ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
                                 side  = u.get("side")[0].encode("ascii")
                                 price = _ff(u.get("price_level")); qty = _ff(u.get("new_quantity"))
-                                self.book_writers[pid].write_values(l2_type, side, ev_ns, price, qty, create_index=idx)
+                                self.book_writers[pid].write_values(l2_type,side,packet_ns,recv_ns,_now_ns(),ev_ns,price,qty,create_index=idx)
                                 idx = False
-                            self._metrics.l2(pid, n=len(updates), latency_us=_perf_ns()-t_in_ns)
+                            self._metrics.l2(pid, n=len(updates), latency_us=_now_ns()-recv_ns)
 
                     elif ch == "subscriptions":
                         # fine to ignore

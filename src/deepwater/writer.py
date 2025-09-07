@@ -5,14 +5,13 @@ from typing import Union, Optional, Tuple
 from pathlib import Path
 import numpy as np
 from multiprocessing import shared_memory
-from core.chunk import Chunk
-from core.index import ChunkIndex
-from core.feed_registry import FeedRegistry
-from utils.process import ProcessUtils
+
+from .chunk import Chunk
+from .index import ChunkIndex
+from .feed_registry import FeedRegistry
+from .utils.process import ProcessUtils
 
 class Writer:
-    """Writer with bulletproof crash recovery"""
-
     def __init__(self, platform, feed_name:str):
         self.platform = platform
         self.feed_name = feed_name
