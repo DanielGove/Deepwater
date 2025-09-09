@@ -1,62 +1,55 @@
 import numpy as np
 import mmap
+import os
 from multiprocessing import shared_memory
 from typing import Optional
 
 
 class Chunk:
-    """Memory chunk with proper SHM coordination"""
 
-    def __init__(self, name: str, size: int, create: bool = False, file_path: Optional[str] = None):
-        self.name = name
-        self.size = size
-        self.file_path = file_path
+    def __init__(self, buffer: memoryview, closeables: list, read_only: bool, is_shm:bool):
+        self.buffer = buffer
+        self.closeables = closeables
+        self.read_only = read_only
+        self.is_shm = is_shm
+        self.size = len(buffer)
 
-        if file_path:
-            if create:
-                with open(file_path, 'wb') as f:
-                    f.write(b'\x00' * size)
+    @classmethod
+    def create_shm(cls, name: str, size: int):
+        shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+        return cls(buffer=shm.buf, closeables=[shm], read_only=False, is_shm=True)
+    
+    @classmethod
+    def open_shm(cls, name: str):
+        shm = shared_memory.SharedMemory(name=name, create=False)
+        return cls(buffer=shm.buf, closeables=[shm], read_only=True, is_shm=True)
 
-            self.file = open(file_path, 'r+b')
-            self.mmap = mmap.mmap(self.file.fileno(), size)
-            self.buffer = memoryview(self.mmap)
-            self.is_shm = False
-        else:
-            if create:
-                self.shm = shared_memory.SharedMemory(name=name, create=True, size=size)
-            else:
-                self.shm = shared_memory.SharedMemory(name=name)
+    def close_shm(self):
+        self.buffer.release()
+        self.closeables[0].close()
+        if self.read_only is False:
+            self.closeables[0].unlink()
+    
+    @classmethod
+    def create_file(cls, path: str, size: int):
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.ftruncate(fd, size)
+        mm = mmap.mmap(fd, length=size, access=mmap.ACCESS_WRITE)
+        return cls(memoryview(mm), [mm, fd], read_only=False, is_shm=False)
+    
+    @classmethod
+    def open_file(cls, file_path: str):
+        fd = os.open(file_path, os.O_RDONLY)
+        mm = mmap.mmap(fd, length=0, access=mmap.ACCESS_READ)
+        return cls(memoryview(mm), [mm, fd], read_only=True, is_shm=False)
 
-            self.buffer = memoryview(self.shm.buf)
-            self.is_shm = True
-
-    def memview(self) -> memoryview:
-        return self.buffer
-
-    def write_bytes(self, position: int, data: bytes) -> int:
-        """Write bytes and return new position"""
-        if position + len(data) > self.size:
-            raise ValueError(f"Write would exceed chunk capacity")
-        self.buffer[position:position + len(data)] = data
-        return position + len(data)
-
-    def read_bytes(self, position: int, length: int) -> bytes:
-        """Read bytes from chunk"""
-        if position + length > self.size:
-            raise ValueError(f"Read would exceed chunk capacity")
-        return bytes(self.buffer[position:position + length])
-
-    def persist_to_disk(self, path: str):
-        """Save SHM chunk to disk file"""
-        with open(path, 'wb') as f:
-            f.write(bytes(self.buffer))
-
-    def close(self):
-        if self.is_shm:
-            self.buffer = None
-            self.shm.unlink()
-            self.shm.close()
-        else:
-            self.buffer = None
-            self.mmap.close()
-            self.file.close()
+    def close_file(self):
+        self.buffer.release()
+        mm = self.closeables[0]
+        fd = self.closeables[1]
+        if not self.read_only:
+            mm.flush()
+            os.ftruncate(fd, self.size)
+            os.fsync(fd)
+        mm.close()
+        os.close(fd)

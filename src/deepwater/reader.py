@@ -8,7 +8,7 @@ from multiprocessing import shared_memory
 
 from .chunk import Chunk
 from .index import ChunkIndex
-from .feed_registry import FeedRegistry
+from .feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED
 from .utils.process import ProcessUtils
 
 class Reader:
@@ -37,21 +37,28 @@ class Reader:
             raise RuntimeError(f"Feed '{self.feed_name}' has no chunks; cannot read records.")
         
         chunk_id = latest_chunk_meta.chunk_id
-        chunk_path = self.data_dir / f"chunk_{chunk_id:08d}.bin"
-        if not chunk_path.exists():
-            raise RuntimeError(f"Chunk file '{chunk_path}' does not exist; cannot read records.")
 
-        if len(self.chunk_data) == 0 or self.chunk_metadata[-1].chunk_id != chunk_id:
-            # Load new chunk
-            chunk = Chunk(str(chunk_path), self.record_format["fmt"], self.record_format["ts_offset"])
-            self.chunk_data.append(chunk)
-            self.chunk_metadata.append(latest_chunk_meta)
-
+        if latest_chunk_meta.status == IN_MEMORY:
+            chunk = Chunk(name=f"{self.feed_name}_chunk_{chunk_id:08d}", create=False)
             if self.feed_config.get("index_playback") is True:
-                chunk_index = ChunkIndex(name=f"{self.feed_name}_index", directory=self.data_dir, create=False)
-                self.chunk_indexes.append(chunk_index)
-            else:
-                self.chunk_indexes.append(None)
+                chunk_index = ChunkIndex.open_shm(name=f"{self.feed_name}_index")
+        elif latest_chunk_meta.status == ON_DISK:
+            chunk = Chunk(name=f"{self.feed_name}_chunk_{chunk_id:08d}", file_path=str(self.data_dir / f"chunk_{chunk_id:08d}.bin"), create=False)
+            if self.feed_config.get("index_playback") is True:
+                chunk_index = ChunkIndex.open_file(path=str(self.data_dir / f"chunk_{chunk_id:08d}.idx"))
+        elif latest_chunk_meta.status == EXPIRED:
+            raise RuntimeError(f"Latest chunk '{chunk_id}' is expired; cannot read records.")
+        else:
+            raise RuntimeError(f"Chunk '{chunk_id}' has unknown status '{latest_chunk_meta.status}'; cannot read records.")
+
+        self.chunk_data.append(chunk)
+        self.chunk_metadata.append(latest_chunk_meta)
+
+        if self.feed_config.get("index_playback") is True:
+            chunk_index = ChunkIndex(name=f"{self.feed_name}_index", directory=self.data_dir, create=False)
+            self.chunk_indexes.append(chunk_index)
+        else:
+            self.chunk_indexes.append(None)
 
         chunk = self.chunk_data[-1]
         index = self.chunk_indexes[-1]

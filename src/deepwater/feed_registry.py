@@ -5,18 +5,17 @@ import fcntl
 from typing import Iterator, Optional
 
 # Only keep struct for initial setup - eliminate from hot paths
-CHUNK_STRUCT = struct.Struct("<QQQQQQQB71x")  # start, end, write_pos, num_records, last_update, chunk_id, size, status + padding = 128 bytes
-HEADER_STRUCT = struct.Struct("<QQB111x")  # chunk_count, default_size, default_status + padding = 128 bytes
+CHUNK_STRUCT = struct.Struct("<QQQQQQB79x")  # start, end, write_pos, num_records, last_update, chunk_id, size, status + padding = 128 bytes
+HEADER_STRUCT = struct.Struct("<Q120x")  # chunk_count + padding = 128 bytes
 
 # No helper functions - direct inline operations for maximum speed
 CHUNK_SIZE = CHUNK_STRUCT.size
 HEADER_SIZE = HEADER_STRUCT.size
 
 # Status constants
-STATUS_UNKNOWN = 0
-STATUS_IN_MEMORY = 1
-STATUS_ON_DISK = 2
-STATUS_EXPIRED = 3
+IN_MEMORY = 0
+ON_DISK = 1
+EXPIRED = 2
 
 # Precomputed offsets for direct memory access
 CHUNK_START_OFFSET = 0
@@ -127,8 +126,7 @@ class ChunkMeta:
 class FeedRegistry:
     __slots__ = ("path", "max_chunks", "fd", "mm", "is_writer", "_mv", "_chunk_count")
 
-    def __init__(self, path: str, max_chunks: int = 65535, mode: str = "r",
-                 default_size: int = 0, default_status: int = STATUS_UNKNOWN):
+    def __init__(self, path: str, max_chunks: int = 65535, mode: str = "r"):
         self.path = path
         self.max_chunks = max_chunks
         self.is_writer = mode == "w"
@@ -150,7 +148,7 @@ class FeedRegistry:
                 current_size = desired_size
 
             if (not already_exists) or current_size == 0:
-                header_data = HEADER_STRUCT.pack(0, default_size, default_status)
+                header_data = HEADER_STRUCT.pack(0)
                 os.pwrite(self.fd, header_data, 0)
                 current_size = desired_size
 
@@ -173,7 +171,7 @@ class FeedRegistry:
         def_status = self._mv[24]
         return def_size, def_chunk_id, def_status
 
-    def register_chunk(self, start_time: int, chunk_id: int = None, size: int = None, status: int = None) -> int:
+    def register_chunk(self, start_time: int, chunk_id: int = None, size: int = None) -> int:
         if not self.is_writer:
             raise PermissionError("Read-only mode")
         self._chunk_count[0] += 1
@@ -191,7 +189,7 @@ class FeedRegistry:
         self._mv[offset + CHUNK_LAST_UPDATE_OFFSET:offset + CHUNK_ID_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"
         self._mv[offset + CHUNK_ID_OFFSET:offset + CHUNK_SIZE_OFFSET] = chunk_id.to_bytes(8, 'little')
         self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_STATUS_OFFSET] = size.to_bytes(8, 'little')
-        self._mv[offset + CHUNK_STATUS_OFFSET] = status
+        self._mv[offset + CHUNK_STATUS_OFFSET] = IN_MEMORY
         
         self.mm.flush()
         return self._chunk_count[0]

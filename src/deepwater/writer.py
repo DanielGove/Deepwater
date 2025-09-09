@@ -4,11 +4,12 @@ import struct
 from typing import Union, Optional, Tuple
 from pathlib import Path
 import numpy as np
+import numba as _nb
 from multiprocessing import shared_memory
 
 from .chunk import Chunk
 from .index import ChunkIndex
-from .feed_registry import FeedRegistry
+from .feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED
 from .utils.process import ProcessUtils
 
 class Writer:
@@ -39,43 +40,49 @@ class Writer:
             self.current_chunk_id = 0
         else:
             self.current_chunk_id = self.current_chunk_metadata.chunk_id
+        
         self._create_new_chunk()
+        self._schema_init()
 
     def _create_new_chunk(self):
         self.current_chunk_id += 1
         self.registry.register_chunk(
             time.time_ns(),self.current_chunk_id,
-            self.feed_config["chunk_size_bytes"],1)
+            self.feed_config["chunk_size_bytes"])
+
+        new_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
 
         if self.current_chunk is not None:
-            if self.feed_config["persist"]:
-                file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
-                self.current_chunk.persist_to_disk(str(file_path))
-            self._chunk_mv = None
-            self.current_chunk.close()
-
-        if self.current_chunk_metadata is not None:
+            if self.feed_config.get("persist") is True:
+                self.current_chunk.close_file()
+            else:
+                self.current_chunk.close_shm()
+            self.current_chunk_metadata.status = ON_DISK if self.feed_config["persist"] else EXPIRED            
             self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
-            new_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
             new_metadata.start_time = self.current_chunk_metadata.end_time
             self.current_chunk_metadata.release()
-        else:
-            new_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
 
         self.current_chunk_metadata = new_metadata
-        self.current_chunk = Chunk(f"{self.feed_name}-{self.current_chunk_id}", self.feed_config["chunk_size_bytes"], create=True)
-        self._chunk_mv = self.current_chunk.memview()
+
+        if self.feed_config.get("persist") is True:
+            self.current_chunk = Chunk.create_file(path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"), size=self.feed_config["chunk_size_bytes"])
+        else:
+            self.current_chunk = Chunk.create_shm(name=f"{self.feed_name}-{self.current_chunk_id}", size=self.feed_config["chunk_size_bytes"])
 
         if self.feed_config.get("index_playback") is True:
-            if self.chunk_index is not None:
-                self.chunk_index.close()
-            self.chunk_index = ChunkIndex(name=f"{self.feed_name}-{self.current_chunk_id}.idx", create=True, directory=self.platform.data_path/self.feed_name)
+            if self.feed_config.get("persist") is True:
+                if self.chunk_index is not None:
+                    self.chunk_index.close_file()
+                self.chunk_index = ChunkIndex.create_file(path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.idx"), capacity=2047)
+            else:
+                if self.chunk_index is not None:
+                    self.chunk_index.close_shm()
+                self.chunk_index = ChunkIndex.create_shm(name=f"{self.feed_name}-index", capacity=2047)
 
-    def write(self, timestamp: int, data: Union[bytes, np.ndarray], create_index: bool = False) -> int:
-        if isinstance(data, np.ndarray):
-            record_data = data.tobytes()
-        else:
-            record_data = bytes(data)
+
+    def write(self, timestamp: int, record_data: Union[bytes, np.ndarray], create_index: bool = False) -> int:
+        if isinstance(record_data, np.ndarray):
+            record_data = record_data.tobytes()
 
         record_size = len(record_data)
         if record_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
@@ -83,16 +90,14 @@ class Writer:
 
         position = self.current_chunk_metadata.write_pos
         new_position = self.current_chunk.write_bytes(position, record_data)
-        if create_index and self.chunk_index is not None:
-            self.chunk_index.create_index(timestamp, self.current_chunk_metadata, 0)
+        if create_index:
+            self.chunk_index.create_index(timestamp, position)
 
         self.current_chunk_metadata.last_update = timestamp
         self.current_chunk_metadata.write_pos = new_position
         self.current_chunk_metadata.num_records += 1
 
-    def _ensure_schema_init(self):
-        if getattr(self, "_S", None) is not None:
-            return
+    def _schema_init(self):
         rf = getattr(self, "record_format", None)
         if not rf or "fmt" not in rf or "fields" not in rf:
             raise RuntimeError("Writer.record_format missing 'fmt'/'fields'; cannot pack values.")
@@ -100,7 +105,7 @@ class Writer:
         self._rec_size = self._S.size
         self._value_fields = [f.get("name") for f in rf["fields"] if f.get("name") != "_"]
         # timestamp field name (optional). feed specs used 'ts_col' previously.
-        self._ts_field = rf.get("ts_col") or rf.get("ts") or None
+        self._ts_field = rf.get("ts_name", None)
         try:
             self._ts_idx = self._value_fields.index(self._ts_field) if self._ts_field else None
         except ValueError:
@@ -111,32 +116,19 @@ class Writer:
         self._staging_count = 0
         self._staging_last_ts = None
 
-    def _extract_ts_from_vals(self, vals):
-        if getattr(self, "_ts_idx", None) is not None and self._ts_idx < len(vals):
-            try:
-                return int(vals[self._ts_idx])
-            except Exception:
-                pass
-        # fallback to wall clock if schema didn't specify ts
-        return int(time.time_ns())
-
     def write_values(self, *vals, create_index=False) -> int:
         """Pack positional values according to schema and write directly to SHM.
         Does not accept kwargs. Uses schema order (non-padding fields).
         """
-        self._ensure_schema_init()
-        ts = self._extract_ts_from_vals(vals)
-        record_size = self._rec_size
-        # rotate chunk if needed
-        if record_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
+        if self._rec_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
             self._create_new_chunk()
-        self._S.pack_into(self._chunk_mv, self.current_chunk_metadata.write_pos, *vals)
+        self._S.pack_into(self.current_chunk.buffer, self.current_chunk_metadata.write_pos, *vals)
         if create_index and self.chunk_index is not None:
             self.chunk_index.create_index(
-                self._chunk_mv[self.current_chunk_metadata.write_pos+self.record_format.get("ts_offset"):self.current_chunk_metadata.write_pos+self.record_format.get("ts_offset")+self.record_format.get("ts_size")].cast("Q")[0],
-                self.current_chunk_metadata.write_pos, 0
+                vals[self._ts_idx],
+                self.current_chunk_metadata.write_pos
             )
-        self.current_chunk_metadata.last_update = ts
+        self.current_chunk_metadata.last_update = vals[self._ts_idx]
         self.current_chunk_metadata.write_pos += self._rec_size
         self.current_chunk_metadata.num_records += 1
         return self.current_chunk_metadata.write_pos
@@ -171,39 +163,34 @@ class Writer:
         return new_pos
 
     # TODO
-    def commit_values(self) -> int:
+    def commit_values(self, create_index: bool = False) -> int:
         """Publish previously staged rows by updating metadata once.
         Returns new write_pos. No-op if nothing staged.
         """
-        # If schema hasn't been initialized yet, there is nothing staged.
-        if getattr(self, "_S", None) is None:
+        if not getattr(self, "_staging_active", False):
+            self._staging_active = False
+            self._staging_count = 0
+            self._staging_last_ts = None
             return self.current_chunk_metadata.write_pos
-        if not getattr(self, "_staging_active", False) or self._staging_count == 0:
-            return self.current_chunk_metadata.write_pos
-        self.current_chunk_metadata.last_update = (
-            self._staging_last_ts if self._staging_last_ts is not None else self.current_chunk_metadata.last_update
-        )
+        self.current_chunk_metadata.last_update = self._staging_last_ts
         self.current_chunk_metadata.write_pos = self._staging_pos
         self.current_chunk_metadata.num_records += self._staging_count
-        # reset staging
         self._staging_active = False
         self._staging_count = 0
         self._staging_last_ts = None
         return self.current_chunk_metadata.write_pos
 
     def close(self):
-        """Clean shutdown with ownership release"""
         if self.current_chunk:
             self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
-            if self.feed_config["persist"]:
-                try:
-                    file_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
-                    self.current_chunk.persist_to_disk(str(file_path))
-                except Exception as e:
-                    print(f"⚠️  Could not persist final chunk {e}")
+            if self.feed_config.get("persist", True):
+                self.current_chunk.close_file()
+                if self.feed_config.get("index_playback", False):
+                    self.chunk_index.close_file()
+            else:
+                self.current_chunk.close_shm()
+                if self.feed_config.get("index_playback", False):
+                    self.chunk_index.close_shm()
+            self.current_chunk_metadata.status = ON_DISK if self.feed_config["persist"] else EXPIRED
             self.current_chunk_metadata.release()
-            if self.feed_config.get("index_playback") is True:
-                self.chunk_index.close()
             self.registry.close()
-            self._chunk_mv = None
-            self.current_chunk.close()

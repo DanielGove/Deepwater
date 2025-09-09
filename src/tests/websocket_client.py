@@ -12,9 +12,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 log = logging.getLogger("dw.ws")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-from core.platform import Platform  # unchanged platform substrate
-from utils.benchmarking import Metrics
-from utils.timestamps import parse_ns_timestamp
+from deepwater.platform import Platform  # unchanged platform substrate
+from deepwater.utils.benchmarking import Metrics
+from deepwater.utils.timestamps import parse_ns_timestamp
 
 # ======= feed configuration =======
 def trades_spec(pid: str) -> dict:
@@ -269,7 +269,7 @@ class MarketDataEngine:
                             pid = ev.get("product_id")
                             l2_type = ev.get("type")[0].encode('ascii')  # 'U' or 'S'
                             updates = ev.get("updates") or ()
-                            idx = True
+                            idx = True if l2_type == b's' else False
                             for u in updates:
                                 ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
                                 side  = u.get("side")[0].encode("ascii")
