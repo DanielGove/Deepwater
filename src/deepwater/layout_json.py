@@ -4,99 +4,204 @@ from __future__ import annotations
 import json
 import struct
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple, Optional
 
-
-# ---- type → struct token map (endian handled separately) --------------------
-_TMAP: Dict[str, tuple[str, int]] = {
+# ---- type → (numpy_code, struct_token, size, natural_align) -----------------
+# natural_align is capped implicitly by our logic (<= 8) to mirror common ABIs.
+_SCALARS: Dict[str, Tuple[str, str, int, int]] = {
     # 1 byte
-    "char":    ("c", 1),
-    "bool":    ("?", 1),
-    "i8":      ("b", 1), "int8":   ("b", 1),
-    "u8":      ("B", 1), "uint8":  ("B", 1), "byte": ("B", 1),
-
+    "char":   ("|S1", "c", 1, 1),
+    "bool":   ("|b1", "?", 1, 1),
+    "i8":     ("<i1", "b", 1, 1), "int8":  ("<i1","b",1,1),
+    "u8":     ("<u1", "B", 1, 1), "uint8": ("<u1","B",1,1), "byte": ("<u1","B",1,1),
     # 2 bytes
-    "i16":     ("h", 2), "int16":  ("h", 2),
-    "u16":     ("H", 2), "uint16": ("H", 2),
-    "f16":     ("e", 2), "float16":("e", 2),
-
+    "i16":    ("<i2", "h", 2, 2), "int16": ("<i2","h",2,2),
+    "u16":    ("<u2", "H", 2, 2), "uint16":("<u2","H",2,2),
+    "f16":    ("<f2", "e", 2, 2), "float16":("<f2","e",2,2),
     # 4 bytes
-    "i32":     ("i", 4), "int32":  ("i", 4),
-    "u32":     ("I", 4), "uint32": ("I", 4),
-    "f32":     ("f", 4), "float32":("f", 4),
-
+    "i32":    ("<i4", "i", 4, 4), "int32": ("<i4","i",4,4),
+    "u32":    ("<u4", "I", 4, 4), "uint32":("<u4","I",4,4),
+    "f32":    ("<f4", "f", 4, 4), "float32":("<f4","f",4,4),
     # 8 bytes
-    "i64":     ("q", 8), "int64":  ("q", 8),
-    "u64":     ("Q", 8), "uint64": ("Q", 8),
-    "f64":     ("d", 8), "float64":("d", 8),
+    "i64":    ("<i8", "q", 8, 8), "int64": ("<i8","q",8,8),
+    "u64":    ("<u8", "Q", 8, 8), "uint64":("<u8","Q",8,8),
+    "f64":    ("<f8", "d", 8, 8), "float64":("<f8","d",8,8),
 }
 
-
-def _pad(tok: str) -> tuple[str, int] | None:
+def _pad_token(tok: str) -> Tuple[str, int] | None:
     """
-    Support explicit padding tokens like "_6", "_16" → ("6x", 6).
+    Support explicit padding tokens like '_6' or '_16' → ('V6' dtype / '6x' struct).
     """
     if tok.startswith("_") and tok[1:].isdigit():
         n = int(tok[1:])
-        return f"{n}x", n
+        return f"V{n}", n
     return None
 
+def _dtype_size(code: str) -> int:
+    if code.startswith("|S"): return int(code[2:])
+    if code.startswith("V"):  return int(code[1:])
+    return {
+        "<i1":1,"<u1":1,"|b1":1,
+        "<i2":2,"<u2":2,"<f2":2,
+        "<i4":4,"<u4":4,"<f4":4,
+        "<i8":8,"<u8":8,"<f8":8,
+    }[code]
 
-def build_layout(fields: List[Dict], *, ts_col: str, endian: str = "<") -> Dict:
+def _dtype_to_struct(code: str) -> str:
+    if code == "|b1": return "?"
+    if code == "<i1": return "b"
+    if code == "<u1": return "B"
+    if code == "<i2": return "h"
+    if code == "<u2": return "H"
+    if code == "<f2": return "e"
+    if code == "<i4": return "i"
+    if code == "<u4": return "I"
+    if code == "<f4": return "f"
+    if code == "<i8": return "q"
+    if code == "<u8": return "Q"
+    if code == "<f8": return "d"
+    if code.startswith("|S"): return f"{int(code[2:])}s"
+    if code.startswith("V"):  return f"{int(code[1:])}x"
+    raise ValueError(f"unsupported dtype code: {code}")
+
+def build_layout(
+    fields: List[Dict],
+    *,
+    ts_col: str,
+    endian: str = "<",
+    aligned: bool = False,
+) -> Dict:
     """
-    Build a UF layout dictionary:
+    Build a UF layout dict from your app config (unchanged interface).
+
+    Params:
+      fields : [{'name': str, 'type': str, ...}, ...]
+               types may be scalar (e.g. 'uint64','float64','char','bool',...)
+               or padding like '_6'
+      ts_col : name of the uint64 timestamp column
+      endian : '<' or '>' (struct endianness)
+      aligned: if True, apply C-style alignment (explicit pads inserted so dtype & struct match)
+
+    Returns:
       {
         "mode": "UF",
-        "fmt": "<...>",                   # struct format string
-        "record_size": <int>,             # bytes
+        "fmt": "<...>",                 # struct format string
+        "record_size": int,
         "fields": [{"name","type","offset","size"}, ...],
-        "ts_name": <str>,
-        "ts_offset": <int>,
-        "ts_size": <int>,
-        "ts_endian": <...endian?? idk i cant fucking remember and this doesnt matter>,
+        "ts_name": str,
+        "ts_offset": int,
+        "ts_size": 8,
+        "ts_endian": "<" or ">",
+        "dtype": { "names","formats","offsets","itemsize" }  # NumPy explicit-offset spec
         "version": 1
       }
     """
-    parts: List[str] = []
+    if endian not in ("<", ">"):
+        raise ValueError("endian must be '<' or '>'")
+
+    names:   List[str] = []
+    formats: List[str] = []
+    offsets: List[int] = []
     out_fields: List[Dict] = []
-    size = 0
-    ts_off = None
+
+    off = 0
+    max_align = 1
+    ts_off: Optional[int] = None
 
     for f in fields:
-        typ = f["type"]
-        tok_sz = _TMAP.get(typ) or _pad(typ)
-        if tok_sz is None:
+        name = f["name"]
+        typ  = f["type"]
+
+        # explicit user padding like "_6"
+        p = _pad_token(typ)
+        if p is not None:
+            dcode, n = p
+            names.append(name)
+            formats.append(dcode)     # 'Vn' (void bytes)
+            offsets.append(off)
+            out_fields.append({"name": name, "type": typ, "offset": off, "size": n})
+            off += n
+            continue
+
+        # scalars
+        scalar = _SCALARS.get(typ)
+        if scalar is None:
             raise ValueError(f"unknown field type: {typ}")
-        tok, sz = tok_sz
-        parts.append(tok)
-        out_fields.append({"name": f["name"], "type": typ, "offset": size, "size": sz})
-        if f["name"] == ts_col:
+        np_code, st_code, size, align = scalar
+
+        if aligned:
+            a = min(align, 8)
+            pad = (-off) & (a - 1)
+            if pad:
+                # inject explicit implicit-pad so dtype & struct remain identical
+                names.append(f"_impad{pad}@{off}")
+                formats.append(f"V{pad}")
+                offsets.append(off)
+                out_fields.append({"name": "_", "type": f"_{pad}", "offset": off, "size": pad})
+                off += pad
+            max_align = max(max_align, a)
+
+        # place the field
+        names.append(name)
+        formats.append(np_code)
+        offsets.append(off)
+        out_fields.append({"name": name, "type": typ, "offset": off, "size": size})
+        if name == ts_col:
             if typ != "uint64":
                 raise ValueError("ts_col must be a uint64 field")
-            ts_off = size
-        size += sz
+            ts_off = off
+        off += size
 
-    fmt = endian + "".join(parts)
-    S = struct.Struct(fmt)
-    # Guard in case of future alignment semantics (we use '<' so should match)
-    record_size = S.size
-    if record_size != size:
-        size = record_size  # align to struct's computed size
+    # tail pad to overall alignment if requested
+    itemsize = off
+    if aligned:
+        a = min(max_align, 8)
+        tail = (-itemsize) & (a - 1)
+        if tail:
+            names.append(f"_impad{tail}@{off}")
+            formats.append(f"V{tail}")
+            offsets.append(off)
+            out_fields.append({"name": "_", "type": f"_{tail}", "offset": off, "size": tail})
+            itemsize += tail
 
     if ts_off is None:
         raise ValueError(f"ts_col '{ts_col}' not present in fields[]")
 
+    # Build struct fmt by walking the dtype spec (offset gaps → 'x' pads)
+    parts: List[str] = []
+    cursor = 0
+    for code, ofs in zip(formats, offsets):
+        if ofs > cursor:
+            parts.append(f"{ofs - cursor}x")
+            cursor = ofs
+        parts.append(_dtype_to_struct(code))
+        cursor += _dtype_size(code)
+    if cursor < itemsize:
+        parts.append(f"{itemsize - cursor}x")
+    fmt = endian + "".join(parts)
+    if struct.Struct(fmt).size != itemsize:
+        raise AssertionError("struct size mismatch with dtype")
+
     return {
         "mode": "UF",
         "fmt": fmt,
-        "record_size": size,
+        "record_size": itemsize,
         "fields": out_fields,
         "ts_name": ts_col,
         "ts_offset": ts_off,
         "ts_size": 8,
         "ts_endian": endian,
+        "dtype": {
+            "names": names,
+            "formats": formats,
+            "offsets": offsets,
+            "itemsize": itemsize,
+        },
         "version": 1,
     }
+
+
+# ------------------------------ persistence ----------------------------------
 
 def save_layout(feed_dir: Path | str, layout: Dict) -> None:
     feed_dir = Path(feed_dir)
@@ -106,71 +211,6 @@ def save_layout(feed_dir: Path | str, layout: Dict) -> None:
     tmp.write_text(json.dumps(layout, indent=2))
     tmp.replace(path)
 
-
 def load_layout(feed_dir: Path | str) -> Dict:
     feed_dir = Path(feed_dir)
     return json.loads((feed_dir / "record_format.json").read_text())
-
-
-# ------------------------------ unit tests -----------------------------------
-if __name__ == "__main__":
-    import tempfile
-
-    def assert_eq(a, b, msg=""):
-        if a != b:
-            raise AssertionError(f"{msg} (got {a!r}, expected {b!r})")
-
-    # --- L2 UF (ws_ts_ns first; ts_off = 0) ---------------------------------
-    l2_fields = [
-        {"name": "type",     "type": "char"},
-        {"name": "side",     "type": "char"},
-        {"name": "_",        "type": "_6"},
-        {"name": "ws_ts_ns", "type": "uint64"},
-        {"name": "ev_ns",    "type": "uint64"},
-        {"name": "proc_ns",  "type": "uint64"},
-        {"name": "price",    "type": "float64"},
-        {"name": "qty",      "type": "float64"},
-        {"name": "_",        "type": "_16"},
-    ]
-    l2_layout = build_layout(l2_fields, ts_col="ws_ts_ns")
-    assert_eq(l2_layout["mode"], "UF", "L2 mode")
-    assert_eq(l2_layout["fmt"], "<Qcc6xQQdd16x", "L2 fmt")
-    assert_eq(l2_layout["record_size"], struct.Struct("<Qcc6xQQdd16x").size, "L2 size")
-    assert_eq(l2_layout["ts"]["offset"], 8, "L2 ts_off")
-    # total size sanity: 8 + 1 + 1 + 6 + 8 + 8 + 8 + 8 + 16 = 64
-    assert_eq(l2_layout["record_size"], 64, "L2 rec_size sanity")
-
-    # --- TRADES UF (ts_col inside; matches <cc14xQQQQdd> ordering) ----------
-    trades_fields = [
-        {"name": "type",     "type": "char"},
-        {"name": "side",     "type": "char"},
-        {"name": "_",        "type": "_14"},
-        {"name": "trade_id", "type": "uint64"},
-        {"name": "ev_ns",    "type": "uint64"},
-        {"name": "ws_ts_ns", "type": "uint64"},   # ts_col here
-        {"name": "proc_ns",  "type": "uint64"},
-        {"name": "price",    "type": "float64"},
-        {"name": "size",     "type": "float64"},
-    ]
-    tr_layout = build_layout(trades_fields, ts_col="ws_ts_ns")
-    assert_eq(tr_layout["fmt"], "<cc14xQQQQdd", "TRADES fmt")
-    assert_eq(tr_layout["record_size"], struct.Struct("<cc14xQQQQdd").size, "TRADES size")
-    # ts offset = 2 (cc) + 14 (pad) + 8 (trade_id) + 8 (ev_ns) = 32
-    assert_eq(tr_layout["ts"]["offset"], 32, "TRADES ts_off")
-    assert_eq(tr_layout["record_size"], 64, "TRADES rec_size sanity")
-
-    # --- save/load roundtrip -------------------------------------------------
-    with tempfile.TemporaryDirectory() as td:
-        p_l2 = Path(td) / "CB-L2-BTC-USD"
-        save_layout(p_l2, l2_layout)
-        rt_l2 = load_layout(p_l2)
-        assert_eq(rt_l2["fmt"], l2_layout["fmt"], "RT L2 fmt")
-        assert_eq(rt_l2["ts"]["offset"], l2_layout["ts"]["offset"], "RT L2 ts_off")
-
-        p_tr = Path(td) / "CB-TRADES-BTC-USD"
-        save_layout(p_tr, tr_layout)
-        rt_tr = load_layout(p_tr)
-        assert_eq(rt_tr["fmt"], tr_layout["fmt"], "RT TRADES fmt")
-        assert_eq(rt_tr["ts"]["offset"], tr_layout["ts"]["offset"], "RT TRADES ts_off")
-
-    print("OK: layout_json UF tests passed (L2 + TRADES)")

@@ -93,9 +93,9 @@ class ChunkIndex:
     @classmethod
     def create_file(cls, path:str, capacity:int=2047):
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
-        os.ftruncate(fd, capacity)
+        os.ftruncate(fd, HEADER_SIZE+capacity*INDEX_SIZE)
         mm = mmap.mmap(fd, length=capacity, access=mmap.ACCESS_WRITE)
-        HEADER_STRUCT.pack_into(mm, 0, 0, HEADER_SIZE+capacity*INDEX_SIZE)
+        HEADER_STRUCT.pack_into(mm, 0, 0, capacity)
         return cls(memoryview(mm), [mm, fd], read_only=False, is_shm=False)
     
     @classmethod
