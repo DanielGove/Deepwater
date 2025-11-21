@@ -152,6 +152,10 @@ class FeedRegistry:
                 os.pwrite(self.fd, header_data, 0)
                 current_size = desired_size
 
+        # For reader mode on empty/nonexistent files, ensure minimum size
+        if not self.is_writer and current_size == 0:
+            current_size = desired_size
+
         self.mm = mmap.mmap(self.fd, current_size, mmap.MAP_SHARED,
                             mmap.PROT_WRITE | mmap.PROT_READ)
         self._mv = memoryview(self.mm)
@@ -205,10 +209,13 @@ class FeedRegistry:
         os.posix_fallocate(self.fd, 0, new_total_size)
         
         # Close and remap to new size
+        self._chunk_count.release()
+        self._mv.release()
         self.mm.close()
         self.mm = mmap.mmap(self.fd, new_total_size, mmap.MAP_SHARED,
                             mmap.PROT_WRITE | mmap.PROT_READ)
         self._mv = memoryview(self.mm)
+        self._chunk_count = self._mv[0:8].cast("Q")
         
         # Update our max_chunks
         self.max_chunks = new_max_chunks

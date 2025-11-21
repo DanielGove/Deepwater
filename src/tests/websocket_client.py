@@ -160,6 +160,19 @@ class MarketDataEngine:
         if not product_id: return
         pid = product_id.upper()
         self.product_ids.discard(pid)
+        # Close writers to release feed registry locks
+        if pid in self.trade_writers:
+            try:
+                self.trade_writers[pid].close()
+            except Exception as e:
+                log.warning(f"Error closing trade writer for {pid}: {e}")
+            del self.trade_writers[pid]
+        if pid in self.book_writers:
+            try:
+                self.book_writers[pid].close()
+            except Exception as e:
+                log.warning(f"Error closing book writer for {pid}: {e}")
+            del self.book_writers[pid]
         self._send_unsubscribe([pid])
 
     def list_products(self) -> list[str]:
@@ -262,7 +275,7 @@ class MarketDataEngine:
                                 tid   = int(tr.get("trade_id") or 0)
                                 self.trade_writers[pid].write_values(b'T',side,tid,packet_ns,recv_ns,_now_ns(),ev_ns,price,size)
                             if pid is not None:
-                                self._metrics.trade(pid, n=len(trades), late3DZ45QWEA   R235 ncy_us=_now_ns()-recv_ns)
+                                self._metrics.trade(pid, n=len(trades), latency_us=_now_ns()-recv_ns)
 
                     elif ch == "l2_data":
                         packet_ns = parse_ns_timestamp(obj.get("timestamp").encode('ascii'))

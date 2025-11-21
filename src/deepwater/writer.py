@@ -35,34 +35,34 @@ class Writer:
         # Current chunk state
         self.current_chunk = None
         self.chunk_index = None
-        self.current_chunk_metadata = self.registry.get_latest_chunk()
-        if self.current_chunk_metadata is None:
-            self.current_chunk_id = 0
-        else:
-            self.current_chunk_id = self.current_chunk_metadata.chunk_id
-        
+        self.current_chunk_metadata = None
+        self.current_chunk_id = self.registry.get_latest_chunk_idx()
+
         self._create_new_chunk()
         self._schema_init()
 
     def _create_new_chunk(self):
         self.current_chunk_id += 1
-        self.registry.register_chunk(
-            time.time_ns(),self.current_chunk_id,
-            self.feed_config["chunk_size_bytes"])
-
-        new_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
-
-        if self.current_chunk is not None:
+        
+        # Release old metadata BEFORE register_chunk in case it triggers resize
+        # (resize will close/remap the mmap, invalidating our metadata's cast views and causing an exported pointers exception)
+        _new_start_time = None
+        if self.current_chunk_metadata is not None:
             if self.feed_config.get("persist") is True:
                 self.current_chunk.close_file()
             else:
                 self.current_chunk.close_shm()
             self.current_chunk_metadata.status = ON_DISK if self.feed_config["persist"] else EXPIRED            
             self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
-            new_metadata.start_time = self.current_chunk_metadata.end_time
+            _new_start_time = self.current_chunk_metadata.end_time
             self.current_chunk_metadata.release()
+        
+        self.registry.register_chunk(
+            time.time_ns(),self.current_chunk_id,
+            self.feed_config["chunk_size_bytes"])
 
-        self.current_chunk_metadata = new_metadata
+        self.current_chunk_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
+        self.current_chunk_metadata.start_time = _new_start_time if _new_start_time is not None else self.current_chunk_metadata.start_time
 
         if self.feed_config.get("persist") is True:
             self.current_chunk = Chunk.create_file(path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"), size=self.feed_config["chunk_size_bytes"])
