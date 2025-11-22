@@ -175,7 +175,7 @@ class FeedRegistry:
         def_status = self._mv[24]
         return def_size, def_chunk_id, def_status
 
-    def register_chunk(self, start_time: int, chunk_id: int = None, size: int = None) -> int:
+    def register_chunk(self, start_time: int, chunk_id: int = None, size: int = None, status: int = None) -> int:
         if not self.is_writer:
             raise PermissionError("Read-only mode")
         self._chunk_count[0] += 1
@@ -193,7 +193,7 @@ class FeedRegistry:
         self._mv[offset + CHUNK_LAST_UPDATE_OFFSET:offset + CHUNK_ID_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"
         self._mv[offset + CHUNK_ID_OFFSET:offset + CHUNK_SIZE_OFFSET] = chunk_id.to_bytes(8, 'little')
         self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_STATUS_OFFSET] = size.to_bytes(8, 'little')
-        self._mv[offset + CHUNK_STATUS_OFFSET] = IN_MEMORY
+        self._mv[offset + CHUNK_STATUS_OFFSET] = status
         
         self.mm.flush()
         return self._chunk_count[0]
@@ -285,9 +285,11 @@ class FeedRegistry:
         return range(start_idx, end_idx)
 
     def get_latest_chunk_idx(self) -> Optional[int]:
-        return self._chunk_count[0] - 1 if self._chunk_count[0] > 0 else None
+        """Return the chunk_id of the most recently registered chunk."""
+        return self._chunk_count[0] if self._chunk_count[0] > 0 else None
     
     def get_latest_chunk(self) -> Optional[ChunkMeta]:
+        """Return metadata for the newest chunk (1-indexed internally)."""
         if self._chunk_count[0] == 0:
             return None
         return self.get_chunk_metadata(self._chunk_count[0])

@@ -63,75 +63,101 @@ class IndexRecord:
         return (f"IndexRecord(start={self.timestamp}, offset={self.offset}, size={self.size})")
 
 class ChunkIndex:
-    __slots__ = ("_mv", "closeables", "read_only", "is_shm", "_index_count", "_capacity")
+    __slots__ = ("_mv", "closeables", "read_only", "is_shm", "_count", "_capacity")
 
     def __init__(self, mv, closeables, read_only, is_shm):
         self._mv = mv
         self.closeables = closeables
         self.read_only = read_only
         self.is_shm = is_shm
-        self._index_count = self._mv[0:8].cast("Q")[0]
-        self._capacity = self._mv[8:16].cast("Q")[0]
+        self._count = self._mv[0:8].cast("Q")
+        self._capacity = self._mv[8:16].cast("Q")
+
+    @property
+    def count(self) -> int:
+        return self._count[0]
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity[0]
 
     @classmethod
-    def create_shm(cls, name:str, capacity:int=2047):
-        shm = shared_memory.SharedMemory(name=name, create=True, size=HEADER_SIZE+capacity*INDEX_SIZE)
+    def create_shm(cls, name: str, capacity: int = 2047):
+        size = HEADER_SIZE + capacity * INDEX_SIZE
+        shm = shared_memory.SharedMemory(name=name, create=True, size=size)
         HEADER_STRUCT.pack_into(shm.buf, 0, 0, capacity)
-        return cls(mv=shm.buf, closeables=[shm], read_only=False, is_shm=True)
+        mv = memoryview(shm.buf)
+        return cls(mv=mv, closeables=[shm], read_only=False, is_shm=True)
 
     @classmethod
-    def open_shm(cls, name:str):
+    def open_shm(cls, name: str):
         shm = shared_memory.SharedMemory(name=name, create=False)
-        return cls(mv=shm.buf, closeables=[shm], read_only=True, is_shm=True)
+        return cls(mv=memoryview(shm.buf), closeables=[shm], read_only=True, is_shm=True)
     
     def close_shm(self):
+        self._capacity.release()
+        self._count.release()
         self._mv.release()
-        self.closeables[0].close()
+        shm = self.closeables[0]
         if not self.read_only:
-            self.closeables[0].unlink()
+            shm.unlink()
+        shm.close()
 
     @classmethod
-    def create_file(cls, path:str, capacity:int=2047):
+    def create_file(cls, path: str, capacity: int = 2047):
+        size = HEADER_SIZE + capacity * INDEX_SIZE
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
-        os.ftruncate(fd, HEADER_SIZE+capacity*INDEX_SIZE)
-        mm = mmap.mmap(fd, length=capacity, access=mmap.ACCESS_WRITE)
+        os.ftruncate(fd, size)
+        mm = mmap.mmap(fd, length=size, access=mmap.ACCESS_WRITE)
         HEADER_STRUCT.pack_into(mm, 0, 0, capacity)
         return cls(memoryview(mm), [mm, fd], read_only=False, is_shm=False)
     
     @classmethod
-    def open_file(cls, path:str):
+    def open_file(cls, path: str):
         fd = os.open(path, os.O_RDONLY)
         mm = mmap.mmap(fd, length=0, access=mmap.ACCESS_READ)
-        return cls(memoryview(mm), [fd,mm], read_only=True, is_shm=False)
+        return cls(memoryview(mm), [mm, fd], read_only=True, is_shm=False)
 
     def close_file(self):
+        self._capacity.release()
+        self._count.release()
         self._mv.release()
         mm = self.closeables[0]
         fd = self.closeables[1]
         if not self.read_only:
             mm.flush()
-            os.ftruncate(fd, HEADER_SIZE + (self._index_count * INDEX_SIZE))
             os.fsync(fd)
         mm.close()
         os.close(fd)
 
-    def create_index(self, timestamp: int, offset: int = None) -> int:
-        offset = HEADER_SIZE + (self._index_count * INDEX_SIZE)
-        self._mv[offset + TIMESTAMP_OFFSET:offset + OFFSET_OFFSET] = timestamp.to_bytes(8, 'little')
-        self._mv[offset + OFFSET_OFFSET:offset + OFFSET_OFFSET + 8] = offset.to_bytes(8, 'little')
-        self._index_count += 1
-        return self._index_count
+    def create_index(self, timestamp: int, chunk_offset: int, size: int = 0) -> int:
+        if self.read_only:
+            raise PermissionError("read-only index")
+        idx = self.count
+        if idx >= self.capacity:
+            raise IndexError("Chunk index at capacity")
+        entry_offset = HEADER_SIZE + (idx * INDEX_SIZE)
+        INDEX_STRUCT.pack_into(self._mv, entry_offset, timestamp, chunk_offset, size)
+        self._count[0] = idx + 1
+        return idx + 1
 
-    def _timestamp(self, index: int) -> memoryview:
-        offset = HEADER_SIZE + (index * INDEX_SIZE) + TIMESTAMP_OFFSET
-        return self._mv[offset:offset + 8]
+    def _timestamp(self, index: int) -> int:
+        entry_offset = HEADER_SIZE + (index * INDEX_SIZE)
+        return int.from_bytes(self._mv[entry_offset:entry_offset + 8], "little")
 
-    def get_index(self, index: int) -> memoryview:
+    def get_index(self, index: int) -> IndexRecord:
+        if index < 0 or index >= self.count:
+            raise IndexError("index out of range")
         offset = HEADER_SIZE + (index * INDEX_SIZE)
         return IndexRecord(self._mv[offset:offset + INDEX_SIZE])
 
+    def get_latest_index(self) -> Optional[IndexRecord]:
+        if self.count == 0:
+            return None
+        return self.get_index(self.count - 1)
+
     def _binary_search_start_time(self, target_time: int) -> int:
-        left, right = 0, self._index_count
+        left, right = 0, self.count
         while left < right:
             mid = (left + right) >> 1
             if self._timestamp(mid) < target_time:
@@ -141,7 +167,7 @@ class ChunkIndex:
         return left
 
     def _binary_search_end_time(self, target_time: int) -> int:
-        left, right = 0, self._index_count
+        left, right = 0, self.count
         while left < right:
             mid = (left + right) >> 1
             if self._timestamp(mid) <= target_time:
@@ -156,13 +182,13 @@ class ChunkIndex:
 
     def get_indices_after(self, time_t: int) -> Iterator[int]:
         start_idx = self._binary_search_end_time(time_t)
-        return range(start_idx, self._index_count)
+        return range(start_idx, self.count)
 
     def get_indicies_in_range(self, start_time: int, end_time: int) -> Iterator[int]:
         start_idx = 0
-        end_idx = self._index_count
+        end_idx = self.count
 
-        left, right = 0, self._index_count
+        left, right = 0, self.count
         while left < right:
             mid = (left + right) >> 1
             if self._timestamp(mid) < start_time:
@@ -171,7 +197,7 @@ class ChunkIndex:
                 right = mid
         start_idx = left
 
-        left, right = start_idx, self._index_count
+        left, right = start_idx, self.count
         while left < right:
             mid = (left + right) >> 1
             if self._timestamp(mid) <= end_time:
@@ -181,8 +207,3 @@ class ChunkIndex:
         end_idx = left
 
         return range(start_idx, end_idx)
-    
-    def get_latest_index(self) -> Optional[IndexRecord]:
-        if self._index_count == 0:
-            return None
-        return self.get_index(self._index_count-1)

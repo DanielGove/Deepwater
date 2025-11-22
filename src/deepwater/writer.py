@@ -36,7 +36,7 @@ class Writer:
         self.current_chunk = None
         self.chunk_index = None
         self.current_chunk_metadata = None
-        self.current_chunk_id = self.registry.get_latest_chunk_idx()
+        self.current_chunk_id = self.registry.get_latest_chunk_idx() or 0
 
         self._create_new_chunk()
         self._schema_init()
@@ -56,28 +56,36 @@ class Writer:
             self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
             _new_start_time = self.current_chunk_metadata.end_time
             self.current_chunk_metadata.release()
-        
-        self.registry.register_chunk(
-            time.time_ns(),self.current_chunk_id,
-            self.feed_config["chunk_size_bytes"])
+
+        if self.feed_config.get("persist") is True:
+            self.registry.register_chunk(
+                time.time_ns(),self.current_chunk_id,
+                self.feed_config["chunk_size_bytes"], status=ON_DISK)
+            self.current_chunk = Chunk.create_file(path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"), size=self.feed_config["chunk_size_bytes"])
+        else:
+            self.registry.register_chunk(
+                time.time_ns(),self.current_chunk_id,
+                self.feed_config["chunk_size_bytes"], status=IN_MEMORY)
+            self.current_chunk = Chunk.create_shm(name=f"{self.feed_name}-{self.current_chunk_id}", size=self.feed_config["chunk_size_bytes"])
 
         self.current_chunk_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
         self.current_chunk_metadata.start_time = _new_start_time if _new_start_time is not None else self.current_chunk_metadata.start_time
-
-        if self.feed_config.get("persist") is True:
-            self.current_chunk = Chunk.create_file(path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"), size=self.feed_config["chunk_size_bytes"])
-        else:
-            self.current_chunk = Chunk.create_shm(name=f"{self.feed_name}-{self.current_chunk_id}", size=self.feed_config["chunk_size_bytes"])
 
         if self.feed_config.get("index_playback") is True:
             if self.feed_config.get("persist") is True:
                 if self.chunk_index is not None:
                     self.chunk_index.close_file()
-                self.chunk_index = ChunkIndex.create_file(path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.idx"), capacity=2047)
+                self.chunk_index = ChunkIndex.create_file(
+                    path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.idx"),
+                    capacity=2047
+                )
             else:
                 if self.chunk_index is not None:
                     self.chunk_index.close_shm()
-                self.chunk_index = ChunkIndex.create_shm(name=f"{self.feed_name}-index", capacity=2047)
+                self.chunk_index = ChunkIndex.create_shm(
+                    name=f"{self.feed_name}-index-{self.current_chunk_id}",
+                    capacity=2047
+                )
 
 
     def write(self, timestamp: int, record_data: Union[bytes, np.ndarray], create_index: bool = False) -> int:
@@ -90,8 +98,8 @@ class Writer:
 
         position = self.current_chunk_metadata.write_pos
         new_position = self.current_chunk.write_bytes(position, record_data)
-        if create_index:
-            self.chunk_index.create_index(timestamp, position)
+        if create_index and self.chunk_index is not None:
+            self.chunk_index.create_index(timestamp, position, record_size)
 
         self.current_chunk_metadata.last_update = timestamp
         self.current_chunk_metadata.write_pos = new_position
@@ -126,7 +134,8 @@ class Writer:
         if create_index and self.chunk_index is not None:
             self.chunk_index.create_index(
                 vals[self._ts_idx],
-                self.current_chunk_metadata.write_pos
+                self.current_chunk_metadata.write_pos,
+                self._rec_size
             )
         self.current_chunk_metadata.last_update = vals[self._ts_idx]
         self.current_chunk_metadata.write_pos += self._rec_size
