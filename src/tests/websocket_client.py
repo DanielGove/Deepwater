@@ -4,15 +4,16 @@ from websocket import create_connection, WebSocketTimeoutException, WebSocketCon
 from typing import Dict, Iterable, Optional, Tuple, Any, List
 from fastnumbers import fast_float as _ff
 
-import simdjson as orjson
-
+import orjson
+from simdjson import Parser as _JSONParser
 import sys
 import logging
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 log = logging.getLogger("dw.ws")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+if not log.handlers:
+    log.addHandler(logging.NullHandler())
 
 from deepwater.platform import Platform  # unchanged platform substrate
 from deepwater.utils.benchmarking import Metrics
@@ -74,6 +75,19 @@ def _backoff():
         yield b
         b = min(b*2.0, 15.0)
 
+def _ensure_bytes(val) -> Optional[bytes]:
+    if val is None:
+        return None
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        return bytes(val)
+    return str(val).encode("ascii")
+
+def _parse_ts(val) -> int:
+    data = _ensure_bytes(val)
+    if not data:
+        return 0
+    return parse_ns_timestamp(data)
+
 # ======= Engine =======
 
 class MarketDataEngine:
@@ -106,14 +120,16 @@ class MarketDataEngine:
         self._seq_gap_trades = 0
         self._last_seq: int = -1
         self._metrics = Metrics()
+        self._parser = _JSONParser()
 
         # Control flow
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
         # Dead socket detection
-        self._hb_last = time.monotonic()
-        self._msg_last = time.monotonic()
+        now = time.monotonic()
+        self._hb_last = now
+        self._msg_last = now
         self._hb_timeout = 12.0     # seconds with no heartbeats -> reconnect
         self._msg_timeout = 12.0    # seconds with no messages  -> reconnect
 
@@ -220,7 +236,22 @@ class MarketDataEngine:
     # ---- unified IO loop: recv + process ----
 
     def _io_loop(self) -> None:
-        loads = orjson.loads
+        parse = self._parser.parse
+        now_ns = _now_ns
+        fast_float = _ff
+
+        metrics = self._metrics
+        ingress = metrics.ingress
+        trade_metric = metrics.trade
+        l2_metric = metrics.l2
+        trade_writers = self.trade_writers
+        book_writers = self.book_writers
+        bad_frame_dir = self.platform.base_path / "bad_frames"
+        try:
+            bad_frame_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            bad_frame_dir = None
+
         for delay in _backoff():
             if not self._should_run:
                 return
@@ -234,8 +265,9 @@ class MarketDataEngine:
                         raw = self._ws.recv()
                         if not raw:
                             raise WebSocketConnectionClosedException("recv returned None/empty")
-                        recv_ns = _now_ns()
-                        self._metrics.ingress(len(raw), 1)
+                        recv_ns = now_ns()
+                        ingress(len(raw), 1)
+                        self._msg_last = time.monotonic()
                     except WebSocketTimeoutException:
                         # treat as liveness issue; fall through to timeout checks below
                         raw = None
@@ -244,16 +276,26 @@ class MarketDataEngine:
                     except Exception as e:
                         raise WebSocketConnectionClosedException(f"WS recv error: {e!s}")
 
-                    try:
-                        obj = loads(raw)
-                    except Exception:
-                        # TODO: write bad frames to disk if you want)
-                        log.warning("JSON decode error (frame skipped)")
+                    if raw is None:
                         continue
 
-                    ch = obj.get("channel")
-                    if ch == "heartbeats":
+                    try:
+                        doc = parse(raw)
+                        obj = doc.as_dict()
+                    except Exception:
+                        msg = "JSON decode error (frame skipped)"
+                        if bad_frame_dir is not None:
+                            try:
+                                path = bad_frame_dir / f"badframe_{now_ns()}.json"
+                                data = raw if isinstance(raw, (bytes, bytearray)) else str(raw).encode("utf-8", "replace")
+                                path.write_bytes(data)
+                                msg = f"JSON decode error (frame saved to {path})"
+                            except Exception as ex:
+                                log.debug("bad frame dump failed: %s", ex, exc_info=True)
+                        log.warning(msg)
                         continue
+                    finally:
+                        doc = None
 
                     seq = obj.get("sequence_num")
                     if seq is not None:
@@ -261,37 +303,71 @@ class MarketDataEngine:
                             self._seq_gap_trades += 1
                         self._last_seq = int(seq)
 
+                    ch = obj.get("channel")
+                    if ch == "heartbeats":
+                        self._hb_last = time.monotonic()
+                        continue
+
                     if ch == "market_trades":
-                        packet_ns = parse_ns_timestamp(obj.get("timestamp").encode('ascii'))
+                        packet_ns = _parse_ts(obj.get("timestamp"))
                         events = obj.get("events") or ()
                         for ev in events:
                             trades = ev.get("trades") or ()
-                            pid = None
+                            if not trades:
+                                continue
+                            proc_ns = now_ns()
+                            written_counts: Dict[str, int] = {}
                             for tr in trades:
                                 pid = tr.get("product_id")
-                                ev_ns = parse_ns_timestamp(tr.get("time").encode('ascii'))
-                                side  = tr.get("side")[0].encode("ascii")
-                                price = _ff(tr.get("price")); size = _ff(tr.get("size"))
-                                tid   = int(tr.get("trade_id") or 0)
-                                self.trade_writers[pid].write_values(b'T',side,tid,packet_ns,recv_ns,_now_ns(),ev_ns,price,size)
-                            if pid is not None:
-                                self._metrics.trade(pid, n=len(trades), latency_us=_now_ns()-recv_ns)
+                                if not pid:
+                                    continue
+                                writer = trade_writers.get(pid)
+                                if writer is None:
+                                    continue
+                                write_values = writer.write_values
+                                ev_ns = _parse_ts(tr.get("time"))
+                                side_val = tr.get("side")
+                                side = side_val[0].encode("ascii") if side_val else b'?'
+                                price = fast_float(tr.get("price"))
+                                size = fast_float(tr.get("size"))
+                                tid = int(tr.get("trade_id") or 0)
+                                write_values(b'T', side, tid, packet_ns, recv_ns, proc_ns, ev_ns, price, size)
+                                written_counts[pid] = written_counts.get(pid, 0) + 1
+                            if written_counts:
+                                latency_us = max(0, now_ns() - recv_ns) / 1_000.0
+                                for pid, count in written_counts.items():
+                                    trade_metric(pid, n=count, latency_us=latency_us)
 
                     elif ch == "l2_data":
-                        packet_ns = parse_ns_timestamp(obj.get("timestamp").encode('ascii'))
+                        packet_ns = _parse_ts(obj.get("timestamp"))
                         events = obj.get("events") or ()
                         for ev in events:
                             pid = ev.get("product_id")
-                            l2_type = ev.get("type")[0].encode('ascii')  # 'U' or 'S'
+                            if not pid:
+                                continue
+                            writer = book_writers.get(pid)
+                            if writer is None:
+                                continue
                             updates = ev.get("updates") or ()
+                            if not updates:
+                                continue
+                            l2_type_val = ev.get("type")
+                            l2_type = l2_type_val[0].encode('ascii') if l2_type_val else b'U'
                             idx = True if l2_type == b's' else False
+                            proc_ns = now_ns()
+                            write_values = writer.write_values
                             for u in updates:
-                                ev_ns = parse_ns_timestamp(u.get("event_time").encode('ascii'))
-                                side  = u.get("side")[0].encode("ascii")
-                                price = _ff(u.get("price_level")); qty = _ff(u.get("new_quantity"))
-                                self.book_writers[pid].write_values(l2_type,side,packet_ns,recv_ns,_now_ns(),ev_ns,price,qty,create_index=idx)
+                                ev_ns = _parse_ts(u.get("event_time"))
+                                side_val = u.get("side")
+                                side = side_val[0].encode("ascii") if side_val else b'?'
+                                price = fast_float(u.get("price_level"))
+                                qty = fast_float(u.get("new_quantity"))
+                                write_values(l2_type, side, packet_ns, recv_ns, proc_ns, ev_ns, price, qty, create_index=idx)
                                 idx = False
-                            self._metrics.l2(pid, n=len(updates), latency_us=_now_ns()-recv_ns)
+                            count = len(updates)
+                            if count:
+                                latency_us = max(0, now_ns() - recv_ns) / 1_000.0
+                                l2_metric(pid, n=count, latency_us=latency_us)
 
                     elif ch == "subscriptions":
                         # fine to ignore
@@ -327,3 +403,14 @@ class MarketDataEngine:
         
     def metrics_snapshot(self) -> dict: return self._metrics.snapshot()
     def metrics_reset(self) -> None: self._metrics.reset()
+
+    def status_snapshot(self) -> dict:
+        now = time.monotonic()
+        return {
+            "running": self._should_run,
+            "connected": self._ws is not None,
+            "subs": sorted(self.product_ids),
+            "seq_gap_trades": self._seq_gap_trades,
+            "hb_age": max(0.0, now - self._hb_last) if self._hb_last else None,
+            "msg_age": max(0.0, now - self._msg_last) if self._msg_last else None,
+        }

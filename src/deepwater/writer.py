@@ -1,6 +1,7 @@
 import threading
 import time
 import struct
+import logging
 from typing import Union, Optional, Tuple
 from pathlib import Path
 import numpy as np
@@ -11,6 +12,8 @@ from .chunk import Chunk
 from .index import ChunkIndex
 from .feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED
 from .utils.process import ProcessUtils
+
+log = logging.getLogger("dw.writer")
 
 class Writer:
     def __init__(self, platform, feed_name:str):
@@ -23,7 +26,7 @@ class Writer:
         # Try to resume existing feed
         feed_exists = platform.registry.feed_exists(feed_name)
         if not feed_exists:
-            print(f"🆕 Creating new feed '{feed_name}' (PID: {self.my_pid})")
+            log.info("Creating new feed '%s' (pid=%s)", feed_name, self.my_pid)
             self.platform.registry.register_feed(feed_name)
 
         # Where to store persisted chunks

@@ -8,8 +8,9 @@ Fixes/changes vs v7:
 • Logs view still captures stdout/stderr without echoing to the terminal (no UI conflicts).
 """
 import os, sys, time
+import logging
 from collections import deque
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from prompt_toolkit.application import Application
 from prompt_toolkit.styles import Style
 from prompt_toolkit.key_binding import KeyBindings
@@ -32,10 +33,14 @@ class _RingWriter:
     """Capture stdout/stderr into a ring buffer. Do not echo to terminal.
     Also write to LOGFILE if set.
     """
-    def __init__(self, ring: deque):
-        self._ring = ring
+    def __init__(self, emit_line):
+        self._emit_line = emit_line
         self._buf = ""
-        self._fh = open(LOGFILE, "a", buffering=1) if LOGFILE else None
+
+    def _push_line(self, line: str) -> None:
+        text = line.rstrip("\n")
+        self._emit_line(text)
+
     def write(self, s: str) -> int:
         self._buf += s
         while True:
@@ -43,20 +48,27 @@ class _RingWriter:
             if i == -1:
                 break
             line = self._buf[:i+1]
-            self._ring.append(line.rstrip("\n"))
-            if self._fh:
-                try: self._fh.write(line)
-                except Exception: pass
+            self._push_line(line)
             self._buf = self._buf[i+1:]
         return len(s)
     def flush(self) -> None:
-        if self._fh:
-            try: self._fh.flush()
-            except Exception: pass
+        return None
     def close(self) -> None:
-        if self._fh:
-            try: self._fh.close()
-            except Exception: pass
+        return None
+
+
+class _RingLogHandler(logging.Handler):
+    """Route logging records into the dashboard log ring."""
+    def __init__(self, emit_line):
+        super().__init__()
+        self._emit_line = emit_line
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+        except Exception:
+            msg = record.getMessage()
+        self._emit_line(msg)
 
 # ────────────────────────── helpers ──────────────────────────
 def _term_width(default: int = 120) -> int:
@@ -77,12 +89,14 @@ def _bar(val: float, vmax: float, width: int = 24) -> str:
     filled = int(max(0.0, min(1.0, val / vmax)) * width + 0.5)
     return "█" * filled + " " * (width - filled)
 
-def _fmt_latency(ns: float) -> str:
-    if ns is None: return "—"
-    if ns >= 1_000_000_000: return f"{ns/1_000_000_000:.2f}s"
-    if ns >= 1_000_000:     return f"{ns/1_000_000:.2f}ms"
-    if ns >= 1_000:       return f"{ns/1_000:.1f}µs"
-    return f"{ns}ns"
+def _fmt_latency_us(us: Optional[float]) -> str:
+    if us is None or us <= 0:
+        return "—"
+    if us >= 1_000_000:
+        return f"{us/1_000_000:.2f}s"
+    if us >= 1_000:
+        return f"{us/1_000:.2f}ms"
+    return f"{us:.0f}µs"
 
 def _sum_rates(block: Dict[str, Dict[str, Any]]) -> float:
     total = 0.0
@@ -106,9 +120,16 @@ class DashboardApp:
 
         # capture ring
         self._ring = deque(maxlen=5000)
+        self._logfile = open(LOGFILE, "a", buffering=1) if LOGFILE else None
+        self._logs_dirty = False
+        self._log_handler = _RingLogHandler(self._append_log)
+        self._log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        self._prev_log_handlers = None
+        self._prev_log_level = None
 
         # DASHBOARD widgets
         self.header = FormattedTextControl(self._render_header)
+        self.control = FormattedTextControl(self._render_control)
         self.totals = FormattedTextControl(self._render_totals)
         self.trades = FormattedTextControl(lambda: self._render_table("trades"))
         self.l2     = FormattedTextControl(lambda: self._render_table("l2"))
@@ -122,6 +143,7 @@ class DashboardApp:
 
         dash_root = HSplit([
             Window(height=1, content=self.header, always_hide_cursor=True),
+            Window(height=2, content=self.control, always_hide_cursor=True),
             Window(height=3, content=self.totals, always_hide_cursor=True),
             VSplit([
                 Window(content=self.trades, right_margins=[ScrollbarMargin()], always_hide_cursor=True),
@@ -176,6 +198,9 @@ class DashboardApp:
             'table.line': '#cccccc',
             'status': 'bold #00ff88',
             'warn': 'bold #ff4444',
+            'badge.ok': 'bg:#0b6623 #ffffff bold',
+            'badge.warn': 'bg:#7f1d1d #ffffff bold',
+            'badge.info': '#a0c4ff',
             'cmd': 'bg:#202020 #ffffff',
             'log': 'bg:#101010 #dddddd',
             'logs_view': 'bg:#101010 #dddddd',
@@ -188,6 +213,27 @@ class DashboardApp:
             full_screen=True,
             refresh_interval=self.refresh,
         )
+
+    def _append_log(self, text: str) -> None:
+        self._ring.append(text)
+        if self._logfile:
+            try:
+                self._logfile.write(text + "\n")
+            except Exception:
+                pass
+        self._logs_dirty = True
+        app = getattr(self, "app", None)
+        if app is not None:
+            try:
+                app.invalidate()
+            except Exception:
+                pass
+
+    def _refresh_logstrip_if_needed(self) -> None:
+        if not self._logs_dirty:
+            return
+        self.logstrip.text = "\n".join(list(self._ring)[-3:])
+        self._logs_dirty = False
 
     # ───────────── layout switching ─────────────
     def _show_logs(self):
@@ -208,6 +254,7 @@ class DashboardApp:
             Document(text=text, cursor_position=len(text)),
             bypass_readonly=True
         )
+        self._refresh_logstrip_if_needed()
 
     def _show_dash(self):
         self._mode = "dash"
@@ -262,6 +309,44 @@ class DashboardApp:
             _padline(''),
         ]
 
+    def _render_control(self) -> List[Tuple[str,str]]:
+        try:
+            snap = self.engine.status_snapshot()
+        except Exception:
+            snap = {}
+        running = snap.get("running", False)
+        connected = snap.get("connected", False)
+        hb_age = snap.get("hb_age")
+        msg_age = snap.get("msg_age")
+        subs = snap.get("subs") or []
+        seq_gap = snap.get("seq_gap_trades", 0)
+
+        def _fmt_age(v: Optional[float]) -> str:
+            if v is None:
+                return "—"
+            if v >= 1.0:
+                return f"{v:.1f}s"
+            return f"{v*1000:.0f}ms"
+
+        badges: List[Tuple[str,str]] = [
+            ('class:badge.ok' if running else 'class:badge.warn', f" {'RUN' if running else 'STOP'} "),
+            ('', ' '),
+            ('class:badge.ok' if connected else 'class:badge.warn', f" {'WS ON' if connected else 'WS OFF'} "),
+            ('', '  '),
+            ('class:badge.info', f"hbΔ {_fmt_age(hb_age)}  msgΔ {_fmt_age(msg_age)}"),
+            ('', '  '),
+            ('class:badge.info', f"seq gaps {seq_gap}"),
+        ]
+
+        if subs:
+            shown = ", ".join(subs[:4])
+            extra = len(subs) - 4
+            more = f" (+{extra})" if extra > 0 else ""
+            badges.append(('', '  '))
+            badges.append(('class:badge.info', f"subs {len(subs)}: {shown}{more}"))
+        badges.append(('', "\n"))
+        return badges
+
     def _render_table(self, kind: str) -> List[Tuple[str,str]]:
         s = self._snapshot(); data = s.get(kind, {})
         title = "Trades" if kind == 'trades' else 'L2'
@@ -273,24 +358,28 @@ class DashboardApp:
         items = sorted(data.items(), key=lambda kv: kv[1]['rates']['rps_10s'], reverse=True)[:16]
         vmax = max(1.0, max(v['rates']['rps_10s'] for _, v in items) * 1.2)
         for pid, m in items:
-            r = m['rates']; p99 = m.get('p99_us', 0.0)
+            r = m['rates']
             bar = _bar(r['rps_10s'], vmax)
-            lines.append(('class:table.line', _padline(f"  {pid:12s} {bar}  {r['rps_10s']:7.2f} rps  p99={_fmt_latency(p99)}")[1]))
+            lat = m.get('latency', {})
+            last = _fmt_latency_us(lat.get("last"))
+            fast = _fmt_latency_us(lat.get("p99_fast"))
+            slow = _fmt_latency_us(lat.get("p99_slow"))
+            lines.append(('class:table.line', _padline(
+                f"  {pid:12s} {bar}  {r['rps_10s']:7.2f} rps  last={last} fast={fast} slow={slow}"
+            )[1]))
         # a couple of blanks to clear leftovers when the list shrinks
         lines.append(('', _padline('')[1])); lines.append(('', _padline('')[1]))
         return lines
 
     def _render_status(self) -> List[Tuple[str,str]]:
+        self._refresh_logstrip_if_needed()
         msg = self.last_msg or "Type a command below. Try: start · sub BTC-USD ETH-USD · logs"
         return [ _padline(" " + msg) ]
 
     # ───────────── commands ─────────────
     def _notice(self, text: str) -> None:
         self.last_msg = text
-        self._ring.append(text)
-        self.logstrip.text = "\n".join(list(self._ring)[-3:])
-        try: self.app.invalidate()
-        except Exception: pass
+        self._append_log(text)
 
     def _on_command(self, buff) -> None:
         line = (buff.text or "").strip(); buff.text = ""
@@ -312,7 +401,7 @@ class DashboardApp:
         if op in ("q","quit","exit"):
             self.app.exit(); return
         if op == "help":
-            self._notice("start | stop | sub <Product ID> | unsub <Product ID> | products | status | reset | logs | quit")
+            self._notice("start | stop | sub <PIDs...> | unsub <PIDs...> | products | subs | status | reset | logs | quit")
             return
         if op == "logs":
             self._show_logs(); return
@@ -326,19 +415,32 @@ class DashboardApp:
             recs = _sum_rates(s.get('trades')) + _sum_rates(s.get('l2'))
             self._notice(f"WS={t['rps_10s']:.1f} rps / {t['MBps_10s']:.2f} MB/s; recs≈{recs:.1f} rps")
         elif op == "sub":
-            pids = args[-1]
-            if not pids: self._notice("usage: sub <Product ID>")
-            else: self.engine.subscribe(pids); self._notice(f"subscribed: {pids}")
+            if not args:
+                self._notice("usage: sub <Product IDs...>")
+            else:
+                for pid in args:
+                    self.engine.subscribe(pid)
+                self._notice(f"subscribed: {' '.join(args)}")
         elif op == "unsub":
-            pids = args[-1]
-            if not pids: self._notice("usage: unsub <Product ID>")
-            else: self.engine.unsubscribe(pids); self._notice(f"unsubscribed: {pids}")
+            if not args:
+                self._notice("usage: unsub <Product IDs...>")
+            else:
+                for pid in args:
+                    self.engine.unsubscribe(pid)
+                self._notice(f"unsubscribed: {' '.join(args)}")
         elif op == "products":
             try:
                 items = self.engine.list_products()
                 self._notice(", ".join(items) if items else "<none>")
             except Exception:
                 self._notice("<engine does not expose list_products()>")
+        elif op == "subs":
+            try:
+                snap = self.engine.status_snapshot()
+                subs = snap.get("subs") or []
+                self._notice(", ".join(subs) if subs else "<none>")
+            except Exception as e:
+                self._notice(f"status error: {e!s}")
         elif op == "reset":
             try:
                 if hasattr(self.engine, "metrics_reset"):
@@ -352,10 +454,18 @@ class DashboardApp:
 
     # ───────────── run ─────────────
     def run(self) -> None:
+        root = logging.getLogger()
+        self._prev_log_handlers = list(root.handlers)
+        self._prev_log_level = root.level
+        for handler in self._prev_log_handlers:
+            root.removeHandler(handler)
+        root.addHandler(self._log_handler)
+        root.setLevel(logging.INFO)
+
         # Replace stdout/stderr with ring writer (no echo -> no UI conflicts)
         with patch_stdout():
             old_out, old_err = sys.stdout, sys.stderr
-            rw = _RingWriter(self._ring)
+            rw = _RingWriter(self._append_log)
             try:
                 sys.stdout = rw
                 sys.stderr = rw
@@ -364,7 +474,18 @@ class DashboardApp:
                 sys.stdout = old_out
                 sys.stderr = old_err
                 rw.close()
+        root.removeHandler(self._log_handler)
+        for handler in self._prev_log_handlers:
+            root.addHandler(handler)
+        if self._prev_log_level is not None:
+            root.setLevel(self._prev_log_level)
+        if self._logfile:
+            try:
+                self._logfile.close()
+            except Exception:
+                pass
+            self._logfile = None
 
 # ────────────────────────── entry ──────────────────────────
 if __name__ == "__main__":
-    DashboardApp(MarketDataEngine(), refresh_hz=2.0).run()
+    DashboardApp(MarketDataEngine(), refresh_hz=12.0).run()
