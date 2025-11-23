@@ -2,7 +2,7 @@
 import threading, socket, time, struct, signal
 from websocket import create_connection, WebSocketTimeoutException, WebSocketConnectionClosedException
 from typing import Dict, Iterable, Optional, Tuple, Any, List
-from fastnumbers import fast_float as _ff
+from fastnumbers import fast_float as _ff, fast_int as _fi
 
 import orjson
 from simdjson import Parser as _JSONParser
@@ -87,6 +87,10 @@ def _parse_ts(val) -> int:
     if not data:
         return 0
     return parse_ns_timestamp(data)
+
+def _parse_frame(raw):
+    parser = _JSONParser()
+    return parser.parse(raw).as_dict()
 
 # ======= Engine =======
 
@@ -239,6 +243,7 @@ class MarketDataEngine:
         parse = self._parser.parse
         now_ns = _now_ns
         fast_float = _ff
+        fast_int = _fi
 
         metrics = self._metrics
         ingress = metrics.ingress
@@ -281,9 +286,8 @@ class MarketDataEngine:
 
                     try:
                         doc = parse(raw)
-                        obj = doc.as_dict()
-                    except Exception:
-                        msg = "JSON decode error (frame skipped)"
+                    except Exception as e:
+                        msg = f"JSON decode error: {e!s}"
                         if bad_frame_dir is not None:
                             try:
                                 path = bad_frame_dir / f"badframe_{now_ns()}.json"
@@ -294,88 +298,69 @@ class MarketDataEngine:
                                 log.debug("bad frame dump failed: %s", ex, exc_info=True)
                         log.warning(msg)
                         continue
-                    finally:
-                        doc = None
 
-                    seq = obj.get("sequence_num")
-                    if seq is not None:
-                        if int(seq) != self._last_seq+1:
-                            self._seq_gap_trades += 1
-                        self._last_seq = int(seq)
-
-                    ch = obj.get("channel")
-                    if ch == "heartbeats":
-                        self._hb_last = time.monotonic()
+                    if doc is None:
                         continue
 
-                    if ch == "market_trades":
-                        packet_ns = _parse_ts(obj.get("timestamp"))
-                        events = obj.get("events") or ()
-                        for ev in events:
-                            trades = ev.get("trades") or ()
-                            if not trades:
-                                continue
-                            proc_ns = now_ns()
-                            written_counts: Dict[str, int] = {}
-                            for tr in trades:
-                                pid = tr.get("product_id")
-                                if not pid:
-                                    continue
-                                writer = trade_writers.get(pid)
-                                if writer is None:
-                                    continue
-                                write_values = writer.write_values
-                                ev_ns = _parse_ts(tr.get("time"))
-                                side_val = tr.get("side")
-                                side = side_val[0].encode("ascii") if side_val else b'?'
-                                price = fast_float(tr.get("price"))
-                                size = fast_float(tr.get("size"))
-                                tid = int(tr.get("trade_id") or 0)
-                                write_values(b'T', side, tid, packet_ns, recv_ns, proc_ns, ev_ns, price, size)
-                                written_counts[pid] = written_counts.get(pid, 0) + 1
-                            if written_counts:
-                                latency_us = max(0, now_ns() - recv_ns) / 1_000.0
-                                for pid, count in written_counts.items():
-                                    trade_metric(pid, n=count, latency_us=latency_us)
+                    if doc["sequence_num"] != self._last_seq + 1:
+                        self._seq_gap_trades += 1
+                    self._last_seq = _fi(doc["sequence_num"])
 
-                    elif ch == "l2_data":
-                        packet_ns = _parse_ts(obj.get("timestamp"))
-                        events = obj.get("events") or ()
-                        for ev in events:
-                            pid = ev.get("product_id")
-                            if not pid:
-                                continue
-                            writer = book_writers.get(pid)
-                            if writer is None:
-                                continue
-                            updates = ev.get("updates") or ()
-                            if not updates:
-                                continue
-                            l2_type_val = ev.get("type")
-                            l2_type = l2_type_val[0].encode('ascii') if l2_type_val else b'U'
+                    if doc["channel"] == "heartbeats":
+                        self._hb_last = time.monotonic()
+                        del doc
+                        continue
+
+                    if doc["channel"] == "market_trades":
+                        packet_ns = _parse_ts(doc.get("timestamp"))
+                        for ev in doc["events"]:
+                            proc_ns = now_ns()
+                            counts: Dict[str, int] = {}
+                            for tr in ev["trades"]:
+                                writer = trade_writers.get(tr["product_id"])
+                                writer.write_values(b'T',
+                                                    tr["side"][0].encode("ascii"),
+                                                    fast_int(tr["trade_id"]),
+                                                    packet_ns, recv_ns, proc_ns,
+                                                    _parse_ts(tr["time"]),
+                                                    fast_float(tr["price"]),
+                                                    fast_float(tr["size"]))
+                                counts[tr["product_id"]] = counts.get(tr["product_id"], 0) + 1
+                            if counts:
+                                latency_us = max(0, now_ns() - recv_ns) / 1_000.0
+                                for pid, count in counts.items():
+                                    trade_metric(pid, n=count, latency_us=latency_us)
+                        del ev; del tr
+
+                    elif doc["channel"] == "l2_data":
+                        packet_ns = _parse_ts(doc.get("timestamp"))
+                        for ev in doc["events"]:
+                            writer = book_writers.get(ev["product_id"])
+                            l2_type = ev["type"][0].encode('ascii')
                             idx = True if l2_type == b's' else False
                             proc_ns = now_ns()
-                            write_values = writer.write_values
-                            for u in updates:
-                                ev_ns = _parse_ts(u.get("event_time"))
-                                side_val = u.get("side")
-                                side = side_val[0].encode("ascii") if side_val else b'?'
-                                price = fast_float(u.get("price_level"))
-                                qty = fast_float(u.get("new_quantity"))
-                                write_values(l2_type, side, packet_ns, recv_ns, proc_ns, ev_ns, price, qty, create_index=idx)
+                            for u in ev["updates"]:
+                                writer.write_values(
+                                    l2_type,
+                                    u["side"][0].encode("ascii"),
+                                    packet_ns, recv_ns, proc_ns,
+                                    _parse_ts(u["event_time"]),
+                                    fast_float(u["price_level"]),
+                                    fast_float(u["new_quantity"]),
+                                    create_index=idx)
                                 idx = False
-                            count = len(updates)
-                            if count:
+                            if ev["updates"]:
                                 latency_us = max(0, now_ns() - recv_ns) / 1_000.0
-                                l2_metric(pid, n=count, latency_us=latency_us)
+                                l2_metric(pid, n=len(ev["updates"]), latency_us=latency_us)
+                        del ev; del u
 
-                    elif ch == "subscriptions":
-                        # fine to ignore
+                    elif doc["channel"] == "subscriptions":
                         pass
                     else:
-                        # Unknown channel? log & continue (don’t crash)
-                        log.debug("unknown channel: %r", ch)
-
+                        log.debug("unknown channel: %r", doc["channel"])
+                    
+                    del doc
+                    
                 # should_run flipped false -> exit thread cleanly
                 return
 
@@ -383,6 +368,7 @@ class MarketDataEngine:
                 log.warning("WS closed: %s", e)
             except Exception as e:
                 log.error("WS ERROR: %s", e, exc_info=True)
+                del doc
             finally:
                 # Clean up socket only; do NOT recursively restart here
                 if self._ws is not None:
