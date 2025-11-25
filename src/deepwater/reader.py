@@ -16,6 +16,9 @@ class Reader:
         self.feed_name = feed_name
         self.feed_config = platform.lifecycle(feed_name)
         self.record_format = platform.get_record_format(feed_name)
+        # Timestamp decoding for range queries
+        self._ts_offset = self.record_format.get("ts_offset") or self.record_format.get("ts", {}).get("offset")
+        self._ts_byteorder = "little" if self.record_format.get("ts_endian", "<") == "<" else "big"
         self.data_dir = platform.base_path / "data" / feed_name
         self.my_pid = ProcessUtils.get_current_pid()
 
@@ -150,6 +153,69 @@ class Reader:
         if last_offset < 0:
             raise RuntimeError(f"Invalid write_pos {write_pos} for record_size {self._record_size}.")
         return self._record_struct.unpack_from(self._chunk.buffer, last_offset)
+
+    # ------------------------------------------------------------------ range playback
+    def stream_time_range(self, start_time: int, end_time: Optional[int] = None):
+        """
+        Yield packed records whose timestamp is within [start_time, end_time].
+        Requires feed layout to define a uint64 ts field (ts_offset).
+        """
+        if self._ts_offset is None:
+            raise RuntimeError("Feed layout missing ts_offset; cannot perform time-based reads.")
+
+        if self.registry.get_latest_chunk_idx() is None:
+            return
+
+        # choose chunk ids via registry helpers (1-based)
+        if end_time is None:
+            chunk_iter = self.registry.get_chunks_after(start_time)
+        else:
+            chunk_iter = self.registry.get_chunks_in_range(start_time, end_time)
+
+        for chunk_id in chunk_iter:
+            # open_chunk loads fresh metadata; skip empty chunks
+            self._open_chunk(chunk_id)
+            if self._chunk_meta is None or self._chunk_meta.num_records == 0:
+                continue
+            yield from self._stream_chunk_range(start_time, end_time)
+
+    def _stream_chunk_range(self, start_time: int, end_time: Optional[int]):
+        """Yield records from the currently opened chunk within the time window."""
+        buffer = self._chunk.buffer
+        write_pos = self._chunk_meta.write_pos
+
+        idx_path = self.data_dir / f"chunk_{self._chunk_id:08d}.idx"
+        have_index = self._index_enabled and idx_path.exists()
+
+        if have_index:
+            idx = ChunkIndex.open_file(str(idx_path))
+            try:
+                start_idx = idx._binary_search_start_time(start_time)
+                for i in range(start_idx, idx.count):
+                    rec = idx.get_index(i)
+                    try:
+                        ts = rec.timestamp
+                        if end_time is not None and ts > end_time:
+                            break
+                        offset = rec.offset
+                        yield self._record_struct.unpack_from(buffer, offset)
+                    finally:
+                        rec.release()
+            finally:
+                idx.close_file()
+            return
+
+        # Fallback: scan records sequentially
+        pos = 0
+        ts_off = self._ts_offset
+        ts_end = ts_off + 8
+        while pos + self._record_size <= write_pos:
+            ts = int.from_bytes(buffer[pos + ts_off:pos + ts_end], self._ts_byteorder)
+            if ts >= start_time:
+                if end_time is not None and ts > end_time:
+                    break
+                yield self._record_struct.unpack_from(buffer, pos)
+            pos += self._record_size
 
     def close(self):
         self._close_chunk()

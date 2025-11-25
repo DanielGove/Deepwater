@@ -221,21 +221,36 @@ class FeedRegistry:
         self.max_chunks = new_max_chunks
 
     def _chunk_start_time(self, index: int) -> int:
-        offset = HEADER_SIZE + ((index-1) * CHUNK_SIZE) + CHUNK_START_OFFSET
+        """1-based index into registry; returns recorded chunk start."""
+        offset = HEADER_SIZE + ((index - 1) * CHUNK_SIZE) + CHUNK_START_OFFSET
         return int.from_bytes(self._mv[offset:offset+8], 'little')
 
     def _chunk_end_time(self, index: int) -> int:
-        offset = HEADER_SIZE + ((index-1) * CHUNK_SIZE) + CHUNK_END_OFFSET
-        return int.from_bytes(self._mv[offset:offset+8], 'little')
+        """
+        1-based index into registry; returns end_time, falling back to last_update
+        for active chunks where end_time may be unset.
+        """
+        base = HEADER_SIZE + ((index - 1) * CHUNK_SIZE)
+        end = int.from_bytes(self._mv[base + CHUNK_END_OFFSET:base + CHUNK_END_OFFSET + 8], 'little')
+        if end != 0:
+            return end
+        # fall back to last_update so open chunks can be included in range queries
+        return int.from_bytes(self._mv[base + CHUNK_LAST_UPDATE_OFFSET:base + CHUNK_LAST_UPDATE_OFFSET + 8], 'little')
 
     def get_chunk_metadata(self, index: int) -> memoryview:
         offset = HEADER_SIZE + ((index-1) * CHUNK_SIZE)
         return ChunkMeta(self._mv[offset:offset + CHUNK_SIZE])
 
     def _binary_search_start_time(self, target_time: int) -> int:
-        left, right = 0, self._chunk_count[0]
+        """
+        Return the first 1-based chunk index whose start_time >= target_time.
+        If target_time is greater than all chunk starts, returns chunk_count+1.
+        """
+        left, right = 1, self._chunk_count[0] + 1  # right is exclusive
         while left < right:
             mid = (left + right) >> 1
+            if mid > self._chunk_count[0]:
+                break
             if self._chunk_start_time(mid) < target_time:
                 left = mid + 1
             else:
@@ -243,9 +258,15 @@ class FeedRegistry:
         return left
 
     def _binary_search_end_time(self, target_time: int) -> int:
-        left, right = 0, self._chunk_count[0]
+        """
+        Return the first 1-based chunk index whose end_time > target_time.
+        If all chunk end times are <= target_time, returns chunk_count+1.
+        """
+        left, right = 1, self._chunk_count[0] + 1
         while left < right:
             mid = (left + right) >> 1
+            if mid > self._chunk_count[0]:
+                break
             if self._chunk_end_time(mid) <= target_time:
                 left = mid + 1
             else:
@@ -253,36 +274,25 @@ class FeedRegistry:
         return left
 
     def get_chunks_before(self, time_t: int) -> Iterator[int]:
+        """Yield 1-based chunk indices whose start_time is before time_t."""
         end_idx = self._binary_search_start_time(time_t)
-        return range(end_idx)
+        return range(1, min(end_idx, self._chunk_count[0] + 1))
 
     def get_chunks_after(self, time_t: int) -> Iterator[int]:
+        """Yield 1-based chunk indices whose end_time is >= time_t."""
         start_idx = self._binary_search_end_time(time_t)
-        return range(start_idx, self._chunk_count[0])
+        return range(start_idx, self._chunk_count[0] + 1)
 
     def get_chunks_in_range(self, start_time: int, end_time: int) -> Iterator[int]:
-        start_idx = 0
-        end_idx = self._chunk_count[0]
+        """
+        Yield 1-based chunk indices whose time window overlaps [start_time, end_time].
+        """
+        if self._chunk_count[0] == 0:
+            return iter(())
 
-        left, right = 0, self._chunk_count[0]
-        while left < right:
-            mid = (left + right) >> 1
-            if self._chunk_end_time(mid) < start_time:
-                left = mid + 1
-            else:
-                right = mid
-        start_idx = left
-
-        left, right = start_idx, self._chunk_count[0]
-        while left < right:
-            mid = (left + right) >> 1
-            if self._chunk_start_time(mid) <= end_time:
-                left = mid + 1
-            else:
-                right = mid
-        end_idx = left
-
-        return range(start_idx, end_idx)
+        start_idx = self._binary_search_end_time(start_time - 1)
+        end_idx = self._binary_search_start_time(end_time + 1)
+        return range(start_idx, min(end_idx, self._chunk_count[0] + 1))
 
     def get_latest_chunk_idx(self) -> Optional[int]:
         """Return the chunk_id of the most recently registered chunk."""

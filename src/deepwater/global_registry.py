@@ -11,7 +11,7 @@ class GlobalRegistry:
     """
 
     FEED_NAME_LEN = 32
-    # name:32  chunk_sz_bytes:I  rotate_s:I  retain_h:I  persist:bool index_callback:bool  created_ns:Q
+    # name:32  chunk_sz_bytes:I  rotate_s:I  retain_h:I  persist:bool index_callback:bool  created_us:Q
     _ENTRY_CORE   = struct.Struct('<32sIII??6xQ68x') # Pad to 128
     ENTRY_SIZE = _ENTRY_CORE.size
     HEADER_SIZE = _ENTRY_CORE.size
@@ -77,7 +77,7 @@ class GlobalRegistry:
         return [self.mmap[offset:offset+32].rstrip(b'\x00').decode() for offset in range(self.HEADER_SIZE, self.HEADER_SIZE+self.feed_count*self.ENTRY_SIZE,self.ENTRY_SIZE)]
 
     # ---------- public API ----------
-    def register_feed(self, name: str, lifecycle: dict, now_ns: int = 0) -> bool:
+    def register_feed(self, name: str, lifecycle: dict, now_us: int = 0) -> bool:
         self._lock()
         try:
             if self.feed_exists(name):
@@ -93,7 +93,7 @@ class GlobalRegistry:
                                        lifecycle.get("retention_hours", 72),
                                        lifecycle.get("persist", True),
                                        lifecycle.get("index_playback", False),
-                                       now_ns)
+                                       now_us)
             self.feed_count = self.feed_count+1
             self.mmap.flush()
             return True
@@ -103,7 +103,7 @@ class GlobalRegistry:
     def get_metadata(self, name: str) -> Optional[dict]:
         offset = self._find_feed_offset(name)
         if offset == 0: return False    
-        nm, chunk_sz_bytes, rotate_s, retain_h, persist, index_playback, created_ns = self._ENTRY_CORE.unpack(self.mmap[offset:offset+self.ENTRY_SIZE])
+        nm, chunk_sz_bytes, rotate_s, retain_h, persist, index_playback, created_us = self._ENTRY_CORE.unpack(self.mmap[offset:offset+self.ENTRY_SIZE])
         name = nm.rstrip(b'\0').decode()
         return {
             "feed_name": name,
@@ -112,7 +112,7 @@ class GlobalRegistry:
             "retention_hours": retain_h,
             "persist": persist,
             "index_playback": index_playback,
-            "created_ns": created_ns,
+            "created_us": created_us,
         }
     
     def update_metadata(self, name:str, **kwargs) -> Optional[dict]:
@@ -176,7 +176,7 @@ if __name__ == "__main__":
                     "persist": True,
                     "index_playback": True,
                 }
-                ok = reg.register_feed("CB-TRADES-BTC-USD", lc, now_ns=123)
+                ok = reg.register_feed("CB-TRADES-BTC-USD", lc, now_us=123)
                 assert ok is True
                 md = reg.get_metadata("CB-TRADES-BTC-USD")
                 assert md is not None
@@ -219,7 +219,7 @@ if __name__ == "__main__":
                     "retention_hours": 24,
                     "persist": True,
                     "index_playback": False,
-                }, now_ns=111)
+                }, now_us=111)
                 assert reg.update_metadata("CB-L2-BTC-USD", retention_hours=168, index_playback=True) is True
                 md = reg.get_metadata("CB-L2-BTC-USD")
                 assert_eq(md["retention_hours"], 168)

@@ -45,7 +45,7 @@ class Platform:
             "feed_name": "...",
             "mode": "UF",
             "fields": [ {name,type}, ... ],
-            "ts_col": "ws_ts_ns",
+            "ts_col": "ws_ts_us",
             # lifecycle knobs (optional; defaults applied into registry)
             "chunk_size_mb": 64,
             "rotate_s": 3600,
@@ -189,16 +189,18 @@ class Platform:
         lay = self.get_record_format(feed_name)
         return {
             "feed_name": feed_name,
-            "lifecycle": md["lifecycle"],
+            "lifecycle": {
+                "chunk_size_bytes": md["chunk_size_bytes"],
+                "rotate_s": md["rotate_s"],
+                "retention_hours": md["retention_hours"],
+                "persist": md["persist"],
+                "index_playback": md["index_playback"],
+            },
             "record_fmt": lay["fmt"],
             "record_size": lay["record_size"],
             "ts_offset": lay["ts"]["offset"],
             "fields": lay["fields"],
-            "created_ns": md["created_ns"],
-            "updated_ns": md["updated_ns"],
-            "chunk_count": md["chunk_count"],
-            "first_time": md["first_time"],
-            "last_time": md["last_time"],
+            "created_us": md.get("created_us"),
         }
 
     # -------------------------------------------------------------------------

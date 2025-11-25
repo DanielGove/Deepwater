@@ -17,7 +17,7 @@ if not log.handlers:
 
 from deepwater.platform import Platform  # unchanged platform substrate
 from deepwater.utils.benchmarking import Metrics
-from deepwater.utils.timestamps import parse_ns_timestamp
+from deepwater.utils.timestamps import parse_us_timestamp
 
 # ======= feed configuration =======
 def trades_spec(pid: str) -> dict:
@@ -29,14 +29,14 @@ def trades_spec(pid: str) -> dict:
             {"name":"side",       "type":"char",   "desc":"B=buy,S=sell"},
             {"name":"_",          "type":"_6",    "desc":"padding"},
             {"name":"trade_id",   "type":"uint64", "desc":"exchange trade id"},
-            {"name":"packet_ns",  "type":"uint64", "desc":"time packet was sent (ns)"},
-            {"name":"recv_ns",    "type":"uint64", "desc":"time packet was received (ns)"},
-            {"name":"proc_ns",    "type":"uint64", "desc":"time packet was ingested (ns)"},
-            {"name":"ev_ns",      "type":"uint64", "desc":"event timestamp (ns)"},
+            {"name":"packet_us",  "type":"uint64", "desc":"time packet was sent (us)"},
+            {"name":"recv_us",    "type":"uint64", "desc":"time packet was received (us)"},
+            {"name":"proc_us",    "type":"uint64", "desc":"time packet was ingested (us)"},
+            {"name":"ev_us",      "type":"uint64", "desc":"event timestamp (us)"},
             {"name":"price",      "type":"float64","desc":"trade price"},
             {"name":"size",       "type":"float64","desc":"trade size"},
         ],
-        "ts_col": "proc_ns",
+        "ts_col": "proc_us",
         "chunk_size_mb": 0.0625,
         "retention_hours": 2,
         "persist": True
@@ -50,15 +50,15 @@ def l2_spec(pid: str) -> dict:
             {"name":"type",       "type":"char",   "desc":"record type 'U'"},
             {"name":"side",       "type":"char",   "desc":"B=bid,A=ask"},
             {"name":"_",          "type":"_6",     "desc":"padding"},
-            {"name":"packet_ns",  "type":"uint64", "desc":"time packet was sent (ns)"},
-            {"name":"recv_ns",    "type":"uint64", "desc":"time packet was received (ns)"},
-            {"name":"proc_ns",    "type":"uint64", "desc":"time packet was ingested (ns)"},
-            {"name":"ev_ns",      "type":"uint64", "desc":"event timestamp (ns)"},
+            {"name":"packet_us",  "type":"uint64", "desc":"time packet was sent (us)"},
+            {"name":"recv_us",    "type":"uint64", "desc":"time packet was received (us)"},
+            {"name":"proc_us",    "type":"uint64", "desc":"time packet was ingested (us)"},
+            {"name":"ev_us",      "type":"uint64", "desc":"event timestamp (us)"},
             {"name":"price",      "type":"float64","desc":"price level"},
             {"name":"qty",        "type":"float64","desc":"new quantity at level"},
             {"name":"_",          "type":"_8",     "desc":"padding"},
         ],
-        "ts_col": "proc_ns",
+        "ts_col": "proc_us",
         "chunk_size_mb": 0.0625,
         "retention_hours": 2,
         "persist": True,
@@ -66,7 +66,7 @@ def l2_spec(pid: str) -> dict:
     }
 
 # ======= tiny allocation-aware helpers =======
-def _now_ns() -> int: return time.time_ns()
+def _now_us() -> int: return time.time_ns() // 1_000
 def _perf_ns() -> int: return time.perf_counter_ns()
 
 def _backoff():
@@ -86,7 +86,7 @@ def _parse_ts(val) -> int:
     data = _ensure_bytes(val)
     if not data:
         return 0
-    return parse_ns_timestamp(data)
+    return parse_us_timestamp(data)
 
 def _parse_frame(raw):
     parser = _JSONParser()
@@ -241,7 +241,7 @@ class MarketDataEngine:
 
     def _io_loop(self) -> None:
         parse = self._parser.parse
-        now_ns = _now_ns
+        now_us = _now_us
         fast_float = _ff
         fast_int = _fi
 
@@ -270,7 +270,7 @@ class MarketDataEngine:
                         raw = self._ws.recv()
                         if not raw:
                             raise WebSocketConnectionClosedException("recv returned None/empty")
-                        recv_ns = now_ns()
+                        recv_us = now_us()
                         ingress(len(raw), 1)
                         self._msg_last = time.monotonic()
                     except WebSocketTimeoutException:
@@ -290,7 +290,7 @@ class MarketDataEngine:
                         msg = f"JSON decode error: {e!s}"
                         if bad_frame_dir is not None:
                             try:
-                                path = bad_frame_dir / f"badframe_{now_ns()}.json"
+                                path = bad_frame_dir / f"badframe_{now_us()}.json"
                                 data = raw if isinstance(raw, (bytes, bytearray)) else str(raw).encode("utf-8", "replace")
                                 path.write_bytes(data)
                                 msg = f"JSON decode error (frame saved to {path})"
@@ -300,6 +300,12 @@ class MarketDataEngine:
                         continue
 
                     if doc is None:
+                        log.error("WS received null document: %r", doc)
+                        continue
+
+                    if doc.get("type") == "error":
+                        log.error("WS error message: %r", doc)
+                        del doc
                         continue
 
                     if doc["sequence_num"] != self._last_seq + 1:
@@ -312,45 +318,45 @@ class MarketDataEngine:
                         continue
 
                     if doc["channel"] == "market_trades":
-                        packet_ns = _parse_ts(doc.get("timestamp"))
+                        packet_us = _parse_ts(doc.get("timestamp"))
                         for ev in doc["events"]:
-                            proc_ns = now_ns()
+                            proc_us = now_us()
                             counts: Dict[str, int] = {}
                             for tr in ev["trades"]:
                                 writer = trade_writers.get(tr["product_id"])
                                 writer.write_values(b'T',
                                                     tr["side"][0].encode("ascii"),
                                                     fast_int(tr["trade_id"]),
-                                                    packet_ns, recv_ns, proc_ns,
+                                                    packet_us, recv_us, proc_us,
                                                     _parse_ts(tr["time"]),
                                                     fast_float(tr["price"]),
                                                     fast_float(tr["size"]))
                                 counts[tr["product_id"]] = counts.get(tr["product_id"], 0) + 1
                             if counts:
-                                latency_us = max(0, now_ns() - recv_ns) / 1_000.0
+                                latency_us = max(0, now_us() - recv_us)
                                 for pid, count in counts.items():
                                     trade_metric(pid, n=count, latency_us=latency_us)
                         del ev; del tr
 
                     elif doc["channel"] == "l2_data":
-                        packet_ns = _parse_ts(doc.get("timestamp"))
+                        packet_us = _parse_ts(doc.get("timestamp"))
                         for ev in doc["events"]:
                             writer = book_writers.get(ev["product_id"])
                             l2_type = ev["type"][0].encode('ascii')
                             idx = True if l2_type == b's' else False
-                            proc_ns = now_ns()
+                            proc_us = now_us()
                             for u in ev["updates"]:
                                 writer.write_values(
                                     l2_type,
                                     u["side"][0].encode("ascii"),
-                                    packet_ns, recv_ns, proc_ns,
+                                    packet_us, recv_us, proc_us,
                                     _parse_ts(u["event_time"]),
                                     fast_float(u["price_level"]),
                                     fast_float(u["new_quantity"]),
                                     create_index=idx)
                                 idx = False
                             if ev["updates"]:
-                                latency_us = max(0, now_ns() - recv_ns) / 1_000.0
+                                latency_us = max(0, now_us() - recv_us)
                                 l2_metric(pid, n=len(ev["updates"]), latency_us=latency_us)
                         del ev; del u
 
