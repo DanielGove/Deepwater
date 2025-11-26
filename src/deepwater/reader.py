@@ -1,4 +1,5 @@
 import time
+import os
 import struct
 from typing import Optional, Tuple
 
@@ -63,6 +64,9 @@ class Reader:
             chunk = Chunk.open_shm(name=f"{self.feed_name}-{chunk_id}")
         elif meta.status == ON_DISK:
             chunk_path = self.data_dir / f"chunk_{chunk_id:08d}.bin"
+            if not chunk_path.exists():
+                meta.release()
+                raise FileNotFoundError(f"Chunk file missing: {chunk_path}")
             chunk = Chunk.open_file(file_path=str(chunk_path))
         elif meta.status == EXPIRED:
             raise RuntimeError(f"Chunk {chunk_id} is expired; cannot read.")
@@ -136,9 +140,18 @@ class Reader:
 
             latest_available = self.registry.get_latest_chunk_idx()
             if latest_available and self._chunk_id is not None and latest_available > self._chunk_id:
-                self._open_chunk(self._chunk_id + 1)
-                read_head = 0
-                continue
+                try:
+                    self._open_chunk(self._chunk_id + 1)
+                    read_head = 0
+                    continue
+                except FileNotFoundError:
+                    # Chunk file missing (pruned or not yet materialized); retry by reloading latest
+                    try:
+                        self._ensure_latest_chunk()
+                        read_head = self._chunk_meta.write_pos
+                        continue
+                    except FileNotFoundError as e:
+                        raise e
 
             time.sleep(0.001)
 
@@ -191,22 +204,21 @@ class Reader:
             idx = ChunkIndex.open_file(str(idx_path))
             try:
                 start_idx = idx._binary_search_start_time(start_time)
-                for i in range(start_idx, idx.count):
-                    rec = idx.get_index(i)
+                start_offset = 0
+                if start_idx < idx.count:
+                    rec = idx.get_index(start_idx)
                     try:
-                        ts = rec.timestamp
-                        if end_time is not None and ts > end_time:
-                            break
-                        offset = rec.offset
-                        yield self._record_struct.unpack_from(buffer, offset)
+                        start_offset = rec.offset
                     finally:
                         rec.release()
             finally:
                 idx.close_file()
-            return
+            # Continue with sequential scan from start_offset to include non-indexed records too
+            pos = start_offset
+        else:
+            # Fallback: scan records sequentially
+            pos = 0
 
-        # Fallback: scan records sequentially
-        pos = 0
         ts_off = self._ts_offset
         ts_end = ts_off + 8
         while pos + self._record_size <= write_pos:

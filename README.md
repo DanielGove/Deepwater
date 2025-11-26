@@ -118,6 +118,11 @@ for rec in r.stream_time_range(start_time_us, end_time_us):
     handle(rec)
 ```
 
+## Developer Notes (orderbook snapshot + delta pattern)
+- Keep L2 deltas as an event feed. Index entries remain sparse: only mark snapshot boundaries (no per-delta indexing).
+- Maintain a separate “orderbook maintainer” process that consumes L2 deltas, applies them to a local book, and periodically emits a full snapshot (e.g., every 5–15 minutes or on reconnect/gap). Snapshots can live in their own feed or as files; the snapshot record should include the L2 sequence/timestamp to resume from.
+- A specialized reader can then: load the latest snapshot ≤ target time and replay deltas from the recorded seq/ts using the standard `stream_time_range` on the L2 feed. This bounds replay cost and avoids week-long replays.
+
 ## Websocket Ingest Demo
 `src/tests/websocket_client.py` connects to Coinbase Advanced Trade WS and writes trades/L2 updates into Deepwater:
 

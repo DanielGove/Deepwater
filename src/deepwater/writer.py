@@ -61,15 +61,19 @@ class Writer:
             self.current_chunk_metadata.release()
 
         if self.feed_config.get("persist") is True:
+            # Create the chunk file first, then register to avoid readers seeing metadata before the file exists.
+            chunk_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
+            self.current_chunk = Chunk.create_file(path=str(chunk_path), size=self.feed_config["chunk_size_bytes"])
             self.registry.register_chunk(
-                time.time_ns() // 1_000,self.current_chunk_id,
+                time.time_ns() // 1_000, self.current_chunk_id,
                 self.feed_config["chunk_size_bytes"], status=ON_DISK)
-            self.current_chunk = Chunk.create_file(path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"), size=self.feed_config["chunk_size_bytes"])
         else:
+            # Create SHM first, then register.
+            shm_name = f"{self.feed_name}-{self.current_chunk_id}"
+            self.current_chunk = Chunk.create_shm(name=shm_name, size=self.feed_config["chunk_size_bytes"])
             self.registry.register_chunk(
-                time.time_ns() // 1_000,self.current_chunk_id,
+                time.time_ns() // 1_000, self.current_chunk_id,
                 self.feed_config["chunk_size_bytes"], status=IN_MEMORY)
-            self.current_chunk = Chunk.create_shm(name=f"{self.feed_name}-{self.current_chunk_id}", size=self.feed_config["chunk_size_bytes"])
 
         self.current_chunk_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
         self.current_chunk_metadata.start_time = _new_start_time if _new_start_time is not None else self.current_chunk_metadata.start_time

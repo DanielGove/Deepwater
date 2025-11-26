@@ -342,9 +342,13 @@ class MarketDataEngine:
                         packet_us = _parse_ts(doc.get("timestamp"))
                         for ev in doc["events"]:
                             writer = book_writers.get(ev["product_id"])
+                            if writer is None:
+                                log.warning("no writer for product %s", ev.get("product_id"))
+                                continue
                             l2_type = ev["type"][0].encode('ascii')
                             idx = True if l2_type == b's' else False
                             proc_us = now_us()
+
                             for u in ev["updates"]:
                                 writer.write_values(
                                     l2_type,
