@@ -90,7 +90,7 @@ class GlobalRegistry:
                                        name.ljust(self.FEED_NAME_LEN, '\0').encode(),
                                        lifecycle.get("chunk_size_bytes", 64 * 1024 * 1024),
                                        lifecycle.get("rotate_s", 3600),
-                                       lifecycle.get("retention_hours", 72),
+                                       lifecycle.get("retention_hours", 0),
                                        lifecycle.get("persist", True),
                                        lifecycle.get("index_playback", False),
                                        now_us)
@@ -102,7 +102,8 @@ class GlobalRegistry:
 
     def get_metadata(self, name: str) -> Optional[dict]:
         offset = self._find_feed_offset(name)
-        if offset == 0: return False    
+        if offset == 0:
+            return None
         nm, chunk_sz_bytes, rotate_s, retain_h, persist, index_playback, created_us = self._ENTRY_CORE.unpack(self.mmap[offset:offset+self.ENTRY_SIZE])
         name = nm.rstrip(b'\0').decode()
         return {
@@ -172,7 +173,6 @@ if __name__ == "__main__":
                 lc = {
                     "chunk_size_bytes": 1_048_576,
                     "rotate_s": 60,
-                    "retention_hours": 2,
                     "persist": True,
                     "index_playback": True,
                 }
@@ -183,7 +183,6 @@ if __name__ == "__main__":
                 assert_eq(md["feed_name"], "CB-TRADES-BTC-USD")
                 assert_eq(md["chunk_size_bytes"], 1_048_576)
                 assert_eq(md["rotate_s"], 60)
-                assert_eq(md["retention_hours"], 2)
                 assert md["persist"] is True
                 assert md["index_playback"] is True
                 # second register should be a no-op / False
@@ -216,20 +215,18 @@ if __name__ == "__main__":
                 reg.register_feed("CB-L2-BTC-USD", {
                     "chunk_size_bytes": 16 * 1024,  # tiny for test
                     "rotate_s": 3600,
-                    "retention_hours": 24,
                     "persist": True,
                     "index_playback": False,
                 }, now_us=111)
-                assert reg.update_metadata("CB-L2-BTC-USD", retention_hours=168, index_playback=True) is True
+                assert reg.update_metadata("CB-L2-BTC-USD", index_playback=True) is True
                 md = reg.get_metadata("CB-L2-BTC-USD")
-                assert_eq(md["retention_hours"], 168)
                 assert md["index_playback"] is True
 
                 # close + reopen → persistence
                 reg.close()
                 reg = GlobalRegistry(base)
                 md3 = reg.get_metadata("CB-L2-BTC-USD")
-                assert_eq(md3["retention_hours"], 168)
+                assert md3["index_playback"] is True
             finally:
                 reg.close()
 

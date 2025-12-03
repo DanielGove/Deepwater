@@ -4,8 +4,8 @@ from websocket import create_connection, WebSocketTimeoutException, WebSocketCon
 from typing import Dict, Iterable, Optional, Tuple, Any, List
 from fastnumbers import fast_float as _ff, fast_int as _fi
 
-import orjson
 from simdjson import Parser as _JSONParser
+import orjson
 import sys
 import logging
 from pathlib import Path
@@ -37,8 +37,7 @@ def trades_spec(pid: str) -> dict:
             {"name":"size",       "type":"float64","desc":"trade size"},
         ],
         "ts_col": "proc_us",
-        "chunk_size_mb": 0.0625,
-        "retention_hours": 2,
+        "chunk_size_bytes": 0.0625 * 1024 * 1024,
         "persist": True
     }
 
@@ -59,8 +58,7 @@ def l2_spec(pid: str) -> dict:
             {"name":"_",          "type":"_8",     "desc":"padding"},
         ],
         "ts_col": "proc_us",
-        "chunk_size_mb": 0.0625,
-        "retention_hours": 2,
+        "chunk_size_bytes": 0.0625 * 1024 * 1024,
         "persist": True,
         "index_playback": True
     }
@@ -116,7 +114,7 @@ class MarketDataEngine:
         self.io_thread: Optional[threading.Thread] = None
 
         # platform
-        self.platform = Platform(base_path="/deepwater/data/coinbase-test")
+        self.platform = Platform(base_path="data/coinbase-test")
         self.trade_writers: Dict[str, Any] = {}
         self.book_writers:  Dict[str, Any] = {}
 

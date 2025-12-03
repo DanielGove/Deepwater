@@ -1,5 +1,4 @@
 build==1.3.0
--e git+https://github.com/DanielGove/Deepwater.git@ba7adc8b5086f6f56b245e0f1f653018e7d09750#egg=deepwater
 fastnumbers==5.1.1
 llvmlite==0.44.0
 numba==0.61.2

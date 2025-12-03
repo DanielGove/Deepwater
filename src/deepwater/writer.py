@@ -104,12 +104,12 @@ class Writer:
             self._create_new_chunk()
 
         position = self.current_chunk_metadata.write_pos
-        new_position = self.current_chunk.write_bytes(position, record_data)
+        self.current_chunk.buffer[position:position+record_size] = record_data
         if create_index and self.chunk_index is not None:
             self.chunk_index.create_index(timestamp, position, record_size)
 
         self.current_chunk_metadata.last_update = timestamp
-        self.current_chunk_metadata.write_pos = new_position
+        self.current_chunk_metadata.write_pos = position + record_size
         self.current_chunk_metadata.num_records += 1
 
     def _schema_init(self):
@@ -130,34 +130,38 @@ class Writer:
         self._staging_pos = 0
         self._staging_count = 0
         self._staging_last_ts = None
+        self._rowbuf = bytearray(self._rec_size)
 
     def write_values(self, *vals, create_index=False) -> int:
         """Pack positional values according to schema and write directly to SHM.
         Does not accept kwargs. Uses schema order (non-padding fields).
         """
+        # hot locals
+        meta = self.current_chunk_metadata
+        buf = self.current_chunk.buffer
+        rec_size = self._rec_size
+
         if self._rec_size > self.current_chunk_metadata.size - self.current_chunk_metadata.write_pos:
             self._create_new_chunk()
-        self._S.pack_into(self.current_chunk.buffer, self.current_chunk_metadata.write_pos, *vals)
+            meta = self.current_chunk_metadata
+            buf = self.current_chunk.buffer
+        pos = meta.write_pos
+        self._S.pack_into(buf, pos, *vals)
         if create_index and self.chunk_index is not None:
-            self.chunk_index.create_index(
-                vals[self._ts_idx],
-                self.current_chunk_metadata.write_pos,
-                self._rec_size
-            )
-        self.current_chunk_metadata.last_update = vals[self._ts_idx]
-        self.current_chunk_metadata.write_pos += self._rec_size
-        self.current_chunk_metadata.num_records += 1
-        return self.current_chunk_metadata.write_pos
+            self.chunk_index.create_index(vals[self._ts_idx], pos, rec_size)
+        ts = vals[self._ts_idx] if self._ts_idx is not None else 0
+        meta.last_update = ts
+        meta.write_pos = pos + rec_size
+        meta.num_records += 1
+        return meta.write_pos
 
-    # TODO
     def stage_values(self, *vals) -> int:
         """Pack positional values and stage them (write bytes) without updating metadata.
         Call commit_values() to publish staged rows atomically.
         NOTE: this API assumes the same thread uses the writer during staging.
         """
-        self._ensure_schema_init()
         self._S.pack_into(self._rowbuf, 0, *vals)
-        ts = self._extract_ts_from_vals(vals)
+        ts = vals[self._ts_idx] if self._ts_idx is not None else 0
         # initialize staging window if not active
         if not getattr(self, "_staging_active", False):
             self._staging_active = True
@@ -172,13 +176,16 @@ class Writer:
             self._staging_count = 0
             self._staging_last_ts = None
         # write bytes at the staging cursor (no registry update)
-        new_pos = self.current_chunk.write_bytes(self._staging_pos, self._rowmv[:self._rec_size])
+        mv = memoryview(self._rowbuf)
+        start = self._staging_pos
+        end = start + self._rec_size
+        self.current_chunk.buffer[start:end] = mv[:self._rec_size]
+        new_pos = end
         self._staging_pos = new_pos
         self._staging_count += 1
         self._staging_last_ts = ts
         return new_pos
 
-    # TODO
     def commit_values(self, create_index: bool = False) -> int:
         """Publish previously staged rows by updating metadata once.
         Returns new write_pos. No-op if nothing staged.
@@ -188,13 +195,56 @@ class Writer:
             self._staging_count = 0
             self._staging_last_ts = None
             return self.current_chunk_metadata.write_pos
-        self.current_chunk_metadata.last_update = self._staging_last_ts
-        self.current_chunk_metadata.write_pos = self._staging_pos
-        self.current_chunk_metadata.num_records += self._staging_count
+        if create_index and self.chunk_index is not None and self._staging_last_ts is not None:
+            # create a single index entry marking the last staged row
+            self.chunk_index.create_index(self._staging_last_ts, self._staging_pos - self._rec_size, self._rec_size)
+        meta = self.current_chunk_metadata
+        meta.last_update = self._staging_last_ts
+        meta.write_pos = self._staging_pos
+        meta.num_records += self._staging_count
         self._staging_active = False
         self._staging_count = 0
         self._staging_last_ts = None
-        return self.current_chunk_metadata.write_pos
+        return meta.write_pos
+
+    def write_batch_bytes(self, data: bytes, create_index: bool = False) -> int:
+        """Write a blob of packed records (len must be multiple of record_size) and update metadata once."""
+        rec_size = self._rec_size
+        n = len(data)
+        if n == 0 or n % rec_size != 0:
+            raise ValueError("batch length must be a positive multiple of record_size")
+        needed = n
+        meta = self.current_chunk_metadata
+        # rotate if necessary
+        if meta.write_pos + needed > meta.size:
+            self._create_new_chunk()
+            meta = self.current_chunk_metadata
+        start = meta.write_pos
+        end = start + needed
+        self.current_chunk.buffer[start:end] = data
+        meta.write_pos = end
+        meta.num_records += n // rec_size
+        if self.record_format.get("ts_offset") is not None:
+            ts_off = int(self.record_format["ts_offset"])
+            ts_end = ts_off + 8
+            meta.last_update = int.from_bytes(data[-rec_size + ts_off:-rec_size + ts_end], "little")
+        # optional: single index entry for the last record
+        if create_index and self.chunk_index is not None and meta.last_update is not None:
+            self.chunk_index.create_index(meta.last_update, end - rec_size, rec_size)
+        return meta.write_pos
+
+    def resize_chunk_size(self, new_size_bytes: int) -> None:
+        """Update lifecycle and rotate into a new chunk with a new size."""
+        if new_size_bytes <= 0:
+            raise ValueError("new chunk size must be >0")
+        self.feed_config["chunk_size_bytes"] = int(new_size_bytes)
+        # propagate to global registry for future writers/readers
+        try:
+            self.platform.registry.update_metadata(self.feed_name, chunk_size_bytes=int(new_size_bytes))
+        except Exception:
+            pass
+        # rotate immediately to honor new size
+        self._create_new_chunk()
 
     def close(self):
         if self.current_chunk:

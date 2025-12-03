@@ -36,6 +36,8 @@ class Reader:
         self._record_struct = struct.Struct(self.record_format["fmt"])
         self._record_size = self.record_format["record_size"]
         self._index_enabled = bool(self.feed_config.get("index_playback"))
+        self._ts_offset = self.record_format.get("ts_offset") or self.record_format.get("ts", {}).get("offset")
+        self._ts_byteorder = "little" if self.record_format.get("ts_endian", "<") == "<" else "big"
 
     # ------------------------------------------------------------------ helpers
     def _close_chunk(self) -> None:
@@ -154,6 +156,69 @@ class Reader:
                         raise e
 
             time.sleep(0.001)
+
+    def stream_latest_records_raw(self, playback: bool = False):
+        """Yield memoryviews over packed records (no struct unpack)."""
+        start_chunk = None
+        start_offset = 0
+
+        if playback:
+            snapshot = self._find_latest_snapshot_pointer()
+            if snapshot:
+                start_chunk, start_offset = snapshot
+
+        if start_chunk is not None:
+            self._open_chunk(start_chunk)
+            read_head = start_offset
+        else:
+            self._ensure_latest_chunk()
+            read_head = self._chunk_meta.write_pos
+
+        rs = self._record_size
+        buf = self._chunk.buffer
+        while True:
+            if self._chunk_meta is None:
+                time.sleep(0.001)
+                continue
+            write_pos = self._chunk_meta.write_pos
+            if read_head < write_pos:
+                yield memoryview(buf)[read_head:read_head+rs]
+                read_head += rs
+                continue
+            latest_available = self.registry.get_latest_chunk_idx()
+            if latest_available and self._chunk_id is not None and latest_available > self._chunk_id:
+                try:
+                    self._open_chunk(self._chunk_id + 1)
+                    buf = self._chunk.buffer
+                    read_head = 0
+                    continue
+                except FileNotFoundError:
+                    try:
+                        self._ensure_latest_chunk()
+                        buf = self._chunk.buffer
+                        read_head = self._chunk_meta.write_pos
+                        continue
+                    except FileNotFoundError as e:
+                        raise e
+            time.sleep(0.0005)
+
+    def read_batch(self, count: int, playback: bool = False):
+        """Yield lists of records in batches of size count."""
+        batch = []
+        for rec in self.stream_latest_records(playback=playback):
+            batch.append(rec)
+            if len(batch) >= count:
+                yield batch
+                batch = []
+
+    def read_batch_raw(self, count: int, playback: bool = False):
+        """Yield lists of memoryviews in batches of size count."""
+        batch = []
+        for rec in self.stream_latest_records_raw(playback=playback):
+            batch.append(rec)
+            if len(batch) >= count:
+                yield batch
+                batch = []
 
     def get_latest_record(self) -> tuple:
         """Return the most recent record currently written."""

@@ -34,7 +34,7 @@ By default, `Platform` writes under `./platform_data`. The demos use `/deepwater
 - **Feed**: Named stream with a fixed record schema (`layout.json` under `data/<feed>/`).
 - **Chunks**: Fixed-size byte buffers (SHM or mmapped files) that store packed records.
 - **Feed registry**: Binary file `<feed>.reg` tracking chunk metadata (start/end times, write position, record count, status).
-- **Global registry**: Binary catalog of feeds and lifecycle defaults (chunk size, rotation, retention, persist, index flag).
+- **Global registry**: Binary catalog of feeds and lifecycle defaults (chunk size, rotation, persist, index flag).
 - **Index files (optional)**: Fixed-width records marking offsets for snapshot playback (`chunk_<id>.idx`).
 
 ## Define a Feed
@@ -57,8 +57,7 @@ feed_spec = {
         {"name": "size",      "type": "float64"},
     ],
     "ts_col": "proc_us",
-    "chunk_size_mb": 64,
-    "retention_hours": 72,
+    "chunk_size_bytes": 64 * 1024 * 1024,
     "persist": True,
     "index_playback": False,
 }
@@ -146,14 +145,26 @@ python src/tests/orderbook.py
 
 It tails the most recent chunk for `CB-TRADES-MON-USD` and logs records.
 
+## Ingest & Snapshot Apps
+- Coinbase ingest: `python src/tests/main_websocket.py` (connects, subscribes, writes trades/L2 into Deepwater feeds). Use `--base-path` to match your data dir.
+- Orderbook maintainer: `python src/tests/orderbook_snapshot.py --product BTC-USD --base-path data/coinbase-test --depth 500 --interval 1` (rebuilds book from L2 with playback and emits fixed-depth snapshots into a ring feed).
+- Trade window reader: `python src/tests/trades.py --start HH:MM[:SS] --end HH:MM[:SS] --base-path data/coinbase-test` (time-range playback using indices when available).
+
 ## Operational Notes
 - SHM names: `${feed}-${chunk_id}` for chunks and `${feed}-index-${chunk_id}` for index segments (when enabled). Ensure writers/readers close to release SHM.
 - Persistence: set `persist=False` for in-memory-only feeds; `persist=True` writes chunk files + indices to disk.
 - Registries are memory-mapped and lock-protected; only one writer per feed should be active.
 - Layout stability: `create_feed` enforces schema immutability if `layout.json` already exists.
 - Chunk resizing: feed registries auto-resize if chunk count approaches the configured max (doubling up to a cap).
+- Live-only rings: set `persist: false` in a feed spec to use a single shared-memory ring sized by `chunk_size_bytes` (capacity ≈ bytes / record_size). `Platform` uses `RingWriter`/`RingReader` automatically; old data is overwritten on wrap and no chunk/index files are produced.
 
 ## What to Explore Next
 - Add CLI wrappers for feed creation and inspection.
 - Extend index usage (snapshot/delta playback) in readers.
-- Add retention/rotation workers that honor `rotate_s` and `retention_hours`.
+
+## User Manual (runtime basics)
+- Config knobs: `chunk_size_bytes` is the single capacity setting. `persist=True` → chunked files and optional indices; `persist=False` → SHM ring sized by the same bytes (capacity ≈ bytes / record_size). `index_playback` only applies when persisted.
+- Writers: `write_values` for single writes; use `stage_values` + `commit_values` to batch metadata updates, or `write_batch_bytes` to append many packed records with one metadata bump. `resize_chunk_size` rotates into a new chunk size.
+- Readers: `stream_latest_records` for tuples, `stream_latest_records_raw` for memoryviews (no unpack). `read_batch` / `read_batch_raw` yield batches to reduce per-record overhead. Rings expose the same interfaces.
+- Resizing: call `Platform.resize_feed(feed_name, new_chunk_size_bytes)` to change size (persisted feeds rotate to a new chunk; rings are recreated).
+- Schemas: layouts are immutable; changing fields/record_size requires a new feed. Snapshots with fixed depth should store depth in config for downstream consumers.

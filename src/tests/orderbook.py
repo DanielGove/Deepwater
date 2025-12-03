@@ -76,7 +76,7 @@ def _field_names(reader) -> list[str]:
 def main():
     parser = argparse.ArgumentParser(description="Tail from latest snapshot marker (index) to present.")
     parser.add_argument("--feed", default="CB-L2-MON-USD", help="Feed name to read")
-    parser.add_argument("--base-path", default="/deepwater/data/coinbase-test", help="Deepwater base path")
+    parser.add_argument("--base-path", default="data/coinbase-test", help="Deepwater base path")
     parser.add_argument("--inspect-only", action="store_true", help="Only show index summary and exit")
     parser.add_argument("--end", help="Optional end time HH:MM[:SS] UTC; if set, replay from snapshot to this time and stop")
     args = parser.parse_args()
@@ -88,6 +88,7 @@ def main():
         return
 
     platform = Platform(base_path=args.base_path)
+    print(platform.list_feeds())
     reader = platform.create_reader(feed_name=args.feed)
     fields = _field_names(reader)
 
