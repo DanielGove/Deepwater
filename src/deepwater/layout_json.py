@@ -26,6 +26,11 @@ _SCALARS: Dict[str, Tuple[str, str, int, int]] = {
     "i64":    ("<i8", "q", 8, 8), "int64": ("<i8","q",8,8),
     "u64":    ("<u8", "Q", 8, 8), "uint64":("<u8","Q",8,8),
     "f64":    ("<f8", "d", 8, 8), "float64":("<f8","d",8,8),
+    # fixed-length byte strings
+    "bytes8":  ("|S8",  "8s",  8, 1),
+    "bytes16": ("|S16", "16s", 16, 1),
+    "bytes32": ("|S32", "32s", 32, 1),
+    "bytes64": ("|S64", "64s", 64, 1),
 }
 
 def _pad_token(tok: str) -> Tuple[str, int] | None:

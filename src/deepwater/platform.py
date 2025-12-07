@@ -255,7 +255,7 @@ class Platform:
             },
             "record_fmt": lay["fmt"],
             "record_size": lay["record_size"],
-            "ts_offset": lay["ts"]["offset"],
+            "ts_offset": lay["ts_offset"],
             "fields": lay["fields"],
             "created_us": md.get("created_us"),
             "persist": persist,
