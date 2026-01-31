@@ -70,6 +70,11 @@ class Reader:
                 meta.release()
                 raise FileNotFoundError(f"Chunk file missing: {chunk_path}")
             chunk = Chunk.open_file(file_path=str(chunk_path))
+            
+            # Optional validation for ON_DISK chunks (only if feed is idle)
+            # Skip validation if feed is actively being written (race condition)
+            if self._should_validate_chunk(meta):
+                self._validate_chunk_integrity(chunk_path, meta)
         elif meta.status == EXPIRED:
             raise RuntimeError(f"Chunk {chunk_id} is expired; cannot read.")
         else:
@@ -78,6 +83,34 @@ class Reader:
         self._chunk_meta = meta
         self._chunk = chunk
         self._chunk_id = chunk_id
+
+    def _should_validate_chunk(self, meta) -> bool:
+        """Check if chunk should be validated (only if feed appears idle)."""
+        now_us = time.time_ns() // 1_000
+        age_us = now_us - meta.last_update
+        # If updated within last 5 seconds, assume feed is active (skip validation)
+        return age_us > 5_000_000
+
+    def _validate_chunk_integrity(self, chunk_path, meta):
+        """
+        Optional validation: warn if chunk file doesn't match registry.
+        Does not block reads - just logs warnings for operator awareness.
+        """
+        try:
+            actual_size = chunk_path.stat().st_size
+            actual_records = actual_size // self._record_size
+            expected_records = meta.num_records
+            
+            if actual_records < expected_records:
+                import logging
+                log = logging.getLogger("dw.reader")
+                log.warning(
+                    f"Chunk {meta.chunk_id} validation failed: "
+                    f"file has {actual_records} records, registry claims {expected_records}. "
+                    f"Consider running: python -m deepwater.repair --feed {self.feed_name}"
+                )
+        except Exception:
+            pass  # Validation is best-effort, don't block reads
 
     def _ensure_latest_chunk(self) -> None:
         latest = self.registry.get_latest_chunk_idx()

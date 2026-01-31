@@ -1,0 +1,111 @@
+{
+  "mode": "UF",
+  "fmt": "<1s1s6xQQQQQdd",
+  "record_size": 64,
+  "fields": [
+    {
+      "name": "type",
+      "type": "char",
+      "offset": 0,
+      "size": 1
+    },
+    {
+      "name": "side",
+      "type": "char",
+      "offset": 1,
+      "size": 1
+    },
+    {
+      "name": "_",
+      "type": "_6",
+      "offset": 2,
+      "size": 6
+    },
+    {
+      "name": "trade_id",
+      "type": "uint64",
+      "offset": 8,
+      "size": 8
+    },
+    {
+      "name": "packet_us",
+      "type": "uint64",
+      "offset": 16,
+      "size": 8
+    },
+    {
+      "name": "recv_us",
+      "type": "uint64",
+      "offset": 24,
+      "size": 8
+    },
+    {
+      "name": "proc_us",
+      "type": "uint64",
+      "offset": 32,
+      "size": 8
+    },
+    {
+      "name": "ev_us",
+      "type": "uint64",
+      "offset": 40,
+      "size": 8
+    },
+    {
+      "name": "price",
+      "type": "float64",
+      "offset": 48,
+      "size": 8
+    },
+    {
+      "name": "size",
+      "type": "float64",
+      "offset": 56,
+      "size": 8
+    }
+  ],
+  "ts_name": "proc_us",
+  "ts_offset": 32,
+  "ts_size": 8,
+  "ts_endian": "<",
+  "dtype": {
+    "names": [
+      "type",
+      "side",
+      "_",
+      "trade_id",
+      "packet_us",
+      "recv_us",
+      "proc_us",
+      "ev_us",
+      "price",
+      "size"
+    ],
+    "formats": [
+      "|S1",
+      "|S1",
+      "V6",
+      "<u8",
+      "<u8",
+      "<u8",
+      "<u8",
+      "<u8",
+      "<f8",
+      "<f8"
+    ],
+    "offsets": [
+      0,
+      1,
+      2,
+      8,
+      16,
+      24,
+      32,
+      40,
+      48,
+      56
+    ],
+    "itemsize": 64
+  },
+  "version": 1
+}

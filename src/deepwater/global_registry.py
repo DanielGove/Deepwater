@@ -11,15 +11,14 @@ class GlobalRegistry:
     """
 
     FEED_NAME_LEN = 32
-    # name:32  chunk_sz_bytes:I  rotate_s:I  retain_h:I  persist:bool index_callback:bool  created_us:Q
-    _ENTRY_CORE   = struct.Struct('<32sIII??6xQ68x') # Pad to 128
+    # name:32  chunk_sz_bytes:I  retain_h:I  persist:bool index_callback:bool  created_us:Q
+    _ENTRY_CORE   = struct.Struct('<32sII??6xQ72x') # Pad to 128
     ENTRY_SIZE = _ENTRY_CORE.size
     HEADER_SIZE = _ENTRY_CORE.size
     CHUNK_SIZE_OFFSET = 32
-    ROTATE_SECONDS_OFFSET = 36
-    RETAIN_HOURS_OFFSET = 40
-    PERSIST_OFFSET = 44
-    INDEX_PLAYBACK_OFFSET = 45
+    RETAIN_HOURS_OFFSET = 36
+    PERSIST_OFFSET = 40
+    INDEX_PLAYBACK_OFFSET = 41
 
     def __init__(self, base_path: Path):
         self.registry_path = base_path / "registry"
@@ -89,7 +88,6 @@ class GlobalRegistry:
             self._ENTRY_CORE.pack_into(self.mmap, offset,
                                        name.ljust(self.FEED_NAME_LEN, '\0').encode(),
                                        lifecycle.get("chunk_size_bytes", 64 * 1024 * 1024),
-                                       lifecycle.get("rotate_s", 3600),
                                        lifecycle.get("retention_hours", 0),
                                        lifecycle.get("persist", True),
                                        lifecycle.get("index_playback", False),
@@ -104,12 +102,11 @@ class GlobalRegistry:
         offset = self._find_feed_offset(name)
         if offset == 0:
             return None
-        nm, chunk_sz_bytes, rotate_s, retain_h, persist, index_playback, created_us = self._ENTRY_CORE.unpack(self.mmap[offset:offset+self.ENTRY_SIZE])
+        nm, chunk_sz_bytes, retain_h, persist, index_playback, created_us = self._ENTRY_CORE.unpack(self.mmap[offset:offset+self.ENTRY_SIZE])
         name = nm.rstrip(b'\0').decode()
         return {
             "feed_name": name,
             "chunk_size_bytes": chunk_sz_bytes,
-            "rotate_s": rotate_s,
             "retention_hours": retain_h,
             "persist": persist,
             "index_playback": index_playback,
@@ -123,8 +120,6 @@ class GlobalRegistry:
                 if offset == 0: return False
                 if kwargs.get("chunk_size_bytes") is not None:
                     self.mmap[offset+self.CHUNK_SIZE_OFFSET:offset+self.CHUNK_SIZE_OFFSET+4] = int.to_bytes(kwargs.get("chunk_size_bytes"),4,'little')
-                if kwargs.get("rostate_s") is not None:
-                    self.mmap[offset+self.ROTATE_SECONDS_OFFSET:offset+self.ROTATE_SECONDS_OFFSET+4] = int.to_bytes(kwargs.get("rotate_s"),4,'little')
                 if kwargs.get("retention_hours") is not None:
                     self.mmap[offset+self.RETAIN_HOURS_OFFSET:offset+self.RETAIN_HOURS_OFFSET+4] = int.to_bytes(kwargs.get("retention_hours"),4,'little')
                 if kwargs.get("persist") is not None:

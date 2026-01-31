@@ -1,6 +1,7 @@
 # core/platform.py
 from __future__ import annotations
 
+import atexit
 import signal
 from pathlib import Path
 import orjson
@@ -11,8 +12,10 @@ from .global_registry import GlobalRegistry
 from .layout_json import build_layout, save_layout, load_layout
 from .feed_registry import FeedRegistry
 from .writer import Writer
+from .ring import RingWriter
 from .reader import Reader
-from .ring import RingWriter, RingReader
+from .manifest import write_manifest, read_manifest
+from . import __version__
 
 
 class Platform:
@@ -27,6 +30,24 @@ class Platform:
         self.base_path = Path(base_path)
         self.data_path = self.base_path / "data"
         self.data_path.mkdir(parents=True, exist_ok=True)
+        
+        # Configure logging to base_path
+        self._setup_logging()
+        
+        # ensure manifest exists and warn on version drift
+        manifest = read_manifest(self.base_path)
+        if manifest is None:
+            write_manifest(self.base_path)
+        else:
+            mf_ver = manifest.get("deepwater_version")
+            if mf_ver and mf_ver != __version__:
+                # log-only; do not block
+                try:
+                    import logging
+                    log = logging.getLogger("dw.platform")
+                    log.warning("deepwater version mismatch: manifest has %s, code is %s", mf_ver, __version__)
+                except Exception:
+                    pass
 
         self.registry = GlobalRegistry(self.base_path)
 
@@ -35,7 +56,48 @@ class Platform:
         self._readers: Dict[str, Reader] = {}
         self._layouts: Dict[str, dict] = {}
         self._structs: Dict[str, Tuple[struct.Struct, int]] = {}  # name -> (Struct(fmt), ts_off)
-        self._specs: Dict[str, dict] = {}
+        
+        # Graceful shutdown on signals
+        self._shutdown_handlers_registered = False
+        self._register_shutdown_handlers()
+
+    # -------------------------------------------------------------------------
+    # LOGGING
+    # -------------------------------------------------------------------------
+    def _setup_logging(self):
+        """Configure logging to write to base_path/deepwater.log."""
+        import logging
+        from logging.handlers import RotatingFileHandler
+        
+        # Only configure if not already configured
+        root_logger = logging.getLogger()
+        if root_logger.hasHandlers():
+            return
+        
+        log_file = self.base_path / "deepwater.log"
+        
+        # Rotating file handler (10MB max, keep 5 backups)
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(
+            logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+        )
+        
+        # Console handler for warnings and errors
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)
+        console_handler.setFormatter(
+            logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        )
+        
+        # Configure root logger
+        root_logger.setLevel(logging.INFO)
+        root_logger.addHandler(file_handler)
+        root_logger.addHandler(console_handler)
 
     # -------------------------------------------------------------------------
     # FEED CREATION (idempotent, failsafe)
@@ -49,8 +111,8 @@ class Platform:
             "fields": [ {name,type}, ... ],
             "ts_col": "ws_ts_us",
             # lifecycle knobs (optional; defaults applied into registry)
-            "chunk_size_bytes": 64*1024*1024,
-            "rotate_s": 3600,
+            "chunk_size_mb": 64,
+            "retention_hours": 72,
             "persist": True,
             "index_playback": False,
             "schema_id": "cb.l2.uf.v1"   # kept only in config.json for ops
@@ -84,20 +146,11 @@ class Platform:
             save_layout(fdir, layout)
 
         # 3) persist lifecycle defaults into GlobalRegistry (create or update)
-        # normalize sizing to bytes (support legacy chunk_size_mb)
-        chunk_bytes = spec.get("chunk_size_bytes")
-        if chunk_bytes is None:
-            chunk_bytes = int(spec.get("chunk_size_mb", 64) * 1024 * 1024)
-        else:
-            chunk_bytes = int(chunk_bytes)
-
-        persist = bool(spec.get("persist", True))
         lifecycle = {
-            "chunk_size_bytes": chunk_bytes,
-            "rotate_s":         int(spec.get("rotate_s", 3600)),
-            "persist":          persist,
-            # indices only make sense for persisted chunk files
-            "index_playback":   bool(spec.get("index_playback", False)) if persist else False,
+            "chunk_size_bytes": int(spec.get("chunk_size_mb", 64)*1024*1024),
+            "retention_hours":  int(spec.get("retention_hours", 72)),
+            "persist":          bool(spec.get("persist", True)),
+            "index_playback":   bool(spec.get("index_playback", False)),
         }
         if not self.registry.feed_exists(name):
             self.registry.register_feed(name, lifecycle)
@@ -105,29 +158,25 @@ class Platform:
             self.registry.update_metadata(name, **lifecycle)
 
         # 4) keep full app spec for ops/debug (optional)
-        spec_to_save = dict(spec)
-        spec_to_save["chunk_size_bytes"] = chunk_bytes
-        spec_to_save.pop("chunk_size_mb", None)
-        (fdir / "config.json").write_bytes(orjson.dumps(spec_to_save))
+        (fdir / "config.json").write_bytes(orjson.dumps(spec))
 
-        # 5) ensure per-feed registry (binary) exists for persisted feeds
-        if lifecycle["persist"]:
-            FeedRegistry(path=fdir / f"{name}.reg", mode="w").close()
+        # 5) ensure per-feed registry (binary) exists
+        # TODO: confirm your FeedRegistry constructor & semantics
+        FeedRegistry(path=fdir / f"{name}.reg", mode="w").close()
 
         # clear caches for this feed
         self._layouts.pop(name, None)
         self._structs.pop(name, None)
-        self._specs.pop(name, None)
 
     # -------------------------------------------------------------------------
     # OPEN/CLOSE
     # -------------------------------------------------------------------------
-    def create_writer(self, feed_name: str) -> Writer:
+    def create_writer(self, feed_name: str):
         """Return a cached Writer for the feed, creating if needed."""
         w = self._writers.get(feed_name)
         if w is None:
             lifecycle = self.lifecycle(feed_name)
-            # non-persistent feeds -> ring
+            # persist=True -> Writer (disk chunks), persist=False -> RingWriter (SHM ring)
             if lifecycle.get("persist", True):
                 w = Writer(self, feed_name)
             else:
@@ -139,18 +188,14 @@ class Platform:
         r = self._readers.get(feed_name)
         if r is None:
             lifecycle = self.lifecycle(feed_name)
-            r = Reader(self, feed_name) if lifecycle.get("persist", True) else RingReader(self, feed_name)
+            # persist=True -> Reader (chunks), persist=False -> RingReader (ring)
+            if lifecycle.get("persist", True):
+                r = Reader(self, feed_name)
+            else:
+                from .ring import RingReader
+                r = RingReader(self, feed_name)
             self._readers[feed_name] = r
-        return r
-
-    # def open_reader(self, feed_name: str) -> UFReader:
-    #     """TODO: wire your reader impl; should mmap the latest chunk and use layout.json."""
-    #     r = self._readers.get(feed_name)
-    #     if r is None:
-    #         layout = self.get_layout(feed_name)
-    #         # r = UFReader(self.latest_chunk_path(feed_name), layout["fmt"], layout["ts"]["offset"])
-    #         self._readers[feed_name] = r
-    #     return r
+        return r  
 
     def close_writer(self, feed_name: str) -> None:
         w = self._writers.pop(feed_name, None)
@@ -169,20 +214,6 @@ class Platform:
             lay = load_layout(self.feed_dir(feed_name))
             self._layouts[feed_name] = lay
         return lay
-
-    def feed_spec(self, feed_name: str) -> dict:
-        """Load and cache the app-level config spec (config.json)."""
-        spec = self._specs.get(feed_name)
-        if spec is None:
-            path = self.feed_dir(feed_name) / "config.json"
-            if not path.exists():
-                raise FileNotFoundError(f"config.json missing for feed '{feed_name}'")
-            spec = orjson.loads(path.read_bytes())
-            # legacy support: chunk_size_mb → chunk_size_bytes
-            if "chunk_size_bytes" not in spec and "chunk_size_mb" in spec:
-                spec["chunk_size_bytes"] = int(spec["chunk_size_mb"] * 1024 * 1024)
-            self._specs[feed_name] = spec
-        return spec
 
     def codec(self, feed_name: str) -> Tuple[struct.Struct, int]:
         """
@@ -205,32 +236,9 @@ class Platform:
         return lc
 
     def set_lifecycle(self, feed_name: str, **kwargs) -> None:
-        """Partial update of lifecycle defaults."""
-        if not self.registry.update_metadata(feed_name, **kwargs):
+        """Partial update of lifecycle defaults (e.g., retention_hours=168)."""
+        if not self.registry.update_lifecycle(feed_name, **kwargs):
             raise KeyError(f"feed '{feed_name}' not found")
-
-    def resize_feed(self, feed_name: str, new_chunk_size_bytes: int) -> None:
-        """Update chunk/ring size and rotate/rescale active writer if present."""
-        if new_chunk_size_bytes <= 0:
-            raise ValueError("new_chunk_size_bytes must be > 0")
-        # update registry/config
-        if self.registry.feed_exists(feed_name):
-            self.registry.update_metadata(feed_name, chunk_size_bytes=int(new_chunk_size_bytes))
-        # update config file
-        spec = self.feed_spec(feed_name)
-        spec["chunk_size_bytes"] = int(new_chunk_size_bytes)
-        cfg_path = self.feed_dir(feed_name) / "config.json"
-        cfg_path.write_bytes(orjson.dumps(spec))
-        self._specs[feed_name] = spec
-        # resize live writer if cached
-        w = self._writers.get(feed_name)
-        if w:
-            if hasattr(w, "resize_chunk_size"):
-                w.resize_chunk_size(int(new_chunk_size_bytes))
-            elif hasattr(w, "resize"):
-                w.resize(int(new_chunk_size_bytes))
-        # refresh lifecycle cache for future readers
-        self.registry.get_metadata(feed_name)
 
     def list_feeds(self) -> list[dict]:
         """Linear scan of registry entries (small; fine for ops)."""
@@ -242,38 +250,70 @@ class Platform:
         if not md:
             raise KeyError(feed_name)
         lay = self.get_record_format(feed_name)
-        spec = self.feed_spec(feed_name)
-        persist = md.get("persist", True)
-        capacity_records = md["chunk_size_bytes"] // lay["record_size"] if lay["record_size"] else None
         return {
             "feed_name": feed_name,
             "lifecycle": {
                 "chunk_size_bytes": md["chunk_size_bytes"],
-                "rotate_s": md["rotate_s"],
+                "retention_hours": md["retention_hours"],
                 "persist": md["persist"],
                 "index_playback": md["index_playback"],
             },
             "record_fmt": lay["fmt"],
             "record_size": lay["record_size"],
-            "ts_offset": lay["ts_offset"],
+            "ts_offset": lay["ts"]["offset"],
             "fields": lay["fields"],
             "created_us": md.get("created_us"),
-            "persist": persist,
-            "capacity_records": capacity_records,
-            "config": spec,
         }
 
     # -------------------------------------------------------------------------
     # SHUTDOWN
     # -------------------------------------------------------------------------
+    def _register_shutdown_handlers(self):
+        """Register signal handlers and atexit for graceful shutdown."""
+        if self._shutdown_handlers_registered:
+            return
+        
+        def shutdown_handler(signum, frame):
+            try:
+                import logging
+                log = logging.getLogger("dw.platform")
+                log.info(f"Received signal {signum}, shutting down gracefully...")
+            except Exception:
+                pass
+            self.close()
+            import sys
+            sys.exit(0)
+        
+        # Register signal handlers
+        signal.signal(signal.SIGTERM, shutdown_handler)
+        signal.signal(signal.SIGINT, shutdown_handler)
+        
+        # Register atexit cleanup (catches normal exit)
+        atexit.register(self.close)
+        
+        self._shutdown_handlers_registered = True
+    
     def close(self):
+        """Close all writers and release resources gracefully."""
         for w in list(self._writers.values()):
-            w.close()
+            try:
+                w.close()
+            except Exception as e:
+                try:
+                    import logging
+                    logging.getLogger("dw.platform").error(f"Error closing writer: {e}")
+                except Exception:
+                    pass
         self._writers = dict()
+        
         for r in list(self._readers.values()):
             try:
                 r.close()
             except Exception:
                 pass
         self._readers = dict()
-        self.registry.close()
+        
+        try:
+            self.registry.close()
+        except Exception:
+            pass

@@ -41,6 +41,10 @@ class Writer:
         self.current_chunk_metadata = None
         self.current_chunk_id = self.registry.get_latest_chunk_idx() or 0
 
+        # Validate previous chunk before starting (handles corruption/missing files)
+        if self.current_chunk_id > 0:
+            self._validate_previous_chunk()
+
         self._create_new_chunk()
         self._schema_init()
 
@@ -48,52 +52,51 @@ class Writer:
         self.current_chunk_id += 1
         
         # Release old metadata BEFORE register_chunk in case it triggers resize
-        # (resize will close/remap the mmap, invalidating our metadata's cast views and causing an exported pointers exception)
         _new_start_time = None
         if self.current_chunk_metadata is not None:
-            if self.feed_config.get("persist") is True:
-                self.current_chunk.close_file()
-            else:
-                self.current_chunk.close_shm()
-            self.current_chunk_metadata.status = ON_DISK if self.feed_config["persist"] else EXPIRED            
+            self.current_chunk.close_file()
+            self.current_chunk_metadata.status = ON_DISK
             self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
             _new_start_time = self.current_chunk_metadata.end_time
             self.current_chunk_metadata.release()
 
-        if self.feed_config.get("persist") is True:
-            # Create the chunk file first, then register to avoid readers seeing metadata before the file exists.
-            chunk_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
-            self.current_chunk = Chunk.create_file(path=str(chunk_path), size=self.feed_config["chunk_size_bytes"])
-            self.registry.register_chunk(
-                time.time_ns() // 1_000, self.current_chunk_id,
-                self.feed_config["chunk_size_bytes"], status=ON_DISK)
-        else:
-            # Create SHM first, then register.
-            shm_name = f"{self.feed_name}-{self.current_chunk_id}"
-            self.current_chunk = Chunk.create_shm(name=shm_name, size=self.feed_config["chunk_size_bytes"])
-            self.registry.register_chunk(
-                time.time_ns() // 1_000, self.current_chunk_id,
-                self.feed_config["chunk_size_bytes"], status=IN_MEMORY)
+        # Writer only handles persist=True (disk chunks)
+        chunk_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
+        self.current_chunk = Chunk.create_file(path=str(chunk_path), size=self.feed_config["chunk_size_bytes"])
+        self.registry.register_chunk(
+            time.time_ns() // 1_000, self.current_chunk_id,
+            self.feed_config["chunk_size_bytes"], status=ON_DISK)
 
         self.current_chunk_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
         self.current_chunk_metadata.start_time = _new_start_time if _new_start_time is not None else self.current_chunk_metadata.start_time
 
         if self.feed_config.get("index_playback") is True:
-            if self.feed_config.get("persist") is True:
-                if self.chunk_index is not None:
-                    self.chunk_index.close_file()
-                self.chunk_index = ChunkIndex.create_file(
-                    path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.idx"),
-                    capacity=2047
-                )
-            else:
-                if self.chunk_index is not None:
-                    self.chunk_index.close_shm()
-                self.chunk_index = ChunkIndex.create_shm(
-                    name=f"{self.feed_name}-index-{self.current_chunk_id}",
-                    capacity=2047
-                )
+            if self.chunk_index is not None:
+                self.chunk_index.close_file()
+            self.chunk_index = ChunkIndex.create_file(
+                path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.idx"),
+                capacity=2047
+            )
 
+    def _validate_previous_chunk(self):
+        """Validate previous chunk and auto-repair if corrupted."""
+        from . import repair
+        
+        meta = self.registry.get_chunk_metadata(self.current_chunk_id)
+        if meta is None:
+            return
+        
+        try:
+            # Delegate to centralized repair logic (persist=True only)
+            repair.validate_and_repair_chunk(
+                chunk_id=self.current_chunk_id,
+                meta=meta,
+                feed_name=self.feed_name,
+                feed_dir=self.data_dir,
+                record_format=self.record_format
+            )
+        finally:
+            meta.release()
 
     def write(self, timestamp: int, record_data: Union[bytes, np.ndarray], create_index: bool = False) -> int:
         if isinstance(record_data, np.ndarray):
