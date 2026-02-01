@@ -34,20 +34,18 @@ class Platform:
         # Configure logging to base_path
         self._setup_logging()
         
-        # ensure manifest exists and warn on version drift
+        # ensure manifest exists and enforce version compatibility
         manifest = read_manifest(self.base_path)
         if manifest is None:
             write_manifest(self.base_path)
         else:
             mf_ver = manifest.get("deepwater_version")
             if mf_ver and mf_ver != __version__:
-                # log-only; do not block
-                try:
-                    import logging
-                    log = logging.getLogger("dw.platform")
-                    log.warning("deepwater version mismatch: manifest has %s, code is %s", mf_ver, __version__)
-                except Exception:
-                    pass
+                raise RuntimeError(
+                    f"Deepwater version mismatch: manifest has {mf_ver}, code is {__version__}. "
+                    f"Data was written by a different version. Either use the correct version or "
+                    f"migrate the data (delete manifest.json to force re-init, but you may lose data compatibility)."
+                )
 
         self.registry = GlobalRegistry(self.base_path)
 

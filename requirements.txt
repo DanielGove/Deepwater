@@ -6,6 +6,7 @@ numpy==2.2.6
 orjson==3.11.3
 packaging==25.0
 prompt_toolkit==3.0.52
+python-crontab==3.3.0
 pyproject_hooks==1.2.0
 pysimdjson==7.0.2
 setuptools==80.9.0
