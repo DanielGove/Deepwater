@@ -16,6 +16,20 @@ from .utils.process import ProcessUtils
 log = logging.getLogger("dw.writer")
 
 class Writer:
+    """
+    Writer for persistent disk-based feeds.
+    
+    Writes records to fixed-size binary chunks with automatic rotation.
+    Supports optional time-based indexing for playback.
+    
+    Do not instantiate directly - use Platform.create_writer().
+    
+    Example:
+        >>> platform = Platform("./data")
+        >>> writer = platform.create_writer("trades")
+        >>> writer.write_values(123.45, 100.0, 1738368000000000)
+        >>> writer.close()
+    """
     def __init__(self, platform, feed_name:str):
         self.platform = platform
         self.feed_name = feed_name
@@ -136,8 +150,22 @@ class Writer:
         self._rowbuf = bytearray(self._rec_size)
 
     def write_values(self, *vals, create_index=False) -> int:
-        """Pack positional values according to schema and write directly to SHM.
-        Does not accept kwargs. Uses schema order (non-padding fields).
+        """
+        Write a record to the current chunk.
+        
+        Values must match feed schema field order (excluding padding fields).
+        Automatically rotates to new chunk when current chunk is full.
+        
+        Args:
+            *vals: Field values in schema order
+            create_index: If True, create time-index entry for this record
+        
+        Returns:
+            New write position in chunk
+        
+        Example:
+            >>> writer.write_values(123.45, 100.0, 1738368000000000)
+            >>> writer.write_values(124.50, 50.0, 1738368001000000, create_index=True)
         """
         # hot locals
         meta = self.current_chunk_metadata
@@ -235,7 +263,16 @@ class Writer:
         if create_index and self.chunk_index is not None and meta.last_update is not None:
             self.chunk_index.create_index(meta.last_update, end - rec_size, rec_size)
         return meta.write_pos
-
+    def close(self):
+        """
+        Close writer and flush pending data.
+        
+        Finalizes current chunk metadata and releases locks.
+        Called automatically on exit, but explicit call recommended.
+        
+        Example:
+            >>> writer.close()
+        """
     def resize_chunk_size(self, new_size_bytes: int) -> None:
         """Update lifecycle and rotate into a new chunk with a new size."""
         if new_size_bytes <= 0:

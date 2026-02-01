@@ -10,7 +10,21 @@ from .utils.process import ProcessUtils
 
 
 class Reader:
-    """Feed reader with optional indexed playback from snapshot markers."""
+    """
+    Reader for persistent disk-based feeds.
+    
+    Provides time-range queries and sequential reads with zero-copy mmap access.
+    Supports optional indexed playback from snapshot markers.
+    
+    Do not instantiate directly - use Platform.create_reader().
+    
+    Example:
+        >>> platform = Platform("./data")
+        >>> reader = platform.create_reader("trades")
+        >>> for record in reader.read(start_us=1738368000000000):
+        ...     print(record["price"], record["size"])
+        >>> reader.close()
+    """
 
     def __init__(self, platform, feed_name: str):
         self.platform = platform
@@ -266,6 +280,41 @@ class Reader:
         return self._record_struct.unpack_from(self._chunk.buffer, last_offset)
 
     # ------------------------------------------------------------------ range playback
+    def read(self, start_us: Optional[int] = None, end_us: Optional[int] = None):
+        """
+        Read records as dictionaries with optional time range filtering.
+        
+        Convenience wrapper around stream_time_range() that returns dicts instead of tuples.
+        If no time range specified, reads all available records.
+        
+        Args:
+            start_us: Start timestamp in microseconds (inclusive), or None for beginning
+            end_us: End timestamp in microseconds (inclusive), or None for end
+        
+        Yields:
+            dict: Record with field names as keys
+        
+        Example:
+            >>> for record in reader.read(start_us=1738368000000000):
+            ...     print(record["price"], record["size"], record["timestamp_us"])
+            
+            >>> # Read all records
+            >>> for record in reader.read():
+            ...     print(record)
+        """
+        field_names = [f["name"] for f in self.record_format.get("fields", [])]
+        
+        if start_us is None and end_us is None:
+            # Read all records
+            for vals in self.stream_latest_records():
+                yield dict(zip(field_names, vals))
+        else:
+            # Time range query
+            if start_us is None:
+                start_us = 0
+            for vals in self.stream_time_range(start_us, end_us):
+                yield dict(zip(field_names, vals))
+    
     def stream_time_range(self, start_time: int, end_time: Optional[int] = None):
         """
         Yield packed records whose timestamp is within [start_time, end_time].
@@ -328,5 +377,14 @@ class Reader:
             pos += self._record_size
 
     def close(self):
+        """
+        Close reader and release resources.
+        
+        Unmaps memory and closes file handles. Called automatically on exit,
+        but explicit call recommended.
+        
+        Example:
+            >>> reader.close()
+        """
         self._close_chunk()
         self.registry.close()

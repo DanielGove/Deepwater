@@ -20,10 +20,34 @@ from . import __version__
 
 class Platform:
     """
-    Single entry-point for feeds.
-    - Lifecycle defaults live in GlobalRegistry (binary, mmap).
-    - Record formatting lives in data/<feed>/layout.json (UF only for now).
-    - Writers/readers are opened explicitly (create_feed never returns a writer).
+    Deepwater platform - zero-copy market data substrate.
+    
+    Entry point for creating feeds, writing data, and querying time-series records.
+    Supports both persistent disk storage and transient shared memory rings.
+    
+    Args:
+        base_path: Root directory for all data and metadata (default: "./platform_data")
+    
+    Raises:
+        RuntimeError: If manifest version mismatch detected (prevents data corruption)
+    
+    Example:
+        >>> platform = Platform(base_path="./data")
+        >>> platform.create_feed({
+        ...     "feed_name": "trades",
+        ...     "mode": "UF",
+        ...     "fields": [
+        ...         {"name": "price", "type": "float64"},
+        ...         {"name": "size", "type": "float64"},
+        ...         {"name": "timestamp_us", "type": "uint64"},
+        ...     ],
+        ...     "ts_col": "timestamp_us",
+        ...     "persist": True,
+        ... })
+        >>> writer = platform.create_writer("trades")
+        >>> writer.write_values(123.45, 100.0, 1738368000000000)
+        >>> writer.close()
+        >>> platform.close()
     """
 
     def __init__(self, base_path: str = "./platform_data"):
@@ -102,19 +126,45 @@ class Platform:
     # -------------------------------------------------------------------------
     def create_feed(self, spec: dict) -> None:
         """
-        spec (UF today):
-          {
-            "feed_name": "...",
-            "mode": "UF",
-            "fields": [ {name,type}, ... ],
-            "ts_col": "ws_ts_us",
-            # lifecycle knobs (optional; defaults applied into registry)
-            "chunk_size_mb": 64,
-            "retention_hours": 72,
-            "persist": True,
-            "index_playback": False,
-            "schema_id": "cb.l2.uf.v1"   # kept only in config.json for ops
-          }
+        Create a new feed with specified schema and lifecycle settings.
+        
+        Idempotent - safe to call multiple times. Enforces schema stability:
+        changing field layout requires new feed name or version.
+        
+        Args:
+            spec: Feed specification dictionary with keys:
+                - feed_name (str, required): Unique feed identifier
+                - mode (str, required): "UF" for uniform format (only mode supported)
+                - fields (list[dict], required): Field definitions, each with:
+                    - name (str): Field name
+                    - type (str): Field type (uint8/16/32/64, int8/16/32/64, 
+                                  float32/64, char, _N for padding)
+                    - desc (str, optional): Field description
+                - ts_col (str, required): Name of timestamp field for time queries
+                - chunk_size_mb (int, optional): Chunk size in MB (default: 64)
+                - retention_hours (int, optional): Data retention in hours (default: 72)
+                - persist (bool, optional): True for disk, False for SHM only (default: True)
+                - index_playback (bool, optional): Enable time-indexed queries (default: False)
+        
+        Raises:
+            ValueError: If required fields missing from spec
+            RuntimeError: If feed exists with different schema (prevents corruption)
+            NotImplementedError: If mode != "UF"
+        
+        Example:
+            >>> platform.create_feed({
+            ...     "feed_name": "sensor_data",
+            ...     "mode": "UF",
+            ...     "fields": [
+            ...         {"name": "sensor_id", "type": "uint32"},
+            ...         {"name": "value", "type": "float64"},
+            ...         {"name": "timestamp_us", "type": "uint64"},
+            ...     ],
+            ...     "ts_col": "timestamp_us",
+            ...     "chunk_size_mb": 32,
+            ...     "retention_hours": 24,
+            ...     "persist": True,
+            ... })
         """
         name = spec["feed_name"]
         mode = spec.get("mode", "UF")
@@ -170,7 +220,26 @@ class Platform:
     # OPEN/CLOSE
     # -------------------------------------------------------------------------
     def create_writer(self, feed_name: str):
-        """Return a cached Writer for the feed, creating if needed."""
+        """
+        Create or return cached writer for a feed.
+        
+        Returns Writer (disk) if persist=True, RingWriter (SHM) if persist=False.
+        Writers are cached per process - multiple calls return same instance.
+        
+        Args:
+            feed_name: Name of feed to write to (must exist via create_feed)
+        
+        Returns:
+            Writer or RingWriter instance
+        
+        Raises:
+            KeyError: If feed does not exist
+        
+        Example:
+            >>> writer = platform.create_writer("trades")
+            >>> writer.write_values(123.45, 100.0, 1738368000000000)
+            >>> writer.close()
+        """
         w = self._writers.get(feed_name)
         if w is None:
             lifecycle = self.lifecycle(feed_name)
@@ -183,6 +252,27 @@ class Platform:
         return w
     
     def create_reader(self, feed_name: str):
+        """
+        Create or return cached reader for a feed.
+        
+        Returns Reader (disk) if persist=True, RingReader (SHM) if persist=False.
+        Readers are cached per process - multiple calls return same instance.
+        
+        Args:
+            feed_name: Name of feed to read from (must exist via create_feed)
+        
+        Returns:
+            Reader or RingReader instance
+        
+        Raises:
+            KeyError: If feed does not exist
+        
+        Example:
+            >>> reader = platform.create_reader("trades")
+            >>> for record in reader.read(start_us=1738368000000000):
+            ...     print(record["price"], record["size"])
+            >>> reader.close()
+        """
         r = self._readers.get(feed_name)
         if r is None:
             lifecycle = self.lifecycle(feed_name)
@@ -239,7 +329,17 @@ class Platform:
             raise KeyError(f"feed '{feed_name}' not found")
 
     def list_feeds(self) -> list[dict]:
-        """Linear scan of registry entries (small; fine for ops)."""
+        """
+        List all registered feed names.
+        
+        Returns:
+            List of feed name strings
+        
+        Example:
+            >>> feeds = platform.list_feeds()
+            >>> print(feeds)
+            ['trades', 'quotes', 'orderbook']
+        """
         return self.registry.list_feeds()
     
     def describe_feed(self, feed_name: str) -> dict:
@@ -292,7 +392,17 @@ class Platform:
         self._shutdown_handlers_registered = True
     
     def close(self):
-        """Close all writers and release resources gracefully."""
+        """
+        Close all writers, readers, and registries.
+        
+        Flushes pending writes and releases file locks. Called automatically
+        on exit via atexit handler, but explicit call recommended.
+        
+        Example:
+            >>> platform = Platform("./data")
+            >>> # ... use platform ...
+            >>> platform.close()  # Clean shutdown
+        """
         for w in list(self._writers.values()):
             try:
                 w.close()
