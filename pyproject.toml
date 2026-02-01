@@ -5,10 +5,37 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "deepwater"
 version = "0.0.1"
-description = "Deepwater core: shared-memory protocol & time queries"
+description = "Zero-copy market data substrate with microsecond precision"
+readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Deepwater" }]
-dependencies = ["numpy>=1.26","numba>=0.61.2"]  # add others as you need them (orjson, fastnumbers, ...)
+license = {text = "MIT"}
+authors = [{ name = "Dan Gove", email = "dnlgove2@gmail.com" }]
+keywords = ["market-data", "time-series", "zero-copy", "shared-memory"]
+
+dependencies = [
+    "numpy>=1.26",
+    "numba>=0.61.2",
+    "orjson>=3.11.3",
+    "fastnumbers>=5.1.1",
+    "pysimdjson>=7.0.2",
+    "websocket-client>=1.8.0",
+    "python-crontab>=3.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "prompt_toolkit>=3.0.52",
+]
+
+[project.scripts]
+deepwater-cleanup = "deepwater.cleanup:main"
+deepwater-health = "deepwater.health_check:main"
+deepwater-repair = "deepwater.repair:main"
+
+[project.urls]
+Homepage = "https://github.com/DanielGove/Deepwater"
+Repository = "https://github.com/DanielGove/Deepwater"
+Issues = "https://github.com/DanielGove/Deepwater/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
