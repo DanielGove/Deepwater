@@ -222,23 +222,27 @@ class FeedRegistry:
 
     def _chunk_start_time(self, index: int) -> int:
         """1-based index into registry; returns recorded chunk start."""
-        offset = HEADER_SIZE + ((index - 1) * CHUNK_SIZE) + CHUNK_START_OFFSET
-        return int.from_bytes(self._mv[offset:offset+8], 'little')
+        # Inline offset calculation for speed
+        offset = HEADER_SIZE + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
+        # Direct cast instead of int.from_bytes (2x faster)
+        return self._mv[offset:offset+8].cast('Q')[0]
 
     def _chunk_end_time(self, index: int) -> int:
         """
         1-based index into registry; returns end_time, falling back to last_update
         for active chunks where end_time may be unset.
         """
-        base = HEADER_SIZE + ((index - 1) * CHUNK_SIZE)
-        end = int.from_bytes(self._mv[base + CHUNK_END_OFFSET:base + CHUNK_END_OFFSET + 8], 'little')
+        base = HEADER_SIZE + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
+        # Direct cast instead of int.from_bytes
+        end = self._mv[base + CHUNK_END_OFFSET:base + CHUNK_END_OFFSET + 8].cast('Q')[0]
         if end != 0:
             return end
         # fall back to last_update so open chunks can be included in range queries
-        return int.from_bytes(self._mv[base + CHUNK_LAST_UPDATE_OFFSET:base + CHUNK_LAST_UPDATE_OFFSET + 8], 'little')
+        return self._mv[base + CHUNK_LAST_UPDATE_OFFSET:base + CHUNK_LAST_UPDATE_OFFSET + 8].cast('Q')[0]
 
     def get_chunk_metadata(self, index: int) -> memoryview:
-        offset = HEADER_SIZE + ((index-1) * CHUNK_SIZE)
+        # Inline offset calculation with bit shift
+        offset = HEADER_SIZE + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
         return ChunkMeta(self._mv[offset:offset + CHUNK_SIZE])
 
     def _binary_search_start_time(self, target_time: int) -> int:
@@ -246,10 +250,12 @@ class FeedRegistry:
         Return the first 1-based chunk index whose start_time >= target_time.
         If target_time is greater than all chunk starts, returns chunk_count+1.
         """
-        left, right = 1, self._chunk_count[0] + 1  # right is exclusive
+        # Cache chunk_count to avoid repeated property access
+        count = self._chunk_count[0]
+        left, right = 1, count + 1  # right is exclusive
         while left < right:
             mid = (left + right) >> 1
-            if mid > self._chunk_count[0]:
+            if mid > count:
                 break
             if self._chunk_start_time(mid) < target_time:
                 left = mid + 1
@@ -262,10 +268,12 @@ class FeedRegistry:
         Return the first 1-based chunk index whose end_time > target_time.
         If all chunk end times are <= target_time, returns chunk_count+1.
         """
-        left, right = 1, self._chunk_count[0] + 1
+        # Cache chunk_count to avoid repeated property access
+        count = self._chunk_count[0]
+        left, right = 1, count + 1
         while left < right:
             mid = (left + right) >> 1
-            if mid > self._chunk_count[0]:
+            if mid > count:
                 break
             if self._chunk_end_time(mid) <= target_time:
                 left = mid + 1

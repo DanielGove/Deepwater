@@ -12,3 +12,11 @@ __pycache__/
 *.log
 platform_data/*
 data/*
+registry/*
+
+# Cython build artifacts
+*.c
+*.so
+*.html
+build/
+dist/
