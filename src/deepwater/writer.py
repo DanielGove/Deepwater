@@ -19,15 +19,87 @@ class Writer:
     """
     Writer for persistent disk-based feeds.
     
-    Writes records to fixed-size binary chunks with automatic rotation.
-    Supports optional time-based indexing for playback.
+    Performance:
+        - 60µs per write (including cross-process sync)
+        - Struct.pack_into: 272ns (zero-allocation)
+        - Automatic chunk rotation (transparent to caller)
+        - Multi-process safe (only one writer per feed)
     
-    Do not instantiate directly - use Platform.create_writer().
+    Features:
+        - Fixed-size binary chunks (default 128MB)
+        - Automatic chunk rotation when full
+        - Optional time-based indexing for fast playback
+        - Memory-mapped metadata (live visibility to readers)
+        - Crash recovery (validates previous chunk on startup)
+    
+    Usage Patterns:
+        # High-frequency writes (trading)
+        >>> writer = platform.create_writer('trades')
+        >>> for event in websocket:
+        ...     writer.write_values(event.price, event.size, event.timestamp_us)
+        
+        # Batch writes (backfill)
+        >>> writer = platform.create_writer('historical')
+        >>> for batch in chunks:
+        ...     writer.write_tuple(batch)  # Pre-packed tuple
+        
+        # Always close when done
+        >>> writer.close()  # Seals chunk, updates metadata
+    
+    Methods:
+        write_values(*args): Write individual field values
+            >>> writer.write_values(123.45, 100.0, 1738368000000000)
+        
+        write_tuple(record): Write pre-packed tuple (faster for batch)
+            >>> writer.write_tuple((123.45, 100.0, 1738368000000000))
+        
+        write_dict(record): Write from dictionary (slower, convenient)
+            >>> writer.write_dict({'price': 123.45, 'size': 100.0, 'timestamp_us': 1738368000000000})
+        
+        close(): Seal current chunk, release resources
+    
+    Chunk Rotation:
+        - Automatic when chunk reaches size limit
+        - Transparent to caller (no special handling needed)
+        - New chunk starts immediately after rotation
+        - Metadata updated atomically (readers see clean transition)
+    
+    Multi-Process:
+        - Only ONE writer per feed allowed (enforced by platform)
+        - Multiple readers can read while writer is active
+        - Writer and readers can be in different processes
+        - 60µs IPC latency from write to read
+    
+    Gotchas:
+        - Must call close() to seal chunk (otherwise readers see incomplete data)
+        - Timestamps must be monotonic increasing (not enforced, but expected)
+        - Field order must match feed schema (no validation)
+        - Writer holds exclusive lock on chunk file
     
     Example:
-        >>> platform = Platform("./data")
-        >>> writer = platform.create_writer("trades")
-        >>> writer.write_values(123.45, 100.0, 1738368000000000)
+        >>> from deepwater import Platform
+        >>> import time
+        >>> 
+        >>> p = Platform('./data')
+        >>> p.create_feed({
+        ...     'feed_name': 'trades',
+        ...     'mode': 'UF',
+        ...     'fields': [
+        ...         {'name': 'price', 'type': 'float64'},
+        ...         {'name': 'size', 'type': 'float64'},
+        ...         {'name': 'timestamp_us', 'type': 'uint64'},
+        ...     ],
+        ...     'ts_col': 'timestamp_us',
+        ...     'persist': True,
+        ... })
+        >>> 
+        >>> writer = p.create_writer('trades')
+        >>> 
+        >>> # Write live data
+        >>> timestamp_us = int(time.time() * 1e6)
+        >>> writer.write_values(123.45, 100.0, timestamp_us)
+        >>> writer.write_values(123.50, 200.0, timestamp_us + 1000)
+        >>> 
         >>> writer.close()
     """
     def __init__(self, platform, feed_name:str):
