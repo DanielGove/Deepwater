@@ -263,16 +263,7 @@ class Writer:
         if create_index and self.chunk_index is not None and meta.last_update is not None:
             self.chunk_index.create_index(meta.last_update, end - rec_size, rec_size)
         return meta.write_pos
-    def close(self):
-        """
-        Close writer and flush pending data.
-        
-        Finalizes current chunk metadata and releases locks.
-        Called automatically on exit, but explicit call recommended.
-        
-        Example:
-            >>> writer.close()
-        """
+
     def resize_chunk_size(self, new_size_bytes: int) -> None:
         """Update lifecycle and rotate into a new chunk with a new size."""
         if new_size_bytes <= 0:
@@ -287,16 +278,27 @@ class Writer:
         self._create_new_chunk()
 
     def close(self):
+        """
+        Close writer and flush pending data.
+        
+        Finalizes current chunk metadata and releases locks.
+        Called automatically on exit, but explicit call recommended.
+        
+        Example:
+            >>> writer.close()
+        """
         if self.current_chunk:
             self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
             if self.feed_config.get("persist", True):
                 self.current_chunk.close_file()
-                if self.feed_config.get("index_playback", False):
+                if self.feed_config.get("index_playback", False) and self.chunk_index:
                     self.chunk_index.close_file()
             else:
                 self.current_chunk.close_shm()
-                if self.feed_config.get("index_playback", False):
+                if self.feed_config.get("index_playback", False) and self.chunk_index:
                     self.chunk_index.close_shm()
             self.current_chunk_metadata.status = ON_DISK if self.feed_config["persist"] else EXPIRED
             self.current_chunk_metadata.release()
+            self.current_chunk = None  # Prevent double-close
             self.registry.close()
+

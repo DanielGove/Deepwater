@@ -320,7 +320,8 @@ class MarketDataEngine:
                         for ev in doc["events"]:
                             proc_us = now_us()
                             counts: Dict[str, int] = {}
-                            for tr in ev["trades"]:
+                            # Reverse trades to get chronological order (oldest first)
+                            for tr in reversed(ev["trades"]):
                                 writer = trade_writers.get(tr["product_id"])
                                 writer.write_values(b'T',
                                                     tr["side"][0].encode("ascii"),
@@ -347,7 +348,8 @@ class MarketDataEngine:
                             idx = True if l2_type == b's' else False
                             proc_us = now_us()
 
-                            for u in ev["updates"]:
+                            # Reverse updates to get chronological order (oldest first)
+                            for u in reversed(ev["updates"]):
                                 writer.write_values(
                                     l2_type,
                                     u["side"][0].encode("ascii"),
