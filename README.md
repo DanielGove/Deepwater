@@ -4,6 +4,14 @@
 
 Ultra-low latency time-series storage optimized for financial market data. Deepwater delivers sub-100-microsecond IPC latency with persistent storage and full replay capability.
 
+📚 **Documentation**:
+- **[GETTING_STARTED.md](GETTING_STARTED.md)** - 5-minute tutorial for beginners (start here!)
+- **[README.md](README.md)** - Complete API reference and examples (this file)
+- **[QUICKSTART.md](QUICKSTART.md)** - Step-by-step guide with real examples
+- **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - Command cheat sheet
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Internal design and implementation
+- **[CHANGELOG.md](CHANGELOG.md)** - Version history and breaking changes
+
 ## Performance
 
 - **Writer**: 60µs per write (cross-process)
@@ -460,24 +468,140 @@ deepwater-repair --base-path ./data --feed trades  # apply
 
 ---
 
-## Architecture
+## Ring Buffers (In-Memory Feeds)
 
-### Storage Model
+Ring buffers provide sub-100µs IPC latency for transient data that doesn't need persistence.
+
+### When to Use Ring Buffers
+
+- **Ultra-low latency**: 40-70µs P50 IPC latency (vs 60-70µs for disk)
+- **Transient data**: Preprocessed/enriched feeds that don't need historical storage
+- **IPC coordination**: Share live data between processes without disk overhead
+- **Cost optimization**: Save disk I/O for data you'll never replay
+
+### Performance
+
+- **Write latency**: 40-50µs
+- **Read latency**: 40-70µs P50 IPC (multiprocessing)
+- **Throughput**: 200-400 rec/sec sustained
+- **Memory**: Configurable (typically 1-8MB buffers)
+
+### Creating Ring Feeds
+
+```python
+from deepwater import Platform
+
+p = Platform('./data')
+
+# Create ring feed (same API as disk feeds)
+p.create_feed({
+    'feed_name': 'live-l2',
+    'mode': 'UF',
+    'fields': [
+        {'name': 'price', 'type': 'float64'},
+        {'name': 'qty', 'type': 'float64'},
+        {'name': 'timestamp_us', 'type': 'uint64'},
+    ],
+    'ts_col': 'timestamp_us',
+    'persist': False,  # ← Ring buffer (shared memory)
+    'chunk_size_mb': 1,  # Buffer size in memory
+})
+
+# Use identical API
+writer = p.create_writer('live-l2')  # Routes to RingWriter
+reader = p.create_reader('live-l2')  # Routes to RingReader
+```
+
+### Multiprocessing Example
+
+```python
+from deepwater import Platform
+from multiprocessing import Process
+
+def publisher(feed_name):
+    """Process 1: Write to ring"""
+    p = Platform('./data')
+    writer = p.create_writer(feed_name)
+    
+    while True:
+        ts = int(time.time() * 1e6)
+        writer.write_values(100.0, 10.0, ts)  # 40µs
+
+def consumer(feed_name):
+    """Process 2: Read from ring"""
+    p = Platform('./data')
+    reader = p.create_reader(feed_name)
+    
+    for record in reader.stream():  # 70µs latency
+        price, qty, ts = record
+        # Process with 40-70µs total latency
+
+# Start both processes
+Process(target=publisher, args=('live-l2',)).start()
+Process(target=consumer, args=('live-l2',)).start()
+```
+
+### Ring API (Same as Disk)
+
+Ring readers support the full standard API:
+
+```python
+reader = p.create_reader('live-l2')  # persist=False
+
+# Streaming (infinite, live updates)
+for record in reader.stream():
+    price, qty, ts = record
+    
+# Range queries (on current buffer contents)
+now_us = int(time.time() * 1e6)
+recent = reader.range(now_us - 5_000_000, now_us)  # Last 5 seconds
+
+# Latest window (convenience)
+last_minute = reader.latest(60.0)  # Last 60 seconds (if in buffer)
+
+# Dict format
+for trade in reader.stream(format='dict'):
+    print(f"Price: {trade['price']}")
+```
+
+**Note**: Ring queries only search data currently in the buffer. Historical depth is limited by buffer size.
+
+### Ring Buffer Behavior
+
+- **Circular**: Old data is overwritten when buffer fills
+- **Shared memory**: Uses `/dev/shm` on Linux (automatic cleanup)
+- **Multi-reader**: Multiple processes can read simultaneously
+- **Auto-routing**: Platform API automatically uses RingWriter/RingReader based on `persist` flag
+- **No persistence**: Data lost on process exit/crash
+
+### Architecture
+
+#### Storage Model
 - **Global Registry**: Binary catalog of all feeds (mmap)
 - **Feed Registry**: Per-feed chunk metadata (mmap)
-- **Chunks**: Fixed-size binary files with records
-- **Ring Buffers**: Shared memory for `persist=False` feeds
+- **Chunks**: Fixed-size binary files with records (persist=True)
+- **Ring Buffers**: Shared memory circular buffers (persist=False)
 
-### Data Flow
+#### Data Flow
 ```
-Writer → Feed Registry → Chunks (disk or SHM)
+Writer → Feed Registry → Chunks (disk) or Ring (SHM)
                       ↓
-Reader ← Time-indexed queries ← Chunk index
+Reader ← Time-indexed queries or Ring streaming
 ```
 
-### Persist Modes
-- **`persist=True`**: Writes to disk chunks, survives restarts
-- **`persist=False`**: Writes to shared memory rings, transient
+#### Persist Modes
+- **`persist=True`** (default): Writes to disk chunks, full historical storage
+- **`persist=False`**: Writes to shared memory ring, transient (lost on exit)
+
+#### Ring Buffer Header
+```
+[write_pos: 8B][start_pos: 8B][generation: 8B][last_ts: 8B][count: 8B][...data...]
+```
+- **write_pos**: Next write location
+- **start_pos**: Oldest valid data (after wrapping)
+- **generation**: Wrap counter
+- **last_ts**: Most recent timestamp (for latest() queries)
+- **count**: Total records written (for catching up)
 
 ---
 
@@ -613,39 +737,330 @@ Or create GitHub release with artifacts attached.
 
 ---
 
+## Complete API Reference
+
+### Platform
+
+Entry point for all operations. Automatically routes to disk or ring based on `persist` flag.
+
+```python
+from deepwater import Platform
+
+p = Platform(base_path='./data')
+```
+
+#### Methods
+
+**`create_feed(spec: dict) -> None`**
+
+Create a new feed with schema and lifecycle settings. Idempotent - safe to call multiple times.
+
+```python
+p.create_feed({
+    'feed_name': 'trades',           # Required: Unique feed identifier
+    'mode': 'UF',                    # Required: 'UF' (uniform format)
+    'fields': [                       # Required: Field definitions
+        {'name': 'price', 'type': 'float64', 'desc': 'Trade price'},
+        {'name': 'size', 'type': 'float64', 'desc': 'Trade size'},
+        {'name': 'timestamp_us', 'type': 'uint64', 'desc': 'Event time'},
+    ],
+    'ts_col': 'timestamp_us',        # Required: Timestamp field name
+    'chunk_size_mb': 64,             # Optional: Chunk size (default: 64)
+    'retention_hours': 72,           # Optional: Data retention (default: 72)
+    'persist': True,                 # Optional: Disk (True) or memory (False, default: True)
+    'index_playback': False,         # Optional: Enable time index (default: False)
+})
+```
+
+**Safety**: Cannot change `persist` flag for existing feeds (raises RuntimeError).
+
+**`create_writer(feed_name: str) -> Writer | RingWriter`**
+
+Create or return cached writer. Automatically chooses Writer (disk) or RingWriter (ring) based on persist flag.
+
+```python
+writer = p.create_writer('trades')  # Cached per process
+```
+
+**`create_reader(feed_name: str) -> Reader | RingReader`**
+
+Create or return cached reader. Automatically chooses Reader (disk) or RingReader (ring) based on persist flag.
+
+```python
+reader = p.create_reader('trades')  # Cached per process
+```
+
+**`list_feeds() -> List[dict]`**
+
+List all registered feeds with metadata.
+
+```python
+feeds = p.list_feeds()
+# [{'name': 'trades', 'persist': True, ...}, ...]
+```
+
+**`lifecycle(feed_name: str) -> dict`**
+
+Get feed lifecycle configuration.
+
+```python
+config = p.lifecycle('trades')
+# {'chunk_size_bytes': 67108864, 'persist': True, ...}
+```
+
+**`get_record_format(feed_name: str) -> dict`**
+
+Get feed record format (layout, fields, format string).
+
+```python
+layout = p.get_record_format('trades')
+# {'fmt': '<ddQ', 'fields': [...], 'record_size': 24, ...}
+```
+
+**`close() -> None`**
+
+Close all writers and readers. Called automatically on exit.
+
+```python
+p.close()
+```
+
+---
+
+### Writer (Disk Feeds: persist=True)
+
+Write records to disk-backed feeds (60µs per write).
+
+```python
+writer = p.create_writer('trades')
+```
+
+#### Methods
+
+**`write_values(*values) -> None`**
+
+Write record from individual values (fastest). Values must match field order.
+
+```python
+writer.write_values(123.45, 100.0, 1738368000000000)  # 60µs
+```
+
+**`write_tuple(record: tuple) -> None`**
+
+Write record from tuple.
+
+```python
+record = (123.45, 100.0, 1738368000000000)
+writer.write_tuple(record)
+```
+
+**`write_dict(record: dict) -> None`**
+
+Write record from dictionary (field names to values).
+
+```python
+writer.write_dict({
+    'price': 123.45,
+    'size': 100.0,
+    'timestamp_us': 1738368000000000
+})
+```
+
+**`close() -> None`**
+
+Flush and close writer. Called automatically on exit.
+
+```python
+writer.close()
+```
+
+---
+
+### RingWriter (Memory Feeds: persist=False)
+
+Write records to shared memory ring buffers (40-50µs per write).
+
+**Same API as Writer** - all methods identical:
+- `write_values(*values)`
+- `write_tuple(record: tuple)`  
+- `write_dict(record: dict)`
+- `close()`
+
+Performance: 10-20µs faster than disk writer due to no fsync.
+
+---
+
+### Reader (Disk Feeds: persist=True)
+
+Read records from disk-backed feeds.
+
+```python
+reader = p.create_reader('trades')
+```
+
+#### Methods
+
+**`stream(start: Optional[int] = None, format: str = 'tuple') -> Iterator`**
+
+Stream records (infinite iterator, live updates).
+
+```python
+# Live only (70µs latency, skips history)
+for trade in reader.stream():  # start=None
+    price, size, ts = trade
+    
+# Historical + live (920K rec/sec historical, then 70µs live)
+for trade in reader.stream(start=1738368000000000):
+    process(trade)
+    
+# Dict format
+for trade in reader.stream(format='dict'):
+    print(f"Price: {trade['price']}")
+```
+
+**Formats**: `'tuple'` (default, fast), `'dict'` (readable), `'numpy'` (batch), `'raw'` (memoryview)
+
+**`range(start: int, end: int, format: str = 'tuple') -> List`**
+
+Read historical time range (finite, 920K rec/sec).
+
+```python
+# Get specific time window
+records = reader.range(start_us, end_us)
+print(f'{len(records)} records')
+
+# Numpy for analysis
+data = reader.range(start_us, end_us, format='numpy')
+avg_price = data['price'].mean()
+```
+
+**`latest(seconds: float = 60.0, format: str = 'tuple') -> List`**
+
+Get recent records (rolling time window).
+
+```python
+# Last minute
+recent = reader.latest(60)
+
+# Last hour as numpy
+data = reader.latest(3600, format='numpy')
+volume = data['size'].sum()
+```
+
+**`field_names -> tuple`**
+
+Get field names in order.
+
+```python
+names = reader.field_names  # ('price', 'size', 'timestamp_us')
+```
+
+**`format -> str`**
+
+Get struct format string.
+
+```python
+fmt = reader.format  # '<ddQ'
+```
+
+**`close() -> None`**
+
+Close reader and free resources.
+
+```python
+reader.close()
+```
+
+---
+
+### RingReader (Memory Feeds: persist=False)
+
+Read records from shared memory ring buffers.
+
+**Same API as Reader** - all methods identical:
+- `stream(start, format)` - Live streaming (start must be None)
+- `range(start, end, format)` - Time queries on current buffer
+- `latest(seconds, format)` - Recent data from buffer
+- `field_names` - Field metadata
+- `format` - Format string
+- `close()` - Close reader
+
+**Differences from Reader**:
+- **`stream()`**: Must use `start=None` (no historical replay)
+- **`range()`**: Only searches data currently in ring buffer (limited depth)
+- **`latest()`**: Limited by buffer size (typically seconds to minutes)
+- **Performance**: 40-70µs P50 IPC latency (vs 70µs for disk)
+
+---
+
+## Field Types
+
+Supported field types for feed schemas:
+
+| Type | Bytes | Description | Range |
+|------|-------|-------------|-------|
+| `char` | 1 | Single character | ASCII char |
+| `uint8` | 1 | Unsigned integer | 0 to 255 |
+| `uint16` | 2 | Unsigned integer | 0 to 65,535 |
+| `uint32` | 4 | Unsigned integer | 0 to 4.3B |
+| `uint64` | 8 | Unsigned integer | 0 to 18.4E |
+| `int8` | 1 | Signed integer | -128 to 127 |
+| `int16` | 2 | Signed integer | -32K to 32K |
+| `int32` | 4 | Signed integer | -2.1B to 2.1B |
+| `int64` | 8 | Signed integer | -9.2E to 9.2E |
+| `float32` | 4 | Floating point | ±3.4E38 (7 digits) |
+| `float64` | 8 | Floating point | ±1.8E308 (15 digits) |
+| `_N` | N | Padding bytes | e.g., `_8` = 8 bytes |
+
+**Example schema**:
+```python
+'fields': [
+    {'name': 'type', 'type': 'char'},           # 1 byte
+    {'name': 'side', 'type': 'char'},           # 1 byte
+    {'name': '_', 'type': '_6'},                # 6 byte padding (alignment)
+    {'name': 'timestamp_us', 'type': 'uint64'}, # 8 bytes
+    {'name': 'price', 'type': 'float64'},       # 8 bytes
+    {'name': 'qty', 'type': 'float64'},         # 8 bytes
+    {'name': '_', 'type': '_8'},                # 8 byte padding (64-byte align)
+]
+# Total: 40 bytes (padded to 64 for cache line alignment)
+```
+
+---
+
 ## API Reference
 
 ### Platform
 ```python
 Platform(base_path: str)
     .create_feed(spec: dict) -> None
-    .create_writer(feed_name: str) -> Writer
-    .create_reader(feed_name: str) -> Reader
-    .list_feeds() -> List[str]
-    .get_feed_info(feed_name: str) -> dict
+    .create_writer(feed_name: str) -> Writer | RingWriter
+    .create_reader(feed_name: str) -> Reader | RingReader
+    .list_feeds() -> List[dict]
+    .lifecycle(feed_name: str) -> dict
+    .get_record_format(feed_name: str) -> dict
     .close() -> None
 ```
 
-### Writer
+### Writer / RingWriter
 ```python
-Writer
-    .write_values(*values, create_index: bool = False) -> None
+Writer | RingWriter
+    .write_values(*values) -> None
+    .write_tuple(record: tuple) -> None
+    .write_dict(record: dict) -> None
     .close() -> None
 ```
 
-### Reader
+### Reader / RingReader
 ```python
-Reader
-    .read(start_us: int = None, end_us: int = None) -> Iterator[dict]
+Reader | RingReader
+    .stream(start: Optional[int] = None, format: str = 'tuple') -> Iterator
+    .range(start: int, end: int, format: str = 'tuple') -> List
+    .latest(seconds: float = 60.0, format: str = 'tuple') -> List
+    .field_names -> tuple
+    .format -> str
     .close() -> None
 ```
-
-### Field Types
-- `char`: 1 byte character
-- `uint8`, `uint16`, `uint32`, `uint64`: Unsigned integers
-- `int8`, `int16`, `int32`, `int64`: Signed integers
-- `float32`, `float64`: Floating point
-- `_N`: Padding (e.g., `_8` = 8 bytes padding)
 
 ---
 
