@@ -302,7 +302,20 @@ class Platform:
         if not self.registry.feed_exists(name):
             self.registry.register_feed(name, lifecycle)
         else:
-            self.registry.update_metadata(name, **lifecycle)
+            # Feed exists - prevent dangerous updates to immutable fields
+            existing = self.registry.get_metadata(name)
+            if existing["persist"] != lifecycle["persist"]:
+                raise RuntimeError(
+                    f"Cannot change persist flag for existing feed '{name}': "
+                    f"existing={existing['persist']}, new={lifecycle['persist']}. "
+                    f"Use a different feed name for different persistence modes."
+                )
+            # Only allow updates to mutable lifecycle fields (retention, chunk size)
+            safe_updates = {
+                "chunk_size_bytes": lifecycle["chunk_size_bytes"],
+                "retention_hours": lifecycle["retention_hours"],
+            }
+            self.registry.update_metadata(name, **safe_updates)
 
         # 4) keep full app spec for ops/debug (optional)
         (fdir / "config.json").write_bytes(orjson.dumps(spec))
