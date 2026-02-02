@@ -25,12 +25,6 @@ class Platform:
     Entry point for creating feeds, writing data, and reading time-series records.
     Manages persistent disk storage, memory-mapped chunks, and feed lifecycle.
     
-    Performance:
-        - 60µs write latency (cross-process)
-        - 70µs read latency (live streaming)
-        - 920K records/sec historical replay
-        - Zero-copy: Memory-mapped files, no serialization
-    
     Args:
         base_path: Root directory for all data and metadata (default: "./platform_data")
     

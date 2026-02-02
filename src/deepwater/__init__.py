@@ -56,5 +56,13 @@ __version__ = "0.0.1"
 from .platform import Platform
 from .writer import Writer
 from .reader import Reader
+from .ring import RingWriter, RingReader
 
-__all__ = ["Platform", "Writer", "Reader", "__version__"]
+__all__ = [
+    "Platform",
+    "Writer", 
+    "Reader",
+    "RingWriter",
+    "RingReader",
+    "__version__",
+]
