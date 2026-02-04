@@ -114,6 +114,11 @@ for trade in reader.stream():  # start=None = live only
     price, size, timestamp = trade
     if price > 100:
         execute_order()
+
+# Non-blocking: read available records (perfect for event loops)
+records = reader.read_available(max_records=10)  # Returns immediately
+for trade in records:
+    process(trade)
 ```
 
 ### Backtesting (920K rec/sec)
@@ -128,6 +133,25 @@ data = reader.range(start_us, end_us, format='numpy')
 avg_price = data['price'].mean()
 volume = data['size'].sum()
 print(f'Price: {avg_price:.2f}, Volume: {volume:.0f}')
+```
+
+### Event Loop Pattern (Non-Blocking)
+
+```python
+# Perfect for background tasks, async code, multi-strategy systems
+reader = p.create_reader('trades')
+
+while True:
+    # Read up to 10 records, returns immediately (no blocking)
+    records = reader.read_available(max_records=10)
+    
+    for trade in records:
+        price, size, timestamp = trade
+        process(trade)
+    
+    # Do other work without 6-8ms delays
+    run_background_tasks()
+    time.sleep(0.001)  # Control loop frequency
 ```
 
 ### Multi-Process (Writer + Reader)

@@ -99,7 +99,7 @@ class Reader:
     __slots__ = ('platform', 'feed_name', 'feed_config', 'record_format', 
                  'data_dir', 'registry', '_chunk', '_chunk_meta', '_chunk_id',
                  '_unpack', '_rec_size', '_index_enabled', '_ts_offset', 
-                 '_ts_byteorder', '_field_names', '_dtype')
+                 '_ts_byteorder', '_field_names', '_dtype', '_read_head')
 
     def __init__(self, platform, feed_name: str):
         self.platform = platform
@@ -129,6 +129,9 @@ class Reader:
         
         # Lazy-load numpy dtype
         self._dtype = None
+        
+        # Read head for non-blocking reads (read_available)
+        self._read_head: Optional[int] = None
 
     # ================================================================ METADATA
     
@@ -689,6 +692,102 @@ class Reader:
         now_us = self._get_current_timestamp_us()
         start_us = now_us - int(seconds * 1_000_000)
         return self.range(start_us, now_us, format=format)
+
+    def read_available(self, max_records: Optional[int] = None, format: str = 'tuple') -> List:
+        """
+        Read available records without blocking (returns immediately).
+        
+        Performance:
+            - Returns instantly (no spin-wait, no blocking)
+            - Best for event loops, background tasks, async patterns
+            - Maintains read position between calls
+        
+        Args:
+            max_records: Maximum records to return (None = all available)
+            format: 'tuple' (default), 'dict', 'numpy', or 'raw'
+        
+        Returns:
+            List of available records (empty list if no new data)
+        
+        Behavior:
+            - First call: Initializes read head to current write position
+            - Subsequent calls: Returns new records since last call
+            - Never blocks - returns empty list if no new data
+            - Perfect for "consume up to N per cycle" patterns
+        
+        Example:
+            # Event loop pattern (no blocking!)
+            >>> reader = platform.create_reader('trades')
+            >>> while True:
+            ...     # Read up to 10 records, returns immediately
+            ...     records = reader.read_available(max_records=10)
+            ...     for rec in records:
+            ...         price, size, ts = rec
+            ...         process(rec)
+            ...     
+            ...     # Do other work without blocking
+            ...     do_background_tasks()
+            ...     time.sleep(0.001)  # Control loop frequency
+            
+            # Async pattern
+            >>> async def consume():
+            ...     while True:
+            ...         records = reader.read_available(max_records=100)
+            ...         if records:
+            ...             await process_batch(records)
+            ...         await asyncio.sleep(0.001)
+            
+            # Dictionary format
+            >>> records = reader.read_available(max_records=5, format='dict')
+            >>> for rec in records:
+            ...     print(f"Price: {rec['price']}, Size: {rec['size']}")
+        
+        Notes:
+            - Non-blocking: Perfect for event loops, async code
+            - Stateful: Maintains position between calls (use separate readers per consumer)
+            - Use stream() if you want blocking/spin-wait behavior
+            - Returns empty list if no data (check length before processing)
+        """
+        # Initialize read head on first call
+        if self._read_head is None:
+            self._ensure_latest_chunk()
+            self._read_head = self._chunk_meta.write_pos
+        
+        # Ensure we're on the latest chunk
+        if self._chunk_meta is None:
+            self._ensure_latest_chunk()
+            self._read_head = self._chunk_meta.write_pos
+        
+        # Check for chunk rotation
+        latest_chunk_id = self.registry.get_latest_chunk_idx()
+        if self._chunk_id < latest_chunk_id:
+            # Move to newer chunk
+            self._open_chunk(latest_chunk_id)
+            self._read_head = 0
+        
+        # Read available records (non-blocking)
+        result = []
+        buf = self._chunk.buffer
+        write_pos = self._chunk_meta.write_pos
+        rec_size = self._rec_size
+        
+        while self._read_head + rec_size <= write_pos:
+            if format == 'tuple':
+                result.append(self._unpack(buf, self._read_head))
+            elif format == 'dict':
+                rec = self._unpack(buf, self._read_head)
+                result.append({self._field_names[i]: rec[i] for i in range(len(self._field_names))})
+            elif format == 'raw':
+                result.append(buf[self._read_head:self._read_head + rec_size])
+            else:
+                raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', or 'raw'")
+            
+            self._read_head += rec_size
+            
+            if max_records and len(result) >= max_records:
+                break
+        
+        return result
 
     # ================================================================ LEGACY API (for backward compatibility)
     
