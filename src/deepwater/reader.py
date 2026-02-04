@@ -352,24 +352,20 @@ class Reader:
         else:
             # Live streaming from current write head
             self._ensure_latest_chunk()
-            # Start from current write position (will be refreshed in loop)
-            # Don't use cached write_pos, it may be stale
-            read_head = 0  # Will be set to write_pos in first loop iteration
+            # Initialize read_head to current write position immediately
+            # Don't defer this - it causes iteration through entire chunk!
+            read_head = self._chunk_meta.write_pos
         
         # Continue with live polling
         
         while True:
             if self._chunk_meta is None:
                 self._ensure_latest_chunk()
-                read_head = 0
+                read_head = self._chunk_meta.write_pos
             
             # Refresh write position on each iteration
             buf = self._chunk.buffer
             write_pos = self._chunk_meta.write_pos
-            
-            # First iteration: jump to current write position for live streaming
-            if read_head == 0:
-                read_head = write_pos
             
             # Read new records
             while read_head + rec_size <= write_pos:
