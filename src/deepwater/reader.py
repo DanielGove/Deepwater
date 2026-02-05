@@ -98,7 +98,7 @@ class Reader:
     """
     __slots__ = ('platform', 'feed_name', 'feed_config', 'record_format', 
                  'data_dir', 'registry', '_chunk', '_chunk_meta', '_chunk_id',
-                 '_unpack', '_rec_size', '_index_enabled', '_ts_offset', 
+                 '_unpack', '_rec_size', '_index_available', '_ts_offset', 
                  '_ts_byteorder', '_field_names', '_dtype', '_read_head')
 
     def __init__(self, platform, feed_name: str):
@@ -118,7 +118,7 @@ class Reader:
         # Hot path optimizations - pre-cache everything
         self._unpack = struct.Struct(self.record_format["fmt"]).unpack_from
         self._rec_size = self.record_format["record_size"]
-        self._index_enabled = bool(self.feed_config.get("index_playback"))
+        self._index_available = bool(self.feed_config.get("index_playback"))
         self._ts_offset = self.record_format.get("ts_offset") or self.record_format.get("ts", {}).get("offset")
         self._ts_byteorder = "little" if self.record_format.get("ts_endian", "<") == "<" else "big"
         
@@ -273,8 +273,14 @@ class Reader:
 
     # ================================================================ TUPLE FORMAT
 
-    def _range_tuples(self, start_us: int, end_us: Optional[int]) -> List[tuple]:
+    def _range_tuples(self, start_us: int, end_us: Optional[int], playback: bool = False) -> List[tuple]:
         """Read range as list of tuples (FAST)"""
+        # If caller requests playback and index is available, start from latest snapshot before start_us
+        if playback and self._index_available:
+            snapshot_ts = self._get_snapshot_before(start_us)
+            if snapshot_ts is not None and snapshot_ts < start_us:
+                start_us = snapshot_ts
+        
         result = []
         
         for chunk_id in self._iter_chunks_in_range(start_us, end_us):
@@ -398,11 +404,11 @@ class Reader:
 
     # ================================================================ DICT FORMAT
 
-    def _range_dicts(self, start_us: int, end_us: Optional[int]) -> List[dict]:
+    def _range_dicts(self, start_us: int, end_us: Optional[int], playback: bool = False) -> List[dict]:
         """Read range as list of dicts (readable, slower)"""
         names = self._field_names
         # Dict comprehension faster than zip - use len(rec) not len(names) due to unpacking
-        return [{names[i]: rec[i] for i in range(len(names))} for rec in self._range_tuples(start_us, end_us)]
+        return [{names[i]: rec[i] for i in range(len(names))} for rec in self._range_tuples(start_us, end_us, playback=playback)]
 
     def _stream_dicts(self, start_us: Optional[int]) -> Iterator[dict]:
         """Stream dicts"""
@@ -413,9 +419,15 @@ class Reader:
 
     # ================================================================ NUMPY FORMAT
 
-    def _range_numpy(self, start_us: int, end_us: Optional[int]):
+    def _range_numpy(self, start_us: int, end_us: Optional[int], playback: bool = False):
         """Read range as single numpy structured array"""
         import numpy as np
+        
+        # If caller requests playback and index is available, start from latest snapshot before start_us
+        if playback and self._index_available:
+            snapshot_ts = self._get_snapshot_before(start_us)
+            if snapshot_ts is not None and snapshot_ts < start_us:
+                start_us = snapshot_ts
         
         # Collect all matching data as contiguous blocks
         blocks = []
@@ -463,8 +475,14 @@ class Reader:
 
     # ================================================================ RAW FORMAT
 
-    def _range_raw(self, start_us: int, end_us: Optional[int]) -> memoryview:
+    def _range_raw(self, start_us: int, end_us: Optional[int], playback: bool = False) -> memoryview:
         """Read range as single contiguous memoryview (zero-copy if single chunk)"""
+        # If caller requests playback and index is available, start from latest snapshot before start_us
+        if playback and self._index_available:
+            snapshot_ts = self._get_snapshot_before(start_us)
+            if snapshot_ts is not None and snapshot_ts < start_us:
+                start_us = snapshot_ts
+        
         blocks = []
         rec_size = self._rec_size
         ts_off = self._ts_offset
@@ -605,7 +623,7 @@ class Reader:
         else:
             raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
 
-    def range(self, start: int, end: int, format: str = 'tuple') -> Union[List, memoryview]:
+    def range(self, start: int, end: int, format: str = 'tuple', playback: bool = False) -> Union[List, memoryview]:
         """
         Read historical time range (finite block).
         
@@ -618,6 +636,7 @@ class Reader:
             start: Start timestamp in microseconds (inclusive)
             end: End timestamp in microseconds (exclusive)
             format: 'tuple' (default, fast), 'dict' (readable), 'numpy' (vectorized), 'raw' (memoryview)
+            playback: For indexed feeds (L2), start from latest snapshot before start (default False)
         
         Returns:
             List of records (or numpy array if format='numpy', or memoryview if format='raw')
@@ -628,6 +647,10 @@ class Reader:
             >>> hour_ago = now_us - 3600_000_000
             >>> trades = reader.range(hour_ago, now_us)
             >>> print(f'Last hour: {len(trades)} trades')
+            
+            # L2 orderbook with playback from snapshot (consistent state)
+            >>> data = reader.range(start, end, playback=True)
+            >>> # Starts from snapshot before start, includes all deltas
             
             # Vectorized analysis with numpy
             >>> data = reader.range(start, end, format='numpy')
@@ -644,15 +667,16 @@ class Reader:
             - All data returned at once (not lazy)
             - Memory usage: num_records * record_size
             - Use latest(seconds) for convenience
+            - playback=True only works if feed has index_playback enabled
         """
         if format == 'tuple':
-            return self._range_tuples(start, end)
+            return self._range_tuples(start, end, playback=playback)
         elif format == 'dict':
-            return self._range_dicts(start, end)
+            return self._range_dicts(start, end, playback=playback)
         elif format == 'numpy':
-            return self._range_numpy(start, end)
+            return self._range_numpy(start, end, playback=playback)
         elif format == 'raw':
-            return self._range_raw(start, end)
+            return self._range_raw(start, end, playback=playback)
         else:
             raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
 
@@ -836,9 +860,109 @@ class Reader:
         return []
     
     def stream_live(self, playback: bool = False) -> Iterator[tuple]:
-        """Legacy: use stream() instead"""
-        start = 0 if playback else None
+        """
+        Legacy: use stream() instead.
+        
+        For feeds with index_playback enabled (L2 orderbooks):
+            playback=True → Start from latest snapshot marker in index
+            playback=False → Live tail only (skip history)
+        
+        For feeds without index_playback:
+            playback=True → Read from beginning (start=0)
+            playback=False → Live tail only
+        """
+        if playback and self._index_available:
+            # For indexed feeds (L2): Start from latest snapshot
+            start = self._get_latest_snapshot_timestamp()
+        elif playback:
+            # For non-indexed feeds: Start from beginning
+            start = 0
+        else:
+            # Live tail only
+            start = None
+        
         return self.stream(start=start, format='tuple')
+    
+    def _get_latest_snapshot_timestamp(self) -> int:
+        """Get timestamp of latest snapshot from index (for playback)"""
+        if not self._index_available:
+            return 0
+        
+        # Find the latest chunk with an index
+        latest_chunk_id = self.registry.get_latest_chunk_idx()
+        if latest_chunk_id is None:
+            return 0
+        
+        # Search backward from latest chunk to find one with index entries
+        for chunk_id in range(latest_chunk_id, -1, -1):
+            idx_path = self.data_dir / f"chunk_{chunk_id:08d}.idx"
+            if not idx_path.exists():
+                continue
+            
+            try:
+                from .index import ChunkIndex
+                idx = ChunkIndex.open_file(str(idx_path))
+                latest_index = idx.get_latest_index()
+                
+                if latest_index is not None:
+                    timestamp = latest_index.timestamp
+                    latest_index.release()
+                    idx.close_file()
+                    return timestamp
+                
+                idx.close_file()
+            except Exception:
+                continue
+        
+        # No index found, start from beginning
+        return 0
+    
+    def _get_snapshot_before(self, target_us: int) -> Optional[int]:
+        """Get timestamp of latest snapshot at or before target_us (for range queries)"""
+        if not self._index_available:
+            return None
+        
+        # Find chunks that could contain snapshots before target_us
+        latest_chunk_id = self.registry.get_latest_chunk_idx()
+        if latest_chunk_id is None:
+            return None
+        
+        # Search backward from latest chunk to find snapshot before target
+        best_snapshot_ts = None
+        
+        for chunk_id in range(latest_chunk_id, -1, -1):
+            idx_path = self.data_dir / f"chunk_{chunk_id:08d}.idx"
+            if not idx_path.exists():
+                continue
+            
+            try:
+                from .index import ChunkIndex
+                idx = ChunkIndex.open_file(str(idx_path))
+                
+                # Search for latest index entry before target_us
+                for i in range(idx.count - 1, -1, -1):
+                    index_rec = idx.get_index(i)
+                    ts = index_rec.timestamp
+                    index_rec.release()
+                    
+                    if ts <= target_us:
+                        # Found a snapshot at or before target
+                        if best_snapshot_ts is None or ts > best_snapshot_ts:
+                            best_snapshot_ts = ts
+                        idx.close_file()
+                        break
+                else:
+                    idx.close_file()
+                    continue
+                
+                # If we found a snapshot, we can stop searching
+                if best_snapshot_ts is not None:
+                    break
+                    
+            except Exception:
+                continue
+        
+        return best_snapshot_ts
     
     def as_dict(self, record: tuple) -> dict:
         """Legacy: convert tuple to dict"""

@@ -185,6 +185,10 @@ class Writer:
             meta.release()
 
     def write(self, timestamp: int, record_data: Union[bytes, np.ndarray], create_index: bool = False) -> int:
+        # Guard against write after close
+        if self.current_chunk is None:
+            return 0  # Silently ignore writes after close
+        
         if isinstance(record_data, np.ndarray):
             record_data = record_data.tobytes()
 
@@ -239,6 +243,10 @@ class Writer:
             >>> writer.write_values(123.45, 100.0, 1738368000000000)
             >>> writer.write_values(124.50, 50.0, 1738368001000000, create_index=True)
         """
+        # Guard against write after close
+        if self.current_chunk is None:
+            return 0  # Silently ignore writes after close
+        
         # hot locals
         meta = self.current_chunk_metadata
         buf = self.current_chunk.buffer
@@ -312,6 +320,10 @@ class Writer:
 
     def write_batch_bytes(self, data: bytes, create_index: bool = False) -> int:
         """Write a blob of packed records (len must be multiple of record_size) and update metadata once."""
+        # Guard against write after close
+        if self.current_chunk is None:
+            return 0  # Silently ignore writes after close
+        
         rec_size = self._rec_size
         n = len(data)
         if n == 0 or n % rec_size != 0:
