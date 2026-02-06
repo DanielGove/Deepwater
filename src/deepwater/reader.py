@@ -1,6 +1,6 @@
 import time
 import struct
-from typing import Optional, Iterator, Union, List
+from typing import Optional, Iterator, Union, List, Tuple
 
 from .chunk import Chunk
 from .index import ChunkIndex
@@ -99,7 +99,7 @@ class Reader:
     __slots__ = ('platform', 'feed_name', 'feed_config', 'record_format', 
                  'data_dir', 'registry', '_chunk', '_chunk_meta', '_chunk_id',
                  '_unpack', '_rec_size', '_index_available', '_ts_offset', 
-                 '_ts_byteorder', '_field_names', '_dtype', '_read_head')
+                 '_ts_byteorder', '_field_names', '_dtype', '_read_head', '_query_keys')
 
     def __init__(self, platform, feed_name: str):
         self.platform = platform
@@ -121,6 +121,15 @@ class Reader:
         self._index_available = bool(self.feed_config.get("index_playback"))
         self._ts_offset = self.record_format.get("ts_offset") or self.record_format.get("ts", {}).get("offset")
         self._ts_byteorder = "little" if self.record_format.get("ts_endian", "<") == "<" else "big"
+        
+        # Query keys: primary ts_col + any additional query_cols
+        # Format: {col_name: {offset: int, size: 8}}
+        self._query_keys = self.record_format.get("query_keys", {})
+        # Add primary timestamp to query_keys for unified access
+        if self._ts_offset is not None:
+            ts_name = self.record_format.get("ts_name")
+            if ts_name and ts_name not in self._query_keys:
+                self._query_keys[ts_name] = {"offset": self._ts_offset, "size": 8}
         
         # Filter field_names to exclude padding fields (marked with _N in type like _6, _8)
         # These fields are skipped by struct.unpack due to 'x' in format string
@@ -172,6 +181,20 @@ class Reader:
         return self._rec_size
 
     # ================================================================ INTERNAL
+
+    def _resolve_ts_key(self, ts_key: Optional[str]) -> Tuple[int, str]:
+        """Resolve ts_key to (offset, byteorder). Returns primary if ts_key is None."""
+        if ts_key is None:
+            if self._ts_offset is None:
+                raise RuntimeError("Feed missing ts_offset for time queries")
+            return self._ts_offset, self._ts_byteorder
+        
+        if ts_key not in self._query_keys:
+            available = list(self._query_keys.keys())
+            raise ValueError(f"ts_key '{ts_key}' not configured as queryable. Available: {available}")
+        
+        key_info = self._query_keys[ts_key]
+        return key_info["offset"], self._ts_byteorder
 
     def _close_chunk(self) -> None:
         if self._chunk is not None:
@@ -235,8 +258,13 @@ class Reader:
                 continue
             yield chunk_id
 
-    def _binary_search_start(self, start_us: int) -> int:
+    def _binary_search_start(self, start_us: int, ts_offset: Optional[int] = None, ts_byteorder: Optional[str] = None) -> int:
         """Binary search for start position in current chunk (assumes sorted!)"""
+        if ts_offset is None:
+            ts_offset = self._ts_offset
+        if ts_byteorder is None:
+            ts_byteorder = self._ts_byteorder
+        
         # Use Cython fast path if available (1.5x faster)
         if HAVE_FAST:
             return binary_search_fast(
@@ -244,17 +272,17 @@ class Reader:
                 start_us,
                 self._chunk_meta.write_pos,
                 self._rec_size,
-                self._ts_offset
+                ts_offset
             )
         
         # Pure Python fallback
         buf = self._chunk.buffer
         write_pos = self._chunk_meta.write_pos
         rec_size = self._rec_size
-        ts_off = self._ts_offset
+        ts_off = ts_offset
         ts_end = ts_off + 8
         from_bytes = int.from_bytes
-        byteorder = self._ts_byteorder
+        byteorder = ts_byteorder
         
         left = 0
         right = write_pos // rec_size
@@ -273,8 +301,11 @@ class Reader:
 
     # ================================================================ TUPLE FORMAT
 
-    def _range_tuples(self, start_us: int, end_us: Optional[int], playback: bool = False) -> List[tuple]:
+    def _range_tuples(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_key: Optional[str] = None) -> List[tuple]:
         """Read range as list of tuples (FAST)"""
+        # Resolve which timestamp column to query on
+        ts_offset, ts_byteorder = self._resolve_ts_key(ts_key)
+        
         # If caller requests playback and index is available, start from latest snapshot before start_us
         if playback and self._index_available:
             snapshot_ts = self._get_snapshot_before(start_us)
@@ -288,7 +319,7 @@ class Reader:
             write_pos = self._chunk_meta.write_pos
             
             # Binary search for start
-            pos = self._binary_search_start(start_us)
+            pos = self._binary_search_start(start_us, ts_offset, ts_byteorder)
             
             # Use Cython fast path for inner loop if available
             if HAVE_FAST:
@@ -299,7 +330,7 @@ class Reader:
                     start_us,
                     end_us or 0,  # 0 means no end limit
                     self._rec_size,
-                    self._ts_offset,
+                    ts_offset,
                     self._unpack
                 )
                 result.extend(chunk_results)
@@ -307,10 +338,10 @@ class Reader:
                 # Pure Python fallback
                 unpack = self._unpack
                 rec_size = self._rec_size
-                ts_off = self._ts_offset
+                ts_off = ts_offset
                 ts_end = ts_off + 8
                 from_bytes = int.from_bytes
-                byteorder = self._ts_byteorder
+                byteorder = ts_byteorder
                 
                 # Optimized tight loop
                 while pos + rec_size <= write_pos:
@@ -325,14 +356,16 @@ class Reader:
         
         return result
 
-    def _stream_tuples(self, start_us: Optional[int]) -> Iterator[tuple]:
+    def _stream_tuples(self, start_us: Optional[int], ts_key: Optional[str] = None) -> Iterator[tuple]:
         """Stream tuples (historical replay → live)"""
         unpack = self._unpack
         rec_size = self._rec_size
         
         # Historical replay if start_us provided
         if start_us is not None:
-            if self._ts_offset is None:
+            # Resolve which timestamp column to query on
+            ts_offset, ts_byteorder = self._resolve_ts_key(ts_key)
+            if ts_offset is None:
                 raise RuntimeError("Feed missing ts_offset for time-based streaming")
             
             # Get latest chunk ID to know when to stop historical replay
@@ -341,7 +374,7 @@ class Reader:
             for chunk_id in self._iter_chunks_in_range(start_us, None):
                 buf = self._chunk.buffer
                 write_pos = self._chunk_meta.write_pos
-                pos = self._binary_search_start(start_us)
+                pos = self._binary_search_start(start_us, ts_offset, ts_byteorder)
                 
                 while pos + rec_size <= write_pos:
                     yield unpack(buf, pos)
@@ -404,24 +437,27 @@ class Reader:
 
     # ================================================================ DICT FORMAT
 
-    def _range_dicts(self, start_us: int, end_us: Optional[int], playback: bool = False) -> List[dict]:
+    def _range_dicts(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_key: Optional[str] = None) -> List[dict]:
         """Read range as list of dicts (readable, slower)"""
         names = self._field_names
         # Dict comprehension faster than zip - use len(rec) not len(names) due to unpacking
-        return [{names[i]: rec[i] for i in range(len(names))} for rec in self._range_tuples(start_us, end_us, playback=playback)]
+        return [{names[i]: rec[i] for i in range(len(names))} for rec in self._range_tuples(start_us, end_us, playback=playback, ts_key=ts_key)]
 
-    def _stream_dicts(self, start_us: Optional[int]) -> Iterator[dict]:
+    def _stream_dicts(self, start_us: Optional[int], ts_key: Optional[str] = None) -> Iterator[dict]:
         """Stream dicts"""
         names = self._field_names
         # Dict comprehension faster than zip
-        for rec in self._stream_tuples(start_us):
+        for rec in self._stream_tuples(start_us, ts_key=ts_key):
             yield {names[i]: rec[i] for i in range(len(names))}
 
     # ================================================================ NUMPY FORMAT
 
-    def _range_numpy(self, start_us: int, end_us: Optional[int], playback: bool = False):
+    def _range_numpy(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_key: Optional[str] = None):
         """Read range as single numpy structured array"""
         import numpy as np
+        
+        # Resolve which timestamp column to query on
+        ts_offset, ts_byteorder = self._resolve_ts_key(ts_key)
         
         # If caller requests playback and index is available, start from latest snapshot before start_us
         if playback and self._index_available:
@@ -432,15 +468,15 @@ class Reader:
         # Collect all matching data as contiguous blocks
         blocks = []
         rec_size = self._rec_size
-        ts_off = self._ts_offset
+        ts_off = ts_offset
         ts_end = ts_off + 8
         from_bytes = int.from_bytes
-        byteorder = self._ts_byteorder
+        byteorder = ts_byteorder
         
         for chunk_id in self._iter_chunks_in_range(start_us, end_us):
             buf = self._chunk.buffer
             write_pos = self._chunk_meta.write_pos
-            pos = self._binary_search_start(start_us)
+            pos = self._binary_search_start(start_us, ts_offset, ts_byteorder)
             
             # Find end position
             end_pos = pos
@@ -464,19 +500,22 @@ class Reader:
         combined = b''.join(blocks)
         return np.frombuffer(combined, dtype=self.dtype)
 
-    def _stream_numpy(self, start_us: Optional[int]) -> Iterator:
+    def _stream_numpy(self, start_us: Optional[int], ts_key: Optional[str] = None) -> Iterator:
         """Stream numpy arrays (yields array per chunk)"""
         import numpy as np
         
-        for rec in self._stream_tuples(start_us):
+        for rec in self._stream_tuples(start_us, ts_key=ts_key):
             # For streaming, yield individual records as 1-element arrays
             arr = np.array([rec], dtype=self.dtype)
             yield arr[0]
 
     # ================================================================ RAW FORMAT
 
-    def _range_raw(self, start_us: int, end_us: Optional[int], playback: bool = False) -> memoryview:
+    def _range_raw(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_key: Optional[str] = None) -> memoryview:
         """Read range as single contiguous memoryview (zero-copy if single chunk)"""
+        # Resolve which timestamp column to query on
+        ts_offset, ts_byteorder = self._resolve_ts_key(ts_key)
+        
         # If caller requests playback and index is available, start from latest snapshot before start_us
         if playback and self._index_available:
             snapshot_ts = self._get_snapshot_before(start_us)
@@ -485,15 +524,15 @@ class Reader:
         
         blocks = []
         rec_size = self._rec_size
-        ts_off = self._ts_offset
+        ts_off = ts_offset
         ts_end = ts_off + 8
         from_bytes = int.from_bytes
-        byteorder = self._ts_byteorder
+        byteorder = ts_byteorder
         
         for chunk_id in self._iter_chunks_in_range(start_us, end_us):
             buf = self._chunk.buffer
             write_pos = self._chunk_meta.write_pos
-            pos = self._binary_search_start(start_us)
+            pos = self._binary_search_start(start_us, ts_offset, ts_byteorder)
             
             # Find end position
             end_pos = pos
@@ -517,16 +556,18 @@ class Reader:
             return memoryview(blocks[0])
         return memoryview(b''.join(blocks))
 
-    def _stream_raw(self, start_us: Optional[int]) -> Iterator[memoryview]:
+    def _stream_raw(self, start_us: Optional[int], ts_key: Optional[str] = None) -> Iterator[memoryview]:
         """Stream raw memoryview slices (64 bytes each)"""
         rec_size = self._rec_size
         
         # Historical replay
         if start_us is not None:
+            # Resolve ts_offset if ts_key provided
+            ts_offset, ts_byteorder = self._resolve_ts_key(ts_key) if ts_key else (self._ts_offset, self._ts_byteorder)
             for chunk_id in self._iter_chunks_in_range(start_us, None):
                 buf = self._chunk.buffer
                 write_pos = self._chunk_meta.write_pos
-                pos = self._binary_search_start(start_us)
+                pos = self._binary_search_start(start_us, ts_offset, ts_byteorder)
                 
                 while pos + rec_size <= write_pos:
                     yield buf[pos:pos + rec_size]
@@ -563,7 +604,7 @@ class Reader:
 
     # ================================================================ PUBLIC API
 
-    def stream(self, start: Optional[int] = None, format: str = 'tuple') -> Iterator:
+    def stream(self, start: Optional[int] = None, format: str = 'tuple', ts_key: Optional[str] = None) -> Iterator:
         """
         Stream records (infinite iterator, live updates).
         
@@ -578,6 +619,7 @@ class Reader:
                 - None: Jump to current write head (skip history, 70µs latency)
                 - timestamp_us: Stream from that point (historical + live)
             format: 'tuple' (default, fast), 'dict' (readable), 'numpy' (batch), 'raw' (memoryview)
+            ts_key: Which timestamp column to query on (None = primary ts_col, or specify 'recv_us', 'proc_us', 'ev_us', etc.)
         
         Returns:
             Iterator yielding records in specified format (never ends)
@@ -603,6 +645,10 @@ class Reader:
             >>> for trade in reader.stream(start=last_ts):
             ...     process(trade)  # Historical at 920K rec/sec, then live at 70µs
             
+            # Query by exchange event time (backtesting)
+            >>> for update in reader.stream(start=ev_time, ts_key='ev_us'):
+            ...     orderbook.apply(update)
+            
             # Dictionary format (readable)
             >>> for trade in reader.stream(format='dict'):
             ...     print(f"Price: {trade['price']}, Size: {trade['size']}")
@@ -613,17 +659,17 @@ class Reader:
             - Use range() for batch analysis (more efficient)
         """
         if format == 'tuple':
-            return self._stream_tuples(start)
+            return self._stream_tuples(start, ts_key=ts_key)
         elif format == 'dict':
-            return self._stream_dicts(start)
+            return self._stream_dicts(start, ts_key=ts_key)
         elif format == 'numpy':
-            return self._stream_numpy(start)
+            return self._stream_numpy(start, ts_key=ts_key)
         elif format == 'raw':
-            return self._stream_raw(start)
+            return self._stream_raw(start, ts_key=ts_key)
         else:
             raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
 
-    def range(self, start: int, end: int, format: str = 'tuple', playback: bool = False) -> Union[List, memoryview]:
+    def range(self, start: int, end: int, format: str = 'tuple', playback: bool = False, ts_key: Optional[str] = None) -> Union[List, memoryview]:
         """
         Read historical time range (finite block).
         
@@ -637,6 +683,7 @@ class Reader:
             end: End timestamp in microseconds (exclusive)
             format: 'tuple' (default, fast), 'dict' (readable), 'numpy' (vectorized), 'raw' (memoryview)
             playback: For indexed feeds (L2), start from latest snapshot before start (default False)
+            ts_key: Which timestamp column to query on (None = primary ts_col, or specify 'recv_us', 'proc_us', 'ev_us', etc.)
         
         Returns:
             List of records (or numpy array if format='numpy', or memoryview if format='raw')
@@ -670,17 +717,17 @@ class Reader:
             - playback=True only works if feed has index_playback enabled
         """
         if format == 'tuple':
-            return self._range_tuples(start, end, playback=playback)
+            return self._range_tuples(start, end, playback=playback, ts_key=ts_key)
         elif format == 'dict':
-            return self._range_dicts(start, end, playback=playback)
+            return self._range_dicts(start, end, playback=playback, ts_key=ts_key)
         elif format == 'numpy':
-            return self._range_numpy(start, end, playback=playback)
+            return self._range_numpy(start, end, playback=playback, ts_key=ts_key)
         elif format == 'raw':
-            return self._range_raw(start, end, playback=playback)
+            return self._range_raw(start, end, playback=playback, ts_key=ts_key)
         else:
             raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
 
-    def latest(self, seconds: float = 60.0, format: str = 'tuple') -> Union[List, memoryview]:
+    def latest(self, seconds: float = 60.0, format: str = 'tuple', ts_key: Optional[str] = None) -> Union[List, memoryview]:
         """
         Get recent records (rolling time window).
         
@@ -691,6 +738,7 @@ class Reader:
         Args:
             seconds: Duration to look back (default 60 seconds)
             format: 'tuple' (default), 'dict', 'numpy', or 'raw'
+            ts_key: Which timestamp column to query on (None = primary ts_col)
         
         Returns:
             List of records (tuple/dict), numpy array, or memoryview
@@ -715,7 +763,7 @@ class Reader:
         """
         now_us = self._get_current_timestamp_us()
         start_us = now_us - int(seconds * 1_000_000)
-        return self.range(start_us, now_us, format=format)
+        return self.range(start_us, now_us, format=format, ts_key=ts_key)
 
     def read_available(self, max_records: Optional[int] = None, format: str = 'tuple') -> List:
         """

@@ -233,7 +233,9 @@ class Platform:
                     - type (str): Field type (uint8/16/32/64, int8/16/32/64, 
                                   float32/64, char, _N for padding)
                     - desc (str, optional): Field description
-                - ts_col (str, required): Name of timestamp field for time queries
+                - ts_col (str, required): Name of primary timestamp field for time queries
+                - query_cols (list[str], optional): Additional timestamp columns for multi-key queries
+                                                    (e.g., ['recv_us', 'proc_us', 'ev_us'])
                 - chunk_size_mb (int, optional): Chunk size in MB (default: 64)
                 - retention_hours (int, optional): Data retention in hours (default: 72)
                 - persist (bool, optional): True for disk, False for SHM only (default: True)
@@ -271,7 +273,8 @@ class Platform:
         # 2) build & persist layout.json atomically (UF format)
         if "fields" not in spec or "ts_col" not in spec:
             raise ValueError("UF spec requires 'fields' and 'ts_col'")
-        layout = build_layout(spec["fields"], ts_col=spec["ts_col"])
+        query_cols = spec.get("query_cols", None)
+        layout = build_layout(spec["fields"], ts_col=spec["ts_col"], query_cols=query_cols)
         # if layout.json exists, enforce schema stability
         lpath = fdir / "layout.json"
         if lpath.exists():

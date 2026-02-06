@@ -37,6 +37,7 @@ def trades_spec(pid: str) -> dict:
             {"name":"size",       "type":"float64","desc":"trade size"},
         ],
         "ts_col": "proc_us",
+        "query_cols": ["recv_us", "proc_us", "ev_us"],  # Enable multi-key queries
         "chunk_size_bytes": 0.0625 * 1024 * 1024,
         "persist": True
     }
@@ -58,6 +59,7 @@ def l2_spec(pid: str) -> dict:
             {"name":"_",          "type":"_8",     "desc":"padding"},
         ],
         "ts_col": "proc_us",
+        "query_cols": ["recv_us", "proc_us", "ev_us"],  # Enable multi-key queries
         "chunk_size_bytes": 0.0625 * 1024 * 1024,
         "persist": True,
         "index_playback": True

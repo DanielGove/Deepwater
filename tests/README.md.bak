@@ -1,0 +1,131 @@
+# Testing Guide for Deepwater
+
+Minimal testing framework. No pytest required.
+
+## Current State
+
+**What's tested:**
+- ✅ Multi-key query feature (ts_key parameter)
+- ✅ Basic write→read cycle (smoke test)
+- ⚠️ Non-blocking read (integration test)
+
+**What's NOT tested:**
+- Chunk rollover, corruption, edge cases
+- Index binary search, concurrent access
+- Ring buffer wraparound
+- Error recovery and repair
+- Performance regressions
+
+**Strategy:** Add tests when bugs found or features added.
+
+## Running Tests
+
+```bash
+./test.sh  # Runs all test_*.py files in tests/
+```
+
+## Adding a Test
+
+**Template:**
+
+```python
+#!/usr/bin/env python3
+"""Test: Your Feature Name"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from deepwater import Platform
+
+def test_your_feature():
+    """What this test validates"""
+    # 1. Setup
+    p = Platform('./data/test-yourfeature')
+    p.create_feed({
+        'feed_name': 'test',
+        'mode': 'UF',
+        'fields': [{'name': 'value', 'type': 'uint64'}],
+        'ts_col': 'value',
+        'persist': True,
+    })
+    
+    # 2. Execute
+    writer = p.create_writer('test')
+    writer.write_values(12345)
+    writer.close()
+    
+    # 3. Verify
+    reader = p.create_reader('test')
+    data = reader.range(0, 99999)
+    assert len(data) > 0, "Expected data"
+    assert data[0][0] == 12345, f"Wrong value: {data[0][0]}"
+    
+    reader.close()
+    p.close()
+    return True
+
+def run_tests():
+    tests = [("Your Feature", test_your_feature)]
+    
+    print("Your Feature Tests")
+    print("=" * 60)
+    
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"✅ {name}")
+        except Exception as e:
+            print(f"❌ {name} - {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+
+if __name__ == '__main__':
+    run_tests()
+```
+
+**Save as:** `tests/test_yourfeature.py`
+
+**Run:** `./test.sh` (auto-discovers test_*.py)
+
+## Test Guidelines
+
+1. **Isolated**: Unique data directory per test (`./data/test-feature`)
+2. **Fast**: <5s per test
+3. **Deterministic**: No random data, no network calls
+4. **Clear errors**: Descriptive assertion messages
+5. **Cleanup**: Close writers/readers/platform
+
+## Example: See test_multikey.py
+
+```python
+# Test feature with different configs
+p.create_feed({'query_cols': ['recv_us', 'proc_us', 'ev_us']})
+
+# Test functionality
+data = reader.range(start, end, ts_key='ev_us')
+assert len(data) > 0
+
+# Test error handling
+try:
+    reader.range(start, end, ts_key='invalid_col')
+    assert False, "Should have raised ValueError"
+except ValueError:
+    pass  # Expected
+```
+
+## When to Add Tests
+
+- **New feature**: Test the feature works
+- **Bug found**: Reproduce bug, fix, verify
+- **Refactor**: Preserve existing behavior
+- **Production issue**: Prevent regression
+
+## Integration Tests (Non-Auto)
+
+Websocket/live tests in `tests/` (no test_* prefix):
+- `websocket_client.py` - Coinbase ingestion
+- `main_websocket.py` - Run live feed
+- `orderbook.py`, `trades.py` - Market data handlers
+
+Run manually when needed.

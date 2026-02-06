@@ -22,7 +22,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Tuple
 
 log = logging.getLogger("dw.health")
 

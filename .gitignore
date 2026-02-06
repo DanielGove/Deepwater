@@ -1,22 +1,44 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.swp
-*.swo
 *.egg-info/
+
+# Virtual environments
 .env
 .venv
-.vscode
-.DS_Store
-*.log
-platform_data/*
-data/*
-registry/*
+env/
+venv/
 
-# Cython build artifacts
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+deepwater.log*
+
+# Test data directories
+platform_data/
+data/test-*/
+data/coinbase-test/
+data/test-ring/
+
+# Build artifacts (Cython)
 *.c
 *.so
 *.html
 build/
 dist/
+
+# Keep data structure examples
+!data/test-ring/manifest.json
+!data/coinbase-test/manifest.json

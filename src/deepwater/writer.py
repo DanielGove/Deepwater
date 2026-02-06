@@ -32,6 +32,12 @@ class Writer:
         - Memory-mapped metadata (live visibility to readers)
         - Crash recovery (validates previous chunk on startup)
     
+    Threading:
+        ⚠️  NOT thread-safe - Writer is NOT protected by locks
+        - For multi-threaded access, use external coordination (queue with dedicated writer thread)
+        - Writes after close() will silently return 0 (defensive guard prevents crashes)
+        - Concurrent writes + close() from different threads may race (use queue pattern)
+    
     Usage Patterns:
         # High-frequency writes (trading)
         >>> writer = platform.create_writer('trades')

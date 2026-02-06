@@ -73,17 +73,20 @@ def build_layout(
     fields: List[Dict],
     *,
     ts_col: str,
+    query_cols: Optional[List[str]] = None,
     endian: str = "<",
     aligned: bool = False,
 ) -> Dict:
     """
-    Build a UF layout dict from your app config (unchanged interface).
+    Build a UF layout dict from your app config.
 
     Params:
       fields : [{'name': str, 'type': str, ...}, ...]
                types may be scalar (e.g. 'uint64','float64','char','bool',...)
                or padding like '_6'
-      ts_col : name of the uint64 timestamp column
+      ts_col : name of the primary uint64 timestamp column (for indexing, required)
+      query_cols : optional list of additional uint64 timestamp columns that can be queried
+                   (e.g. ['recv_us', 'proc_us', 'ev_us']). All must be monotonically increasing.
       endian : '<' or '>' (struct endianness)
       aligned: if True, apply C-style alignment (explicit pads inserted so dtype & struct match)
 
@@ -93,10 +96,11 @@ def build_layout(
         "fmt": "<...>",                 # struct format string
         "record_size": int,
         "fields": [{"name","type","offset","size"}, ...],
-        "ts_name": str,
+        "ts_name": str,                 # primary timestamp column
         "ts_offset": int,
         "ts_size": 8,
         "ts_endian": "<" or ">",
+        "query_keys": {"col_name": {"offset": int, "size": 8}, ...},  # queryable timestamps
         "dtype": { "names","formats","offsets","itemsize" }  # NumPy explicit-offset spec
         "version": 1
       }
@@ -112,6 +116,8 @@ def build_layout(
     off = 0
     max_align = 1
     ts_off: Optional[int] = None
+    query_keys: Dict[str, Dict[str, int]] = {}  # {col_name: {offset, size}}
+    query_cols_set = set(query_cols or [])
 
     for f in fields:
         name = f["name"]
@@ -155,6 +161,10 @@ def build_layout(
             if typ != "uint64":
                 raise ValueError("ts_col must be a uint64 field")
             ts_off = off
+        if name in query_cols_set:
+            if typ != "uint64":
+                raise ValueError(f"query_col '{name}' must be a uint64 field")
+            query_keys[name] = {"offset": off, "size": size}
         off += size
 
     # tail pad to overall alignment if requested
@@ -171,6 +181,12 @@ def build_layout(
 
     if ts_off is None:
         raise ValueError(f"ts_col '{ts_col}' not present in fields[]")
+    
+    # Validate all query_cols were found
+    if query_cols:
+        missing = query_cols_set - set(query_keys.keys())
+        if missing:
+            raise ValueError(f"query_cols not found in fields: {missing}")
 
     # Build struct fmt by walking the dtype spec (offset gaps → 'x' pads)
     parts: List[str] = []
@@ -187,7 +203,7 @@ def build_layout(
     if struct.Struct(fmt).size != itemsize:
         raise AssertionError("struct size mismatch with dtype")
 
-    return {
+    layout = {
         "mode": "UF",
         "fmt": fmt,
         "record_size": itemsize,
@@ -204,6 +220,9 @@ def build_layout(
         },
         "version": 1,
     }
+    if query_keys:
+        layout["query_keys"] = query_keys
+    return layout
 
 
 # ------------------------------ persistence ----------------------------------
