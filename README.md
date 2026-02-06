@@ -1,8 +1,6 @@
 # Deepwater
 
-**Zero-copy market data substrate.**
-
-Time-series storage for financial market data with persistent storage and full replay capability.
+Data platform for time-series storage and replay.
 
 ---
 
