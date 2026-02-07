@@ -58,14 +58,14 @@ class Platform:
         ...     'persist': True,  # Disk storage (vs memory-only)
         ... })
         >>> 
-        >>> # 3. Write data (60µs per write)
+        >>> # 3. Write data
         >>> writer = p.create_writer('trades')
         >>> ts = int(time.time() * 1e6)
         >>> writer.write_values(123.45, 100.0, ts)
         >>> writer.write_values(123.50, 200.0, ts + 1000)
         >>> writer.close()
         >>> 
-        >>> # 4. Read data (70µs latency, 920K rec/sec throughput)
+        >>> # 4. Read data
         >>> reader = p.create_reader('trades')
         >>> 
         >>> # Live stream (infinite)
@@ -123,7 +123,7 @@ class Platform:
         # Process 2: Reader (strategy execution)
         >>> p2 = Platform('./shared_data')
         >>> reader = p2.create_reader('trades')
-        >>> for trade in reader.stream():  # 70µs latency from write
+        >>> for trade in reader.stream():
         ...     # Execute trading logic
     
     Methods:

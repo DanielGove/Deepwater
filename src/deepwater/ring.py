@@ -286,11 +286,6 @@ class RingReader:
         """
         Read time range from current ring buffer contents.
         
-        Performance:
-            - Fast in-memory scan (no disk I/O)
-            - Only searches data currently in ring buffer
-            - May return partial results if data has wrapped
-        
         Args:
             start: Start timestamp in microseconds (inclusive)
             end: End timestamp in microseconds (exclusive)
@@ -366,10 +361,6 @@ class RingReader:
     def latest(self, seconds: float = 60.0, format: str = 'tuple'):
         """
         Get recent records from ring buffer (rolling time window).
-        
-        Performance:
-            - Fast in-memory scan (no disk I/O)
-            - Only searches data currently in ring buffer
         
         Args:
             seconds: Duration to look back (default 60 seconds)

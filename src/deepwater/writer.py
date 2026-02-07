@@ -19,12 +19,6 @@ class Writer:
     """
     Writer for persistent disk-based feeds.
     
-    Performance:
-        - 60µs per write (including cross-process sync)
-        - Struct.pack_into: 272ns (zero-allocation)
-        - Automatic chunk rotation (transparent to caller)
-        - Multi-process safe (only one writer per feed)
-    
     Features:
         - Fixed-size binary chunks (default 128MB)
         - Automatic chunk rotation when full
@@ -74,7 +68,6 @@ class Writer:
         - Only ONE writer per feed allowed (enforced by platform)
         - Multiple readers can read while writer is active
         - Writer and readers can be in different processes
-        - 60µs IPC latency from write to read
     
     Gotchas:
         - Must call close() to seal chunk (otherwise readers see incomplete data)

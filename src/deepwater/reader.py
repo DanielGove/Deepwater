@@ -19,21 +19,15 @@ class Reader:
     """
     Zero-copy reader for persistent disk-based feeds.
     
-    Performance:
-        - Live streaming: 70µs latency (cross-process IPC)
-        - Historical replay: 920K records/sec throughput
-        - Zero-copy: Direct memory access to mmapped chunks
-    
     Three Read Modes:
         stream(start=None, format='tuple') → Iterator (infinite, live)
             - Live tail: start=None jumps to current write head
             - Historical: start=timestamp_us streams from that point forward
-            - Spin-waits for new data (CPU-intensive but 70µs latency)
+            - Spin-waits for new data (CPU-intensive)
             - Use for: Live trading, real-time monitoring
         
         range(start, end, format='tuple') → List (finite, historical)
             - Returns all records in [start, end) microseconds
-            - 920K records/sec throughput (Cython-optimized)
             - Use for: Backtesting, analysis, batch processing
         
         latest(seconds, format='tuple') → List (convenience)
@@ -42,7 +36,7 @@ class Reader:
             - Use for: Quick lookback, recent data checks
     
     Four Output Formats:
-        'tuple': Fast tuples (180ns/record overhead, default)
+        'tuple': Fast tuples (default)
             >>> for record in reader.stream(format='tuple'):
             ...     price, size, timestamp = record
         
@@ -59,12 +53,12 @@ class Reader:
             ...     # Manual parsing with struct.unpack
     
     Common Patterns:
-        # Live trading (spin-wait, 70µs latency)
+        # Live trading (spin-wait)
         >>> for trade in reader.stream():  # start=None = live
         ...     price, size, timestamp = trade
         ...     # Process immediately (no batching)
         
-        # Backtest (920K rec/sec)
+        # Backtest
         >>> data = reader.range(start_us, end_us, format='numpy')
         >>> # Vectorized operations on entire range
         
@@ -265,7 +259,6 @@ class Reader:
         if ts_byteorder is None:
             ts_byteorder = self._ts_byteorder
         
-        # Use Cython fast path if available (1.5x faster)
         if HAVE_FAST:
             return binary_search_fast(
                 self._chunk.buffer,
@@ -608,15 +601,9 @@ class Reader:
         """
         Stream records (infinite iterator, live updates).
         
-        Performance:
-            - 70µs IPC latency (write to read)
-            - Spin-wait (CPU-intensive, 100% core)
-            - 920K rec/sec historical throughput
-            - Automatic chunk rotation
-        
         Args:
             start: Start timestamp in microseconds
-                - None: Jump to current write head (skip history, 70µs latency)
+                - None: Jump to current write head (skip history)
                 - timestamp_us: Stream from that point (historical + live)
             format: 'tuple' (default, fast), 'dict' (readable), 'numpy' (batch), 'raw' (memoryview)
             ts_key: Which timestamp column to query on (None = primary ts_col, or specify 'recv_us', 'proc_us', 'ev_us', etc.)
@@ -627,14 +614,12 @@ class Reader:
         Behavior:
             start=None → Live only (skips all existing data)
                 Best for: Real-time trading, live monitoring
-                Latency: 70µs from write to read
             
             start=timestamp_us → Historical replay + live
                 Best for: Resume from checkpoint, replay strategies
-                Speed: 920K rec/sec historical, then 70µs live
         
         Example:
-            # Live trading (70µs latency)
+            # Live trading
             >>> for trade in reader.stream():  # start=None
             ...     price, size, timestamp = trade
             ...     if price > 100:
@@ -643,7 +628,7 @@ class Reader:
             # Resume from checkpoint
             >>> last_ts = 1738368000000000
             >>> for trade in reader.stream(start=last_ts):
-            ...     process(trade)  # Historical at 920K rec/sec, then live at 70µs
+            ...     process(trade)
             
             # Query by exchange event time (backtesting)
             >>> for update in reader.stream(start=ev_time, ts_key='ev_us'):
@@ -673,11 +658,6 @@ class Reader:
         """
         Read historical time range (finite block).
         
-        Performance:
-            - 920K records/sec throughput (Cython-optimized)
-            - Binary search to find start position
-            - Returns immediately (not lazy)
-        
         Args:
             start: Start timestamp in microseconds (inclusive)
             end: End timestamp in microseconds (exclusive)
@@ -689,7 +669,7 @@ class Reader:
             List of records (or numpy array if format='numpy', or memoryview if format='raw')
         
         Example:
-            # Get last hour of trades (920K rec/sec)
+            # Get last hour of trades
             >>> now_us = int(time.time() * 1e6)
             >>> hour_ago = now_us - 3600_000_000
             >>> trades = reader.range(hour_ago, now_us)
@@ -731,10 +711,6 @@ class Reader:
         """
         Get recent records (rolling time window).
         
-        Performance:
-            - Same as range() (920K rec/sec)
-            - Convenience wrapper for last N seconds
-        
         Args:
             seconds: Duration to look back (default 60 seconds)
             format: 'tuple' (default), 'dict', 'numpy', or 'raw'
@@ -768,11 +744,6 @@ class Reader:
     def read_available(self, max_records: Optional[int] = None, format: str = 'tuple') -> List:
         """
         Read available records without blocking (returns immediately).
-        
-        Performance:
-            - Returns instantly (no spin-wait, no blocking)
-            - Best for event loops, background tasks, async patterns
-            - Maintains read position between calls
         
         Args:
             max_records: Maximum records to return (None = all available)
