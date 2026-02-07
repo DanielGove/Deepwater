@@ -36,13 +36,11 @@ class Platform:
         2. Create feed (schema definition)
         3. Create writer → write data → close writer
         4. Create reader → read data (stream/range/latest)
-        5. Close platform (optional cleanup)
+        5. Close platform (best to explicitly cleanup)
     
-    Quick Example:
-        >>> from deepwater import Platform
-        >>> import time
-        >>> 
+    Quick Examples:
         >>> # 1. Initialize
+        >>> from deepwater import Platform
         >>> p = Platform('./my_data')
         >>> 
         >>> # 2. Define schema
@@ -84,18 +82,12 @@ class Platform:
         >>> p.close()
     
     Feed Modes:
-        'UF': Unindexed feed (simple, no time index)
-            - Fast writes, sequential reads
-            - Use for: Live streaming, append-only logs
-        
-        'IF': Indexed feed (time-based index for playback)
-            - Slightly slower writes, fast range queries
-            - Use for: Backtesting, time-series analysis
+        'UF': Uniform feed (fixed size records)
     
     Feed Schema:
         >>> feed_config = {
         ...     'feed_name': 'orderbook',  # Unique identifier
-        ...     'mode': 'IF',  # 'UF' or 'IF'
+        ...     'mode': 'UF'
         ...     'fields': [  # Schema definition
         ...         {'name': 'price', 'type': 'float64'},
         ...         {'name': 'quantity', 'type': 'float64'},
@@ -132,14 +124,13 @@ class Platform:
         create_reader(feed_name): Get reader instance (multiple allowed)
         list_feeds(): Get all feed names
         feed_exists(feed_name): Check if feed exists
-        close(): Clean up resources (optional)
+        close(): Clean up resources (releases locks)
     
     Gotchas:
-        - create_feed() once per feed (idempotent, safe to call multiple times)
+        - create_feed() once per feed
         - Only ONE writer per feed (enforced)
         - Multiple readers OK (multi-process safe)
-        - Always close() writers (seals chunk metadata)
-        - Readers auto-handle chunk rotation (transparent)
+        - Always close() writers (Platform.close() does this for you)
         - Timestamps must be uint64 microseconds (standard convention)
     """
 
@@ -169,8 +160,6 @@ class Platform:
         # process-local caches
         self._writers: Dict[str, Writer] = {}
         self._readers: Dict[str, Reader] = {}
-        self._layouts: Dict[str, dict] = {}
-        self._structs: Dict[str, Tuple[struct.Struct, int]] = {}  # name -> (Struct(fmt), ts_off)
         
         # Graceful shutdown on signals
         self._shutdown_handlers_registered = False
@@ -215,41 +204,38 @@ class Platform:
         root_logger.addHandler(console_handler)
 
     # -------------------------------------------------------------------------
-    # FEED CREATION (idempotent, failsafe)
+    # FEED CREATION
     # -------------------------------------------------------------------------
     def create_feed(self, spec: dict) -> None:
         """
         Create a new feed with specified schema and lifecycle settings.
-        
-        Idempotent - safe to call multiple times. Enforces schema stability:
-        changing field layout requires new feed name or version.
-        
+                
         Args:
             spec: Feed specification dictionary with keys:
                 - feed_name (str, required): Unique feed identifier
-                - mode (str, required): "UF" for uniform format (only mode supported)
+                - type (str, optional): "UF" for uniform format (default: UF)
                 - fields (list[dict], required): Field definitions, each with:
                     - name (str): Field name
                     - type (str): Field type (uint8/16/32/64, int8/16/32/64, 
                                   float32/64, char, _N for padding)
                     - desc (str, optional): Field description
                 - ts_col (str, required): Name of primary timestamp field for time queries
-                - query_cols (list[str], optional): Additional timestamp columns for multi-key queries
+                - query_cols (list[str], optional): Additional timestamp columns supporting range queries and playback
                                                     (e.g., ['recv_us', 'proc_us', 'ev_us'])
-                - chunk_size_mb (int, optional): Chunk size in MB (default: 64)
-                - retention_hours (int, optional): Data retention in hours (default: 72)
+                - chunk_size_mb (int, optional): Chunk or SHM size in MB (default: 64)
+                - retention_hours (int, optional): Data retention in hours for persisted feeds (default: ∞)
                 - persist (bool, optional): True for disk, False for SHM only (default: True)
-                - index_playback (bool, optional): Enable time-indexed queries (default: False)
+                - index_playback (bool, optional): Tag a record on write to allow readers to playback from that record (default: False)
         
         Raises:
             ValueError: If required fields missing from spec
-            RuntimeError: If feed exists with different schema (prevents corruption)
-            NotImplementedError: If mode != "UF"
+            RuntimeError: If feed already exists
+            NotImplementedError: If type != "UF"
         
         Example:
             >>> platform.create_feed({
             ...     "feed_name": "sensor_data",
-            ...     "mode": "UF",
+            ...     "type": "UF",
             ...     "fields": [
             ...         {"name": "sensor_id", "type": "uint32"},
             ...         {"name": "value", "type": "float64"},
@@ -262,13 +248,15 @@ class Platform:
             ... })
         """
         name = spec["feed_name"]
-        mode = spec.get("mode", "UF")
-        if mode != "UF":
-            raise NotImplementedError("NUF not enabled yet")
+        if self.feed_exists(name): raise RuntimeError(f"Feed {name} already exists in {self.base_path}")
+        
+        typ = spec.get("type", "UF")
+        if typ != "UF":
+            raise NotImplementedError("Feed type not supported")
 
         # 1) ensure feed dir
         fdir = self.feed_dir(name)
-        fdir.mkdir(parents=True, exist_ok=True)
+        fdir.mkdir(parents=True, exist_ok=False)
 
         # 2) build & persist layout.json atomically (UF format)
         if "fields" not in spec or "ts_col" not in spec:
@@ -277,53 +265,21 @@ class Platform:
         layout = build_layout(spec["fields"], ts_col=spec["ts_col"], query_cols=query_cols)
         # if layout.json exists, enforce schema stability
         lpath = fdir / "layout.json"
-        if lpath.exists():
-            current = load_layout(fdir)
-            if (current["fmt"] != layout["fmt"] or
-                current["record_size"] != layout["record_size"] or
-                current["ts"]["offset"] != layout["ts"]["offset"]):
-                raise RuntimeError(
-                    f"layout drift for '{name}': fmt/size/ts_off changed; "
-                    f"use a new feed name or version bump"
-                )
-        else:
-            save_layout(fdir, layout)
+        save_layout(fdir, layout)
 
         # 3) persist lifecycle defaults into GlobalRegistry (create or update)
         lifecycle = {
             "chunk_size_bytes": int(spec.get("chunk_size_mb", 64)*1024*1024),
-            "retention_hours":  int(spec.get("retention_hours", 72)),
+            "retention_hours":  int(spec.get("retention_hours", 0)),
             "persist":          bool(spec.get("persist", True)),
             "index_playback":   bool(spec.get("index_playback", False)),
         }
-        if not self.registry.feed_exists(name):
-            self.registry.register_feed(name, lifecycle)
-        else:
-            # Feed exists - prevent dangerous updates to immutable fields
-            existing = self.registry.get_metadata(name)
-            if existing["persist"] != lifecycle["persist"]:
-                raise RuntimeError(
-                    f"Cannot change persist flag for existing feed '{name}': "
-                    f"existing={existing['persist']}, new={lifecycle['persist']}. "
-                    f"Use a different feed name for different persistence modes."
-                )
-            # Only allow updates to mutable lifecycle fields (retention, chunk size)
-            safe_updates = {
-                "chunk_size_bytes": lifecycle["chunk_size_bytes"],
-                "retention_hours": lifecycle["retention_hours"],
-            }
-            self.registry.update_metadata(name, **safe_updates)
 
-        # 4) keep full app spec for ops/debug (optional)
+        # 4) keep full app spec for ops/debug
         (fdir / "config.json").write_bytes(orjson.dumps(spec))
 
-        # 5) ensure per-feed registry (binary) exists
-        # TODO: confirm your FeedRegistry constructor & semantics
-        FeedRegistry(path=fdir / f"{name}.reg", mode="w").close()
-
-        # clear caches for this feed
-        self._layouts.pop(name, None)
-        self._structs.pop(name, None)
+        # 5) Construct the feed registry (binary)
+        self.registry.register_feed(name, lifecycle)
 
     # -------------------------------------------------------------------------
     # OPEN/CLOSE
@@ -336,10 +292,10 @@ class Platform:
         Writers are cached per process - multiple calls return same instance.
         
         Args:
-            feed_name: Name of feed to write to (must exist via create_feed)
+            feed_name: Name of the feed
         
         Returns:
-            Writer or RingWriter instance
+            Writer or RingWriter instance (same interface)
         
         Raises:
             KeyError: If feed does not exist
@@ -368,10 +324,10 @@ class Platform:
         Readers are cached per process - multiple calls return same instance.
         
         Args:
-            feed_name: Name of feed to read from (must exist via create_feed)
+            feed_name: Name of the feed
         
         Returns:
-            Reader or RingReader instance
+            Reader or RingReader instance (same interface)
         
         Raises:
             KeyError: If feed does not exist
@@ -405,32 +361,22 @@ class Platform:
         return self.data_path / feed_name
 
     def get_record_format(self, feed_name: str) -> dict:
-        """Load and cache layout.json."""
-        lay = self._layouts.get(feed_name)
-        if lay is None:
-            lay = load_layout(self.feed_dir(feed_name))
-            self._layouts[feed_name] = lay
-        return lay
+        """Load layout.json."""
+        return load_layout(self.feed_dir(feed_name))
 
     def codec(self, feed_name: str) -> Tuple[struct.Struct, int]:
         """
         Return (Struct(fmt), ts_off) for fast pack/unpack + seek.
         Readers/writers MAY use this to avoid re-parsing layout.json repeatedly.
         """
-        c = self._structs.get(feed_name)
-        if c is None:
-            lay = self.get_record_format(feed_name)
-            S = struct.Struct(lay["fmt"])
-            c = (S, int(lay["ts"]["offset"]))
-            self._structs[feed_name] = c
+        lay = self.get_record_format(feed_name)
+        S = struct.Struct(lay["fmt"])
+        c = (S, int(lay["ts"]["offset"]))
         return c
 
     def lifecycle(self, feed_name: str) -> dict:
         """Return lifecycle defaults from the global registry."""
-        lc = self.registry.get_metadata(feed_name)
-        if lc is None:
-            raise KeyError(f"feed '{feed_name}' not found in registry")
-        return lc
+        return self.registry.get_metadata(feed_name)
 
     def set_lifecycle(self, feed_name: str, **kwargs) -> None:
         """Partial update of lifecycle defaults (e.g., retention_hours=168)."""
