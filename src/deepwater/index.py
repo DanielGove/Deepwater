@@ -8,13 +8,12 @@ from multiprocessing import shared_memory
 HEADER_STRUCT = struct.Struct("<QQ48x") # Number of indices, capacity to 64 bits
 HEADER_SIZE = HEADER_STRUCT.size
 
-INDEX_STRUCT = struct.Struct("<QQQ40x")  # timestamp, offset, size, 40x pad for later = 64Bytes
+INDEX_STRUCT = struct.Struct("<QQ48x")  # timestamp, offset, size, 40x pad for later = 64Bytes
 INDEX_SIZE = INDEX_STRUCT.size
 
 # Precomputed offsets for direct memory access
 TIMESTAMP_OFFSET = 0
 OFFSET_OFFSET = 8
-SIZE_OFFSET = 16
 
 class IndexRecord:
     """
@@ -26,8 +25,7 @@ class IndexRecord:
     def __init__(self, chunk_record: memoryview):
         self._mv = chunk_record
         self._timestamp  = self._mv[TIMESTAMP_OFFSET:OFFSET_OFFSET].cast("Q")
-        self._offset    = chunk_record[OFFSET_OFFSET:SIZE_OFFSET].cast("Q")
-        self._size     = chunk_record[SIZE_OFFSET:SIZE_OFFSET+8].cast("Q")
+        self._offset    = chunk_record[OFFSET_OFFSET:OFFSET_OFFSET+8].cast("Q")
 
     @property
     def timestamp(self) -> int:
@@ -43,20 +41,12 @@ class IndexRecord:
     def offset(self, v: int) -> None:
         self._offset[0] = v
 
-    @property
-    def size(self) -> int:
-        return self._size[0]
-    @size.setter
-    def size(self, v: int) -> None:
-        self._size[0] = v
-
     def as_tuple(self) -> tuple[int,int,int]:
-        return (self.timestamp, self.offset, self.size)
+        return (self.timestamp, self.offset)
 
     def release(self) -> None:
         self._timestamp.release()
         self._offset.release()
-        self._size.release()
         self._mv.release()
 
     def __repr__(self) -> str:
@@ -130,14 +120,14 @@ class ChunkIndex:
         mm.close()
         os.close(fd)
 
-    def create_index(self, timestamp: int, chunk_offset: int, size: int = 0) -> int:
+    def create_index(self, timestamp: int, chunk_offset: int) -> int:
         if self.read_only:
             raise PermissionError("read-only index")
         idx = self.count
         if idx >= self.capacity:
             raise IndexError("Chunk index at capacity")
         entry_offset = HEADER_SIZE + (idx * INDEX_SIZE)
-        INDEX_STRUCT.pack_into(self._mv, entry_offset, timestamp, chunk_offset, size)
+        INDEX_STRUCT.pack_into(self._mv, entry_offset, timestamp, chunk_offset)
         self._count[0] = idx + 1
         return idx + 1
 
