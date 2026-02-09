@@ -4,7 +4,7 @@ from typing import Optional, Iterator, Union, List, Tuple
 
 from .chunk import Chunk
 from .index import ChunkIndex
-from .feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED
+from .feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED, UINT64_MAX
 from .utils.process import ProcessUtils
 
 # Try to import Cython-optimized hot paths
@@ -235,22 +235,44 @@ class Reader:
         """Get current timestamp for latest() queries"""
         return time.time_ns() // 1000
 
-    def _iter_chunks_in_range(self, start_us: int, end_us: Optional[int] = None):
-        """Iterate chunk IDs that overlap with time range"""
-        if self._ts_offset is None:
-            raise RuntimeError("Feed missing ts_offset for time queries")
-        
+    def _iter_chunks_in_range(self, start_us: int, end_us: Optional[int] = None, ts_key: Optional[str] = None):
+        """Iterate chunk IDs that overlap with time range for the requested ts_key."""
         if self.registry.get_latest_chunk_idx() is None:
             return
-        
-        chunk_iter = (self.registry.get_chunks_after(start_us) if end_us is None 
-                     else self.registry.get_chunks_in_range(start_us, end_us))
-        
+
+        # Determine which key index to use for filtering
+        ts_keys = [self.record_format.get("ts_name")] + list(self.record_format.get("query_keys", {}).keys())
+        ts_idx = 0
+        if ts_key:
+            try:
+                ts_idx = ts_keys.index(ts_key)
+            except ValueError:
+                ts_idx = 0  # fallback to primary
+
+        latest = self.registry.get_latest_chunk_idx() or 0
+        # Use per-key bounds for all ts_keys (including primary)
+        chunk_iter = range(1, latest + 1)
+
         for chunk_id in chunk_iter:
             self._open_chunk(chunk_id)
-            if self._chunk_meta.num_records == 0:
+            meta = self._chunk_meta
+            if meta.num_records == 0:
                 continue
-            yield chunk_id
+            if ts_idx >= meta.query_key_count:
+                yield chunk_id
+                continue
+            qmin = meta.get_qmin(ts_idx)
+            qmax = meta.get_qmax(ts_idx)
+            # If bounds are uninitialized, include conservatively
+            if qmin == UINT64_MAX or qmax == 0:
+                yield chunk_id
+                continue
+            if end_us is None:
+                if qmax >= start_us:
+                    yield chunk_id
+            else:
+                if not (qmax < start_us or qmin > end_us):
+                    yield chunk_id
 
     def _binary_search_start(self, start_us: int, ts_offset: Optional[int] = None, ts_byteorder: Optional[str] = None) -> int:
         """Binary search for start position in current chunk (assumes sorted!)"""
@@ -307,7 +329,7 @@ class Reader:
         
         result = []
         
-        for chunk_id in self._iter_chunks_in_range(start_us, end_us):
+        for chunk_id in self._iter_chunks_in_range(start_us, end_us, ts_key=ts_key):
             buf = self._chunk.buffer
             write_pos = self._chunk_meta.write_pos
             
@@ -364,7 +386,7 @@ class Reader:
             # Get latest chunk ID to know when to stop historical replay
             latest_chunk_id = self.registry.get_latest_chunk_idx()
             
-            for chunk_id in self._iter_chunks_in_range(start_us, None):
+            for chunk_id in self._iter_chunks_in_range(start_us, None, ts_key=ts_key):
                 buf = self._chunk.buffer
                 write_pos = self._chunk_meta.write_pos
                 pos = self._binary_search_start(start_us, ts_offset, ts_byteorder)
@@ -466,7 +488,7 @@ class Reader:
         from_bytes = int.from_bytes
         byteorder = ts_byteorder
         
-        for chunk_id in self._iter_chunks_in_range(start_us, end_us):
+        for chunk_id in self._iter_chunks_in_range(start_us, end_us, ts_key=ts_key):
             buf = self._chunk.buffer
             write_pos = self._chunk_meta.write_pos
             pos = self._binary_search_start(start_us, ts_offset, ts_byteorder)
@@ -522,7 +544,7 @@ class Reader:
         from_bytes = int.from_bytes
         byteorder = ts_byteorder
         
-        for chunk_id in self._iter_chunks_in_range(start_us, end_us):
+        for chunk_id in self._iter_chunks_in_range(start_us, end_us, ts_key=ts_key):
             buf = self._chunk.buffer
             write_pos = self._chunk_meta.write_pos
             pos = self._binary_search_start(start_us, ts_offset, ts_byteorder)
@@ -557,7 +579,7 @@ class Reader:
         if start_us is not None:
             # Resolve ts_offset if ts_key provided
             ts_offset, ts_byteorder = self._resolve_ts_key(ts_key) if ts_key else (self._ts_offset, self._ts_byteorder)
-            for chunk_id in self._iter_chunks_in_range(start_us, None):
+            for chunk_id in self._iter_chunks_in_range(start_us, None, ts_key=ts_key):
                 buf = self._chunk.buffer
                 write_pos = self._chunk_meta.write_pos
                 pos = self._binary_search_start(start_us, ts_offset, ts_byteorder)

@@ -248,7 +248,9 @@ class Platform:
             ... })
         """
         name = spec["feed_name"]
-        if self.feed_exists(name): raise RuntimeError(f"Feed {name} already exists in {self.base_path}")
+        if self.feed_exists(name):
+            # Idempotent: if already exists, just return
+            return
         
         typ = spec.get("type", "UF")
         if typ != "UF":
@@ -308,6 +310,8 @@ class Platform:
         w = self._writers.get(feed_name)
         if w is None:
             lifecycle = self.lifecycle(feed_name)
+            if lifecycle is None:
+                raise KeyError(feed_name)
             # persist=True -> Writer (disk chunks), persist=False -> RingWriter (SHM ring)
             if lifecycle.get("persist", True):
                 w = Writer(self, feed_name)
@@ -341,6 +345,8 @@ class Platform:
         r = self._readers.get(feed_name)
         if r is None:
             lifecycle = self.lifecycle(feed_name)
+            if lifecycle is None:
+                raise KeyError(feed_name)
             # persist=True -> Reader (chunks), persist=False -> RingReader (ring)
             if lifecycle.get("persist", True):
                 r = Reader(self, feed_name)
@@ -380,7 +386,7 @@ class Platform:
 
     def set_lifecycle(self, feed_name: str, **kwargs) -> None:
         """Partial update of lifecycle defaults (e.g., retention_hours=168)."""
-        if not self.registry.update_lifecycle(feed_name, **kwargs):
+        if not self.registry.update_metadata(feed_name, **kwargs):
             raise KeyError(f"feed '{feed_name}' not found")
 
     def list_feeds(self) -> list[dict]:
@@ -396,6 +402,10 @@ class Platform:
             ['trades', 'quotes', 'orderbook']
         """
         return self.registry.list_feeds()
+    
+    def feed_exists(self, feed_name: str) -> bool:
+        """Check if feed exists in global registry."""
+        return self.registry.feed_exists(feed_name)
     
     def describe_feed(self, feed_name: str) -> dict:
         """Combine registry lifecycle + layout summary for ops."""

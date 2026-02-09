@@ -10,7 +10,7 @@ from multiprocessing import shared_memory
 
 from .chunk import Chunk
 from .index import ChunkIndex
-from .feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED
+from .feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED, CHUNK_QMIN_OFFSET, MAX_QUERY_KEYS, UINT64_MAX
 from .utils.process import ProcessUtils
 
 log = logging.getLogger("dw.writer")
@@ -21,7 +21,9 @@ class Writer:
         "data_dir", "registry",
         "current_chunk", "chunk_index", "current_chunk_metadata", "current_chunk_id",
         "_S", "_rec_size", "_value_fields", "_ts_field", "_ts_idx",
-        "_staging_active", "_staging_pos", "_staging_count", "_staging_last_ts", "_rowbuf",
+        "_ts_keys", "_ts_key_indices", "_ts_key_offsets", "_ts_key_count",
+        "_key_min_set", "_qmin_offsets", "_qmax_offsets",
+        "_u64", "_qmins", "_qmaxs",
     )
     """
     Writer for persistent disk-based feeds.
@@ -132,13 +134,18 @@ class Writer:
         self.chunk_index = None
         self.current_chunk_metadata = None
         self.current_chunk_id = self.registry.get_latest_chunk_idx() or 0
+        # Per-key bounds (primary + query_cols, capped by registry)
+        self._ts_keys = None
+        self._ts_key_indices = None
+        self._ts_key_offsets = None
+        self._key_min_set = None
 
         # Validate previous chunk before starting (handles corruption/missing files)
         if self.current_chunk_id > 0:
             self._validate_previous_chunk()
 
-        self._create_new_chunk()
         self._schema_init()
+        self._create_new_chunk()
 
     def _create_new_chunk(self):
         self.current_chunk_id += 1
@@ -152,15 +159,22 @@ class Writer:
             _new_start_time = self.current_chunk_metadata.end_time
             self.current_chunk_metadata.release()
 
+        # reset per-key bounds for new chunk
+        self._key_min_set = [False for _ in range(self._ts_key_count)]
+
         # Writer only handles persist=True (disk chunks)
         chunk_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
         self.current_chunk = Chunk.create_file(path=str(chunk_path), size=self.feed_config["chunk_size_bytes"])
         self.registry.register_chunk(
             time.time_ns() // 1_000, self.current_chunk_id,
-            self.feed_config["chunk_size_bytes"], status=ON_DISK)
+            self.feed_config["chunk_size_bytes"], status=ON_DISK,
+            query_key_count=self._ts_key_count)
 
         self.current_chunk_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
         self.current_chunk_metadata.start_time = _new_start_time if _new_start_time is not None else self.current_chunk_metadata.start_time
+        self.current_chunk_metadata.query_key_count = self._ts_key_count
+        self._qmins = self.current_chunk_metadata._qmins
+        self._qmaxs = self.current_chunk_metadata._qmaxs
 
         if self.feed_config.get("index_playback") is True:
             if self.chunk_index is not None:
@@ -205,9 +219,35 @@ class Writer:
         position = self.current_chunk_metadata.write_pos
         self.current_chunk.buffer[position:position+record_size] = record_data
         if create_index and self.chunk_index is not None:
-            self.chunk_index.create_index(timestamp, position, record_size)
+            self.chunk_index.create_index(timestamp, position)
 
-        self.current_chunk_metadata.last_update = timestamp
+        # update per-key bounds (binary payload assumed monotonic)
+        offsets = self._ts_key_offsets
+        key_min_set = self._key_min_set
+        qmins = self._qmins
+        qmaxs = self._qmaxs
+        u64 = self._u64
+        record_mv = memoryview(record_data)
+        # primary ts (offsets[0]) is provided as 'timestamp' arg
+        if self._ts_key_count >= 1:
+            ts0 = timestamp
+            if not key_min_set[0]:
+                key_min_set[0] = True
+                qmins[0] = ts0
+            qmaxs[0] = ts0
+        if self._ts_key_count >= 2:
+            ts1 = u64.unpack_from(record_mv, offsets[1])[0]
+            if not key_min_set[1]:
+                key_min_set[1] = True
+                qmins[1] = ts1
+            qmaxs[1] = ts1
+        if self._ts_key_count >= 3:
+            ts2 = u64.unpack_from(record_mv, offsets[2])[0]
+            if not key_min_set[2]:
+                key_min_set[2] = True
+                qmins[2] = ts2
+            qmaxs[2] = ts2
+
         self.current_chunk_metadata.write_pos = position + record_size
         self.current_chunk_metadata.num_records += 1
 
@@ -216,6 +256,7 @@ class Writer:
         if not rf or "fmt" not in rf or "fields" not in rf:
             raise RuntimeError("Writer.record_format missing 'fmt'/'fields'; cannot pack values.")
         self._S = struct.Struct(rf["fmt"])
+        self._u64 = struct.Struct("<Q")
         self._rec_size = self._S.size
         self._value_fields = [f.get("name") for f in rf["fields"] if f.get("name") != "_"]
         # timestamp field name (optional). feed specs used 'ts_col' previously.
@@ -224,12 +265,30 @@ class Writer:
             self._ts_idx = self._value_fields.index(self._ts_field) if self._ts_field else None
         except ValueError:
             self._ts_idx = None
-        # staging state
-        self._staging_active = False
-        self._staging_pos = 0
-        self._staging_count = 0
-        self._staging_last_ts = None
-        self._rowbuf = bytearray(self._rec_size)
+        # queryable timestamp keys (primary + query_cols, capped to registry support)
+        query_keys = list(rf.get("query_keys", {}).keys())
+        self._ts_keys = [self._ts_field] + query_keys
+        # cap to registry slot limit
+        self._ts_keys = self._ts_keys[:MAX_QUERY_KEYS]
+        self._ts_key_count = len(self._ts_keys)
+        # lookup indices in value tuple and byte offsets
+        name_to_idx = {name: i for i, name in enumerate(self._value_fields)}
+        self._ts_key_indices = []
+        self._ts_key_offsets = []
+        for name in self._ts_keys:
+            idx = name_to_idx.get(name)
+            if idx is None:
+                raise RuntimeError(f"Timestamp key '{name}' not found in value fields")
+            self._ts_key_indices.append(idx)
+            if name == self._ts_field:
+                self._ts_key_offsets.append(rf.get("ts_offset"))
+            else:
+                self._ts_key_offsets.append(rf["query_keys"][name]["offset"])
+        # precompute qmin/qmax offsets inside chunk metadata
+        base = CHUNK_QMIN_OFFSET
+        self._qmin_offsets = [base + (i * 8) for i in range(self._ts_key_count)]
+        qmax_base = CHUNK_QMIN_OFFSET + (MAX_QUERY_KEYS * 8)
+        self._qmax_offsets = [qmax_base + (i * 8) for i in range(self._ts_key_count)]
 
     def write_values(self, *vals, create_index=False) -> int:
         """
@@ -254,11 +313,35 @@ class Writer:
             return 0  # Silently ignore writes after close
         if self.current_chunk_metadata.write_pos + self._rec_size > self.current_chunk_metadata.size:
             self._create_new_chunk()
-        self._S.pack_into(self.current_chunk.buffer, self.current_chunk_metadata.write_pos, *vals)
+        pos = self.current_chunk_metadata.write_pos
+        self._S.pack_into(self.current_chunk.buffer, pos, *vals)
         if create_index and self.chunk_index is not None:
-            self.chunk_index.create_index(vals[self._ts_idx], self.current_chunk_metadata.write_pos)
-        self.current_chunk_metadata.last_update = vals[self._ts_idx]
-        self.current_chunk_metadata.write_pos = self.current_chunk_metadata.write_pos + self._rec_size
+            if self._ts_idx is not None:
+                self.chunk_index.create_index(vals[self._ts_idx], pos)
+        # update per-key bounds and write directly into chunk metadata (unrolled up to 3)
+        key_min_set = self._key_min_set
+        idxs = self._ts_key_indices
+        qmins = self._qmins
+        qmaxs = self._qmaxs
+        if self._ts_key_count >= 1:
+            ts0 = vals[idxs[0]]
+            if not key_min_set[0]:
+                key_min_set[0] = True
+                qmins[0] = ts0
+            qmaxs[0] = ts0
+        if self._ts_key_count >= 2:
+            ts1 = vals[idxs[1]]
+            if not key_min_set[1]:
+                key_min_set[1] = True
+                qmins[1] = ts1
+            qmaxs[1] = ts1
+        if self._ts_key_count >= 3:
+            ts2 = vals[idxs[2]]
+            if not key_min_set[2]:
+                key_min_set[2] = True
+                qmins[2] = ts2
+            qmaxs[2] = ts2
+        self.current_chunk_metadata.write_pos = pos + self._rec_size
         self.current_chunk_metadata.num_records += 1
         return self.current_chunk_metadata.write_pos
     
@@ -268,16 +351,49 @@ class Writer:
         if self.current_chunk is None:
             return 0
         
-        if len(data) == 0 or len(data) % self._rec_size != 0:
+        data_len = len(data)
+        if data_len == 0 or data_len % self._rec_size != 0:
             raise ValueError("batch length must be a positive multiple of record_size")
-        if self.current_chunk_metadata.write_pos + len(data) > self.current_chunk_metadata.size:
+        if self.current_chunk_metadata.write_pos + data_len > self.current_chunk_metadata.size:
             self._create_new_chunk()
-        self.current_chunk.buffer[self.current_chunk_metadata.write_pos:self.current_chunk_metadata.write_pos + len(data)] = data
+        start = self.current_chunk_metadata.write_pos
+        end = start + data_len
+        rec_sz = self._rec_size
+        self.current_chunk.buffer[start:end] = data
+        # update per-key bounds using first and last records (monotonic timestamps)
+        key_min_set = self._key_min_set
+        offsets = self._ts_key_offsets
+        qmins = self._qmins
+        qmaxs = self._qmaxs
+        mv_data = memoryview(data)
+        u64 = self._u64
+        kcount = self._ts_key_count
+        if kcount >= 1:
+            ts_first = u64.unpack_from(mv_data, offsets[0])[0]
+            ts_last = u64.unpack_from(mv_data, data_len - rec_sz + offsets[0])[0]
+            if not key_min_set[0]:
+                key_min_set[0] = True
+                qmins[0] = ts_first
+            qmaxs[0] = ts_last
+        if kcount >= 2:
+            ts_first = u64.unpack_from(mv_data, offsets[1])[0]
+            ts_last = u64.unpack_from(mv_data, data_len - rec_sz + offsets[1])[0]
+            if not key_min_set[1]:
+                key_min_set[1] = True
+                qmins[1] = ts_first
+            qmaxs[1] = ts_last
+        if kcount >= 3:
+            ts_first = u64.unpack_from(mv_data, offsets[2])[0]
+            ts_last = u64.unpack_from(mv_data, data_len - rec_sz + offsets[2])[0]
+            if not key_min_set[2]:
+                key_min_set[2] = True
+                qmins[2] = ts_first
+            qmaxs[2] = ts_last
         if create_index and self.chunk_index is not None:
-            self.chunk_index.create_index(self.current_chunk_metadata.last_update, self.current_chunk_metadata.write_pos)
-        self.current_chunk_metadata.write_pos += len(data)
-        self.current_chunk_metadata.num_records += len(data) // self._rec_size
-        self.current_chunk_metadata.last_update = int.from_bytes(data[-self._rec_size + self.record_format["ts_offset"]:-self._rec_size + self.record_format["ts_offset"] + 8], "little")
+            ts_first_for_index = u64.unpack_from(mv_data, offsets[0])[0] if kcount >= 1 else 0
+            self.chunk_index.create_index(ts_first_for_index, start)
+        self.current_chunk_metadata.write_pos = end
+        self.current_chunk_metadata.num_records += data_len // rec_sz
         return self.current_chunk_metadata.write_pos
 
     def close(self):
@@ -291,7 +407,6 @@ class Writer:
             >>> writer.close()
         """
         if self.current_chunk:
-            self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
             if self.feed_config.get("persist", True):
                 self.current_chunk.close_file()
                 if self.feed_config.get("index_playback", False) and self.chunk_index:
@@ -304,4 +419,3 @@ class Writer:
             self.current_chunk_metadata.release()
             self.current_chunk = None  # Prevent double-close
             self.registry.close()
-

@@ -5,7 +5,25 @@ import fcntl
 from typing import Iterator, Optional
 
 # Only keep struct for initial setup - eliminate from hot paths
-CHUNK_STRUCT = struct.Struct("<QQQQQQB79x")  # start, end, write_pos, num_records, last_update, chunk_id, size, status + padding = 128 bytes
+# New layout (128 bytes):
+#  0  start_time      Q
+#  8  end_time        Q
+# 16  write_pos       Q
+# 24  num_records     Q
+# 32  last_update     Q
+# 40  chunk_id        Q
+# 48  size            Q
+# 56  status          B
+# 57  query_key_count B   (primary + query_cols, capped)
+# 58  pad             6x  (align to 64)
+# 64  q0_min          Q
+# 72  q0_max          Q
+# 80  q1_min          Q
+# 88  q1_max          Q
+# 96  q2_min          Q
+# 104 q2_max          Q
+# 112 pad             16x
+CHUNK_STRUCT = struct.Struct("<QQQQQQQBB6xQQQQQQ16x")
 HEADER_STRUCT = struct.Struct("<Q120x")  # chunk_count + padding = 128 bytes
 
 # No helper functions - direct inline operations for maximum speed
@@ -26,13 +44,18 @@ CHUNK_LAST_UPDATE_OFFSET = 32
 CHUNK_ID_OFFSET = 40
 CHUNK_SIZE_OFFSET = 48
 CHUNK_STATUS_OFFSET = 56
+CHUNK_QCOUNT_OFFSET = 57
+CHUNK_QMIN_OFFSET = 64
+MAX_QUERY_KEYS = 3
+UINT64_MAX = (1 << 64) - 1
 
 class ChunkMeta:
     """
     Zero-copy, mutable view over a single 64-byte chunk record.
     Reads and writes go directly to the underlying mmapped memory.
     """
-    __slots__ = ("_mv", "_start", "_end", "_wp", "_nr", "_lu", "_id", "_size", "_status")
+    __slots__ = ("_mv", "_start", "_end", "_wp", "_nr", "_lu", "_id", "_size",
+                 "_status", "_qcount", "_qmins", "_qmaxs")
 
     def __init__(self, chunk_record: memoryview):
         self._mv = chunk_record
@@ -43,7 +66,10 @@ class ChunkMeta:
         self._lu     = chunk_record[CHUNK_LAST_UPDATE_OFFSET: CHUNK_ID_OFFSET].cast("Q")
         self._id     = chunk_record[CHUNK_ID_OFFSET:CHUNK_SIZE_OFFSET].cast("Q")
         self._size   = chunk_record[CHUNK_SIZE_OFFSET:CHUNK_STATUS_OFFSET].cast("Q")
-        self._status = chunk_record[CHUNK_STATUS_OFFSET:CHUNK_STATUS_OFFSET+1].cast("B")
+        self._status = chunk_record[CHUNK_STATUS_OFFSET:CHUNK_QCOUNT_OFFSET].cast("B")
+        self._qcount = chunk_record[CHUNK_QCOUNT_OFFSET:CHUNK_QCOUNT_OFFSET+1].cast("B")
+        self._qmins  = chunk_record[CHUNK_QMIN_OFFSET:CHUNK_QMIN_OFFSET + (MAX_QUERY_KEYS * 8)].cast("Q")
+        self._qmaxs  = chunk_record[CHUNK_QMIN_OFFSET + (MAX_QUERY_KEYS * 8):CHUNK_QMIN_OFFSET + (MAX_QUERY_KEYS * 16)].cast("Q")
 
     @property
     def start_time(self) -> int:
@@ -102,6 +128,23 @@ class ChunkMeta:
         # clamp to 0..255 to avoid ValueError from casted B view
         self._status[0] = v & 0xFF
 
+    @property
+    def query_key_count(self) -> int:
+        return self._qcount[0]
+    @query_key_count.setter
+    def query_key_count(self, v: int) -> None:
+        self._qcount[0] = v & 0xFF
+
+    def get_qmin(self, idx: int) -> int:
+        return self._qmins[idx]
+
+    def get_qmax(self, idx: int) -> int:
+        return self._qmaxs[idx]
+
+    def set_qbounds(self, idx: int, min_v: int, max_v: int) -> None:
+        self._qmins[idx] = min_v
+        self._qmaxs[idx] = max_v
+
     # Optional helpers
     def as_tuple(self) -> tuple[int,int,int,int,int]:
         return (self.start_time, self.end_time, self.chunk_id, self.size, self.status)
@@ -116,6 +159,9 @@ class ChunkMeta:
         self._id.release()
         self._size.release()
         self._status.release()
+        self._qcount.release()
+        self._qmins.release()
+        self._qmaxs.release()
         self._mv.release()
 
     def __repr__(self) -> str:
@@ -175,7 +221,8 @@ class FeedRegistry:
         def_status = self._mv[24]
         return def_size, def_chunk_id, def_status
 
-    def register_chunk(self, start_time: int, chunk_id: int = None, size: int = None, status: int = None) -> int:
+    def register_chunk(self, start_time: int, chunk_id: int = None, size: int = None,
+                      status: int = None, query_key_count: int = 1) -> int:
         if not self.is_writer:
             raise PermissionError("Read-only mode")
         self._chunk_count[0] += 1
@@ -187,13 +234,21 @@ class FeedRegistry:
         
         offset = HEADER_SIZE + ((self._chunk_count[0]-1) * CHUNK_SIZE)
         self._mv[offset + CHUNK_START_OFFSET:offset + CHUNK_END_OFFSET] = start_time.to_bytes(8, 'little')
-        self._mv[offset + CHUNK_END_OFFSET:offset + CHUNK_WRITE_POS_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"            # End Time, write position,
-        self._mv[offset + CHUNK_WRITE_POS_OFFSET:offset + CHUNK_NUM_RECORDS_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"    # and number of records
-        self._mv[offset + CHUNK_NUM_RECORDS_OFFSET:offset + CHUNK_LAST_UPDATE_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"           # all initialize to 0
-        self._mv[offset + CHUNK_LAST_UPDATE_OFFSET:offset + CHUNK_ID_OFFSET] = b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        self._mv[offset + CHUNK_END_OFFSET:offset + CHUNK_WRITE_POS_OFFSET] = b"\x00"*8            # End Time, write position,
+        self._mv[offset + CHUNK_WRITE_POS_OFFSET:offset + CHUNK_NUM_RECORDS_OFFSET] = b"\x00"*8    # and number of records
+        self._mv[offset + CHUNK_NUM_RECORDS_OFFSET:offset + CHUNK_LAST_UPDATE_OFFSET] = b"\x00"*8
+        self._mv[offset + CHUNK_LAST_UPDATE_OFFSET:offset + CHUNK_ID_OFFSET] = b"\x00"*8
         self._mv[offset + CHUNK_ID_OFFSET:offset + CHUNK_SIZE_OFFSET] = chunk_id.to_bytes(8, 'little')
         self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_STATUS_OFFSET] = size.to_bytes(8, 'little')
         self._mv[offset + CHUNK_STATUS_OFFSET] = status
+        self._mv[offset + CHUNK_QCOUNT_OFFSET] = query_key_count & 0xFF
+        # initialize qmins to UINT64_MAX and qmaxs to 0
+        for i in range(MAX_QUERY_KEYS):
+            base = offset + CHUNK_QMIN_OFFSET + (i * 8)
+            self._mv[base:base+8] = UINT64_MAX.to_bytes(8, 'little')
+        for i in range(MAX_QUERY_KEYS):
+            base = offset + CHUNK_QMIN_OFFSET + (MAX_QUERY_KEYS * 8) + (i * 8)
+            self._mv[base:base+8] = b"\x00"*8
         
         self.mm.flush()
         return self._chunk_count[0]
