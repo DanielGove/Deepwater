@@ -1,3 +1,4 @@
+import struct
 import tempfile
 from pathlib import Path
 
@@ -17,8 +18,7 @@ def _make_feed(tmpdir: Path, name: str = "test_bounds"):
             {"name": "ev_us", "type": "uint64"},
             {"name": "price", "type": "float64"},
         ],
-        "ts_col": "proc_us",
-        "query_cols": ["recv_us", "ev_us"],
+        "clock_level": 3,
         "persist": True,
         "index_playback": False,
     })
@@ -47,7 +47,7 @@ def test_chunk_metadata_bounds_per_key():
         reg = FeedRegistry(str(reg_path), mode="r")
         meta = reg.get_latest_chunk()
 
-        assert meta.query_key_count == 3
+        assert meta.clock_level == 3
         # primary proc_us
         assert meta.get_qmin(0) == 1_000_020
         assert meta.get_qmax(0) == 1_000_220

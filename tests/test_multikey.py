@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test: Multi-Key Timestamp Queries
+Test: Multi-Key Clock Functionality
 ----------------------------------
 Comprehensive test demonstrating querying on different timestamp columns.
 """
@@ -14,31 +14,30 @@ from deepwater import Platform
 
 
 def test_multi_key_feature():
-    """Test multi-key query functionality"""
+    """Test multi-key clock functionality"""
     print("=" * 70)
-    print("Multi-Key Query Test")
+    print("Multi-Key Clock Test")
     print("=" * 70)
     
     p = Platform('./data/test-multikey')
     
     # Create feed with multiple queryable timestamps
-    print("\n1. Creating feed with query_cols...")
+    print("\n1. Creating feed with 3 clocks...")
     p.create_feed({
         'feed_name': 'test_trades',
         'mode': 'UF',
         'fields': [
-            {'name': 'trade_id', 'type': 'uint64'},
+            {'name': 'ev_us', 'type': 'uint64'},
             {'name': 'recv_us', 'type': 'uint64'},
             {'name': 'proc_us', 'type': 'uint64'},
-            {'name': 'ev_us', 'type': 'uint64'},
+            {'name': 'trade_id', 'type': 'uint64'},
             {'name': 'price', 'type': 'float64'},
             {'name': 'size', 'type': 'float64'},
         ],
-        'ts_col': 'proc_us',
-        'query_cols': ['recv_us', 'proc_us', 'ev_us'],
+        'clock_level': 3,
         'persist': True,
     })
-    print("✓ Feed created with query_cols")
+    print("✓ Feed created with 3 clocks (proc_us, recv_us, ev_us)")
     
     # Write test data
     print("\n2. Writing test data...")
@@ -49,7 +48,7 @@ def test_multi_key_feature():
         ev_us = base_time + (i * 1000)
         recv_us = ev_us + 50
         proc_us = recv_us + 100
-        writer.write_values(i + 1, recv_us, proc_us, ev_us, 100.0 + i, 10.0 * (i + 1))
+        writer.write_values(ev_us, recv_us, proc_us, i + 1, 100.0 + i, 10.0 * (i + 1))
     
     writer.close()
     print("✓ Wrote 10 records")
@@ -62,13 +61,13 @@ def test_multi_key_feature():
     # Query on proc_us (default)
     start = base_time + 150
     end = base_time + 5150
-    records_proc = reader.range(start, end)
+    records_proc = reader.range(start, end, ts_key='proc_us')
     print(f"  Query on proc_us: {len(records_proc)} records")
     
     # Query on ev_us
     start = base_time
     end = base_time + 5000
-    records_ev = reader.range(start, end, ts_key='ev_us')
+    records_ev = reader.range(start, end) # default key is ev_us
     print(f"  Query on ev_us:   {len(records_ev)} records")
     
     # Query on recv_us
@@ -93,7 +92,7 @@ def test_multi_key_feature():
     print(f"  Trades in exchange time window: {len(trades)}")
     
     for trade in trades[:3]:
-        trade_id, recv, proc, ev, price, size = trade
+        ev, recv, proc, trade_id, price, size = trade
         print(f"    Trade {trade_id}: ${price:.2f} @ t+{ev - base_time}µs")
     
     reader.close()
@@ -104,7 +103,7 @@ def test_multi_key_feature():
     print("=" * 70)
     
     print("\nUsage:")
-    print("  p.create_feed({..., 'query_cols': ['recv_us', 'proc_us', 'ev_us']})")
+    print("  p.create_feed({..., 'clock_level': 3})")
     print("  data = reader.range(start, end, ts_key='ev_us')")
 
 

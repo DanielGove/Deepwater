@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import struct
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 # ---- type → (numpy_code, struct_token, size, natural_align) -----------------
 # natural_align is capped implicitly by our logic (<= 8) to mirror common ABIs.
@@ -72,9 +72,7 @@ def _dtype_to_struct(code: str) -> str:
 def build_layout(
     fields: List[Dict],
     *,
-    ts_col: str,
-    query_cols: Optional[List[str]] = None,
-    endian: str = "<",
+    clock_level: int = 1,
     aligned: bool = False,
 ) -> Dict:
     """
@@ -84,10 +82,7 @@ def build_layout(
       fields : [{'name': str, 'type': str, ...}, ...]
                types may be scalar (e.g. 'uint64','float64','char','bool',...)
                or padding like '_6'
-      ts_col : name of the primary uint64 timestamp column (for indexing, required)
-      query_cols : optional list of additional uint64 timestamp columns that can be queried
-                   (e.g. ['recv_us', 'proc_us', 'ev_us']). All must be monotonically increasing.
-      endian : '<' or '>' (struct endianness)
+      clock_level: int (1-3) - how many timestamp fields to reserve up front for reader playback optimizations (e.g. event time, receive time, process time)
       aligned: if True, apply C-style alignment (explicit pads inserted so dtype & struct match)
 
     Returns:
@@ -96,29 +91,31 @@ def build_layout(
         "fmt": "<...>",                 # struct format string
         "record_size": int,
         "fields": [{"name","type","offset","size"}, ...],
-        "ts_name": str,                 # primary timestamp column
-        "ts_offset": int,
-        "ts_size": 8,
-        "ts_endian": "<" or ">",
-        "query_keys": {"col_name": {"offset": int, "size": 8}, ...},  # queryable timestamps
+        "clock_level": int,                # Number of clocks to track (Max 3: e.g. event time, receive time, process time)
         "dtype": { "names","formats","offsets","itemsize" }  # NumPy explicit-offset spec
         "version": 1
       }
     """
-    if endian not in ("<", ">"):
-        raise ValueError("endian must be '<' or '>'")
-
     names:   List[str] = []
     formats: List[str] = []
     offsets: List[int] = []
     out_fields: List[Dict] = []
 
+    endian = "<"  # default to little-endian for both struct & numpy (matches x86_64 native)
+
+    # Clock is required
+    if clock_level < 1 or clock_level > 3:
+        raise ValueError("clock_level must be between 1 and 3")
+    # Clocks need corresponding uint64 fields up front in the field list (e.g. 'ev_us', 'recv_us', 'proc_us')
+    for i in range(clock_level):
+        if i >= len(fields):
+            raise ValueError(f"clock_level={clock_level} requires at least {clock_level} fields for timestamps")
+        f = fields[i]
+        if f["type"] != "uint64":
+            raise ValueError(f"clock_level={clock_level} requires field '{f['name']}' to be uint64 for timestamp")
+
     off = 0
     max_align = 1
-    ts_off: Optional[int] = None
-    query_keys: Dict[str, Dict[str, int]] = {}  # {col_name: {offset, size}}
-    query_cols_set = set(query_cols or [])
-
     for f in fields:
         name = f["name"]
         typ  = f["type"]
@@ -157,14 +154,6 @@ def build_layout(
         formats.append(np_code)
         offsets.append(off)
         out_fields.append({"name": name, "type": typ, "offset": off, "size": size})
-        if name == ts_col:
-            if typ != "uint64":
-                raise ValueError("ts_col must be a uint64 field")
-            ts_off = off
-        if name in query_cols_set:
-            if typ != "uint64":
-                raise ValueError(f"query_col '{name}' must be a uint64 field")
-            query_keys[name] = {"offset": off, "size": size}
         off += size
 
     # tail pad to overall alignment if requested
@@ -178,15 +167,6 @@ def build_layout(
             offsets.append(off)
             out_fields.append({"name": "_", "type": f"_{tail}", "offset": off, "size": tail})
             itemsize += tail
-
-    if ts_off is None:
-        raise ValueError(f"ts_col '{ts_col}' not present in fields[]")
-    
-    # Validate all query_cols were found
-    if query_cols:
-        missing = query_cols_set - set(query_keys.keys())
-        if missing:
-            raise ValueError(f"query_cols not found in fields: {missing}")
 
     # Build struct fmt by walking the dtype spec (offset gaps → 'x' pads)
     parts: List[str] = []
@@ -208,10 +188,7 @@ def build_layout(
         "fmt": fmt,
         "record_size": itemsize,
         "fields": out_fields,
-        "ts_name": ts_col,
-        "ts_offset": ts_off,
-        "ts_size": 8,
-        "ts_endian": endian,
+        "clock_level": clock_level,
         "dtype": {
             "names": names,
             "formats": formats,
@@ -220,8 +197,6 @@ def build_layout(
         },
         "version": 1,
     }
-    if query_keys:
-        layout["query_keys"] = query_keys
     return layout
 
 

@@ -22,20 +22,19 @@ from pathlib import Path
 from deepwater import Platform
 
 
-def make_platform(base: Path, chunk_mb: int, with_queries: bool = True) -> Platform:
+def make_platform(base: Path, chunk_mb: int) -> Platform:
     p = Platform(str(base))
     spec = {
         "feed_name": "bench",
         "mode": "UF",
         "fields": [
-            {"name": "id", "type": "uint64"},
+            {"name": "ev_us", "type": "uint64"},
             {"name": "recv_us", "type": "uint64"},
             {"name": "proc_us", "type": "uint64"},
-            {"name": "ev_us", "type": "uint64"},
+            {"name": "id", "type": "uint64"},
             {"name": "price", "type": "float64"},
         ],
-        "ts_col": "proc_us",
-        "query_cols": ["recv_us", "ev_us"] if with_queries else [],
+        "clock_level": 3,
         "persist": True,
         "chunk_size_mb": chunk_mb,
         "index_playback": False,
@@ -46,24 +45,23 @@ def make_platform(base: Path, chunk_mb: int, with_queries: bool = True) -> Platf
 
 def bench_write_values(writer, n_records: int) -> tuple[float, int, int]:
     """Return (elapsed_s, start_ts, end_ts)."""
-    base = int(time.time() * 1e6)
+    base = time.time_ns() // 1_000
     start = time.perf_counter()
     for i in range(n_records):
-        ts = base + i
-        writer.write_values(i, ts - 5, ts, ts - 10, 100.0)
+        ts = base + 1234*i
+        writer.write_values(ts, ts + 5, ts + 10, i, 100.0)
     writer.close()
     elapsed = time.perf_counter() - start
-    end_ts = base + n_records
+    end_ts = base + 1234 * n_records
     return elapsed, base, end_ts
 
 
 def bench_write_batch(writer, batch_size: int, n_records: int) -> tuple[float, int, int]:
     """Return (elapsed_s, start_ts, end_ts) using write_batch_bytes."""
-    byteorder = writer.record_format.get("ts_endian", "<")
-    fmt = f"{byteorder}QQQQd"
+    fmt = f"<QQQQd"
     S = struct.Struct(fmt)
     rec_size = S.size
-    base = int(time.time() * 1e6)
+    base = time.time_ns() // 1_000
     batch_bytes = bytearray(batch_size * rec_size)
     start = time.perf_counter()
     written = 0
@@ -72,7 +70,7 @@ def bench_write_batch(writer, batch_size: int, n_records: int) -> tuple[float, i
         for j in range(batch_count):
             idx = written + j
             ts = base + idx
-            S.pack_into(batch_bytes, j * rec_size, idx, ts - 5, ts, ts - 10, 100.0)
+            S.pack_into(batch_bytes, j * rec_size, ts, ts + 5, ts + 10, idx, 100.0)
         writer.write_batch_bytes(batch_bytes[: batch_count * rec_size])
         written += batch_count
     writer.close()

@@ -46,6 +46,7 @@ CHUNK_SIZE_OFFSET = 48
 CHUNK_STATUS_OFFSET = 56
 CHUNK_QCOUNT_OFFSET = 57
 CHUNK_QMIN_OFFSET = 64
+CHUNK_QMAX_OFFSET = 88
 MAX_QUERY_KEYS = 3
 UINT64_MAX = (1 << 64) - 1
 
@@ -68,8 +69,8 @@ class ChunkMeta:
         self._size   = chunk_record[CHUNK_SIZE_OFFSET:CHUNK_STATUS_OFFSET].cast("Q")
         self._status = chunk_record[CHUNK_STATUS_OFFSET:CHUNK_QCOUNT_OFFSET].cast("B")
         self._qcount = chunk_record[CHUNK_QCOUNT_OFFSET:CHUNK_QCOUNT_OFFSET+1].cast("B")
-        self._qmins  = chunk_record[CHUNK_QMIN_OFFSET:CHUNK_QMIN_OFFSET + (MAX_QUERY_KEYS * 8)].cast("Q")
-        self._qmaxs  = chunk_record[CHUNK_QMIN_OFFSET + (MAX_QUERY_KEYS * 8):CHUNK_QMIN_OFFSET + (MAX_QUERY_KEYS * 16)].cast("Q")
+        self._qmins  = chunk_record[CHUNK_QMIN_OFFSET:CHUNK_QMAX_OFFSET].cast("Q")
+        self._qmaxs  = chunk_record[CHUNK_QMAX_OFFSET:CHUNK_QMAX_OFFSET + 24].cast("Q")
 
     @property
     def start_time(self) -> int:
@@ -118,7 +119,7 @@ class ChunkMeta:
         return self._size[0]
     @size.setter
     def size(self, v: int) -> None:
-        self._size[0] = v
+        raise Exception("Cannot overwrite chunk size in registry")
 
     @property
     def status(self) -> int:
@@ -129,10 +130,11 @@ class ChunkMeta:
         self._status[0] = v & 0xFF
 
     @property
-    def query_key_count(self) -> int:
+    def clock_level(self) -> int:
         return self._qcount[0]
-    @query_key_count.setter
-    def query_key_count(self, v: int) -> None:
+    @clock_level.setter
+    def clock_level(self, v: int) -> None:
+        # clamp to 0..255 to avoid ValueError from casted B view
         self._qcount[0] = v & 0xFF
 
     def get_qmin(self, idx: int) -> int:
@@ -222,7 +224,7 @@ class FeedRegistry:
         return def_size, def_chunk_id, def_status
 
     def register_chunk(self, start_time: int, chunk_id: int = None, size: int = None,
-                      status: int = None, query_key_count: int = 1) -> int:
+                      status: int = None, clock_level: int = 1) -> int:
         if not self.is_writer:
             raise PermissionError("Read-only mode")
         self._chunk_count[0] += 1
@@ -241,7 +243,7 @@ class FeedRegistry:
         self._mv[offset + CHUNK_ID_OFFSET:offset + CHUNK_SIZE_OFFSET] = chunk_id.to_bytes(8, 'little')
         self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_STATUS_OFFSET] = size.to_bytes(8, 'little')
         self._mv[offset + CHUNK_STATUS_OFFSET] = status
-        self._mv[offset + CHUNK_QCOUNT_OFFSET] = query_key_count & 0xFF
+        self._mv[offset + CHUNK_QCOUNT_OFFSET] = clock_level & 0xFF
         # initialize qmins to UINT64_MAX and qmaxs to 0
         for i in range(MAX_QUERY_KEYS):
             base = offset + CHUNK_QMIN_OFFSET + (i * 8)
@@ -275,35 +277,25 @@ class FeedRegistry:
         # Update our max_chunks
         self.max_chunks = new_max_chunks
 
-    def _chunk_start_time(self, index: int) -> int:
-        """1-based index into registry; returns recorded chunk start."""
-        # Inline offset calculation for speed
-        offset = HEADER_SIZE + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
-        # Direct cast instead of int.from_bytes (2x faster)
+    def _chunk_start_time(self, index: int, qoff: int = 0) -> int:
+        """returns recorded chunk start for a specific time key"""
+        offset = CHUNK_QMIN_OFFSET + HEADER_SIZE + qoff + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
         return self._mv[offset:offset+8].cast('Q')[0]
 
-    def _chunk_end_time(self, index: int) -> int:
-        """
-        1-based index into registry; returns end_time, falling back to last_update
-        for active chunks where end_time may be unset.
-        """
-        base = HEADER_SIZE + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
-        # Direct cast instead of int.from_bytes
-        end = self._mv[base + CHUNK_END_OFFSET:base + CHUNK_END_OFFSET + 8].cast('Q')[0]
-        if end != 0:
-            return end
-        # fall back to last_update so open chunks can be included in range queries
-        return self._mv[base + CHUNK_LAST_UPDATE_OFFSET:base + CHUNK_LAST_UPDATE_OFFSET + 8].cast('Q')[0]
+    def _chunk_end_time(self, index: int, qoff: int = 0) -> int:
+        """returns recorded chunk end for a specific time key"""
+        offset = CHUNK_QMAX_OFFSET + HEADER_SIZE + qoff + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
+        return self._mv[offset:offset+8].cast('Q')[0]
 
     def get_chunk_metadata(self, index: int) -> memoryview:
         # Inline offset calculation with bit shift
         offset = HEADER_SIZE + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
         return ChunkMeta(self._mv[offset:offset + CHUNK_SIZE])
 
-    def _binary_search_start_time(self, target_time: int) -> int:
+    def _binary_search_start_time(self, target_time: int, qoff:int = 0) -> int:
         """
-        Return the first 1-based chunk index whose start_time >= target_time.
-        If target_time is greater than all chunk starts, returns chunk_count+1.
+        Return the first chunk index whose start_time <= target_time.
+        If target_time is greater than all chunk starts, returns 1.
         """
         # Cache chunk_count to avoid repeated property access
         count = self._chunk_count[0]
@@ -312,15 +304,15 @@ class FeedRegistry:
             mid = (left + right) >> 1
             if mid > count:
                 break
-            if self._chunk_start_time(mid) < target_time:
+            if self._chunk_start_time(mid, qoff) > target_time:
                 left = mid + 1
             else:
                 right = mid
         return left
 
-    def _binary_search_end_time(self, target_time: int) -> int:
+    def _binary_search_end_time(self, target_time: int, qoff: int = 0) -> int:
         """
-        Return the first 1-based chunk index whose end_time > target_time.
+        Return the first 1-based chunk index whose end_time >= target_time.
         If all chunk end times are <= target_time, returns chunk_count+1.
         """
         # Cache chunk_count to avoid repeated property access
@@ -330,31 +322,29 @@ class FeedRegistry:
             mid = (left + right) >> 1
             if mid > count:
                 break
-            if self._chunk_end_time(mid) <= target_time:
+            if self._chunk_end_time(mid,qoff) < target_time:
                 left = mid + 1
             else:
                 right = mid
         return left
 
-    def get_chunks_before(self, time_t: int) -> Iterator[int]:
+    def get_chunks_before(self, time_t: int, qoff: int = 0) -> Iterator[int]:
         """Yield 1-based chunk indices whose start_time is before time_t."""
-        end_idx = self._binary_search_start_time(time_t)
+        end_idx = self._binary_search_start_time(time_t, qoff)
         return range(1, min(end_idx, self._chunk_count[0] + 1))
 
-    def get_chunks_after(self, time_t: int) -> Iterator[int]:
+    def get_chunks_after(self, time_t: int, qoff: int = 0) -> Iterator[int]:
         """Yield 1-based chunk indices whose end_time is >= time_t."""
-        start_idx = self._binary_search_end_time(time_t)
+        start_idx = self._binary_search_end_time(time_t, qoff)
         return range(start_idx, self._chunk_count[0] + 1)
 
-    def get_chunks_in_range(self, start_time: int, end_time: int) -> Iterator[int]:
-        """
-        Yield 1-based chunk indices whose time window overlaps [start_time, end_time].
-        """
+    def get_chunks_in_range(self, start_time: int, end_time: int, qoff: int = 0) -> Iterator[int]:
+        """Yield chunk indices whose time window overlaps [start_time, end_time] for a specific time key."""
         if self._chunk_count[0] == 0:
             return iter(())
 
-        start_idx = self._binary_search_end_time(start_time - 1)
-        end_idx = self._binary_search_start_time(end_time + 1)
+        start_idx = self._binary_search_end_time(start_time, qoff)
+        end_idx = 1+self._binary_search_start_time(end_time, qoff)
         return range(start_idx, min(end_idx, self._chunk_count[0] + 1))
 
     def get_latest_chunk_idx(self) -> Optional[int]:

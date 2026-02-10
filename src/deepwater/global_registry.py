@@ -2,6 +2,20 @@
 import struct, mmap, os, fcntl
 from pathlib import Path
 from typing import Optional
+import time
+
+
+FEED_NAME_LEN = 32
+# name:32  chunk_sz_bytes:I  retain_h:I  persist:bool index_callback:bool  clock_level:Q created_us:Q
+_ENTRY_CORE   = struct.Struct('<32sII??6xQQ64x') # Pad to 128
+ENTRY_SIZE = _ENTRY_CORE.size
+HEADER_SIZE = _ENTRY_CORE.size
+CHUNK_SIZE_OFFSET = 32
+RETAIN_HOURS_OFFSET = 36
+PERSIST_OFFSET = 40
+INDEX_PLAYBACK_OFFSET = 41
+CLOCK_LEVEL_OFFSET = 48
+
 
 class GlobalRegistry:
     """
@@ -10,27 +24,17 @@ class GlobalRegistry:
     Formatting (fmt/fields/ts_off) lives in data/<feed>/layout.json, not here.
     """
 
-    FEED_NAME_LEN = 32
-    # name:32  chunk_sz_bytes:I  retain_h:I  persist:bool index_callback:bool  created_us:Q
-    _ENTRY_CORE   = struct.Struct('<32sII??6xQ72x') # Pad to 128
-    ENTRY_SIZE = _ENTRY_CORE.size
-    HEADER_SIZE = _ENTRY_CORE.size
-    CHUNK_SIZE_OFFSET = 32
-    RETAIN_HOURS_OFFSET = 36
-    PERSIST_OFFSET = 40
-    INDEX_PLAYBACK_OFFSET = 41
-
     def __init__(self, base_path: Path):
         self.registry_path = base_path / "registry"
         self.registry_path.mkdir(parents=True, exist_ok=True)
         self.registry_file = self.registry_path / "global_registry.bin"
         self.max_feeds = 16383
-        self.size = self.HEADER_SIZE + self.max_feeds * self.ENTRY_SIZE
+        self.size = HEADER_SIZE + self.max_feeds * ENTRY_SIZE
 
         if not self.registry_file.exists():
             with open(self.registry_file, 'wb') as f:
                 f.write(struct.pack('<Q120x', 0))  # feed_count = 0
-                f.write(b'\x00' * (self.size - self.HEADER_SIZE))
+                f.write(b'\x00' * (self.size - HEADER_SIZE))
 
         self.fd = os.open(self.registry_file, os.O_RDWR)
         self.lock_fd = open(self.registry_file, 'rb+')
@@ -52,31 +56,30 @@ class GlobalRegistry:
 
     # ---------- locate ----------
     def _find_insert_offset(self, name: str) -> int:
-        key = name.ljust(self.FEED_NAME_LEN, '\0').encode('utf-8')
-        lo, hi = self.HEADER_SIZE, self.HEADER_SIZE + self.feed_count * self.ENTRY_SIZE
+        key = name.ljust(FEED_NAME_LEN, '\0').encode('utf-8')
+        lo, hi = HEADER_SIZE, HEADER_SIZE + self.feed_count * ENTRY_SIZE
         while lo < hi:
-            mid = (lo + hi) // 2 // self.ENTRY_SIZE * self.ENTRY_SIZE
-            mid_name = self.mmap[mid:mid+self.FEED_NAME_LEN]
-            lo, hi = (mid + self.ENTRY_SIZE, hi) if mid_name < key else (lo, mid)
+            mid = (lo + hi) // 2 // ENTRY_SIZE * ENTRY_SIZE
+            mid_name = self.mmap[mid:mid+FEED_NAME_LEN]
+            lo, hi = (mid + ENTRY_SIZE, hi) if mid_name < key else (lo, mid)
         return hi
 
     def _find_feed_offset(self, name: str) -> Optional[int]:
-        key = name.ljust(self.FEED_NAME_LEN, '\0').encode('utf-8')
-        lo, hi = self.HEADER_SIZE, self.HEADER_SIZE + self.feed_count * self.ENTRY_SIZE
+        key = name.ljust(FEED_NAME_LEN, '\0').encode('utf-8')
+        lo, hi = HEADER_SIZE, HEADER_SIZE + self.feed_count * ENTRY_SIZE
         while lo <= hi:
-            mid = (lo + hi) // 2 // self.ENTRY_SIZE * self.ENTRY_SIZE
-            mid_name = self.mmap[mid:mid+self.FEED_NAME_LEN]
+            mid = (lo + hi) // 2 // ENTRY_SIZE * ENTRY_SIZE
+            mid_name = self.mmap[mid:mid+FEED_NAME_LEN]
             if mid_name == key: return mid
-            lo, hi = (mid + self.ENTRY_SIZE, hi) if mid_name < key else (lo, mid - self.ENTRY_SIZE)
+            lo, hi = (mid + ENTRY_SIZE, hi) if mid_name < key else (lo, mid - ENTRY_SIZE)
         return 0
 
     def feed_exists(self, name: str) -> bool:
         return self._find_feed_offset(name) > 0
     def list_feeds(self):
-        return [self.mmap[offset:offset+32].rstrip(b'\x00').decode() for offset in range(self.HEADER_SIZE, self.HEADER_SIZE+self.feed_count*self.ENTRY_SIZE,self.ENTRY_SIZE)]
-
+        return [self.mmap[offset:offset+FEED_NAME_LEN].rstrip(b'\x00').decode() for offset in range(HEADER_SIZE, HEADER_SIZE+self.feed_count*ENTRY_SIZE,ENTRY_SIZE)]
     # ---------- public API ----------
-    def register_feed(self, name: str, lifecycle: dict, now_us: int = 0) -> bool:
+    def register_feed(self, name: str, lifecycle: dict, clock_level) -> bool:
         self._lock()
         try:
             if self.feed_exists(name):
@@ -84,14 +87,15 @@ class GlobalRegistry:
             if self.feed_count >= self.max_feeds:
                 raise RuntimeError("Registry full")
             offset = self._find_insert_offset(name)
-            self.mmap[offset+self.ENTRY_SIZE:self.HEADER_SIZE+(self.feed_count*self.ENTRY_SIZE)+self.ENTRY_SIZE] = self.mmap[offset:self.HEADER_SIZE+(self.feed_count*self.ENTRY_SIZE)]
-            self._ENTRY_CORE.pack_into(self.mmap, offset,
-                                       name.ljust(self.FEED_NAME_LEN, '\0').encode(),
+            self.mmap[offset+ENTRY_SIZE:HEADER_SIZE+(self.feed_count*ENTRY_SIZE)+ENTRY_SIZE] = self.mmap[offset:HEADER_SIZE+(self.feed_count*ENTRY_SIZE)]
+            _ENTRY_CORE.pack_into(self.mmap, offset,
+                                       name.ljust(FEED_NAME_LEN, '\0').encode(),
                                        lifecycle.get("chunk_size_bytes", 64 * 1024 * 1024),
                                        lifecycle.get("retention_hours", 0),
                                        lifecycle.get("persist", True),
                                        lifecycle.get("index_playback", False),
-                                       now_us)
+                                       clock_level,
+                                       time.time_ns() // 1_000)
             self.feed_count = self.feed_count+1
             self.mmap.flush()
             return True
@@ -102,7 +106,7 @@ class GlobalRegistry:
         offset = self._find_feed_offset(name)
         if offset == 0:
             return None
-        nm, chunk_sz_bytes, retain_h, persist, index_playback, created_us = self._ENTRY_CORE.unpack(self.mmap[offset:offset+self.ENTRY_SIZE])
+        nm, chunk_sz_bytes, retain_h, persist, index_playback, clock_level, created_us = _ENTRY_CORE.unpack(self.mmap[offset:offset+ENTRY_SIZE])
         name = nm.rstrip(b'\0').decode()
         return {
             "feed_name": name,
@@ -110,6 +114,7 @@ class GlobalRegistry:
             "retention_hours": retain_h,
             "persist": persist,
             "index_playback": index_playback,
+            "clock_level": clock_level,
             "created_us": created_us,
         }
     
@@ -119,13 +124,13 @@ class GlobalRegistry:
                 offset = self._find_feed_offset(name)
                 if offset == 0: return False
                 if kwargs.get("chunk_size_bytes") is not None:
-                    self.mmap[offset+self.CHUNK_SIZE_OFFSET:offset+self.CHUNK_SIZE_OFFSET+4] = int.to_bytes(kwargs.get("chunk_size_bytes"),4,'little')
+                    self.mmap[offset+CHUNK_SIZE_OFFSET:offset+CHUNK_SIZE_OFFSET+4] = int.to_bytes(kwargs.get("chunk_size_bytes"),4,'little')
                 if kwargs.get("retention_hours") is not None:
-                    self.mmap[offset+self.RETAIN_HOURS_OFFSET:offset+self.RETAIN_HOURS_OFFSET+4] = int.to_bytes(kwargs.get("retention_hours"),4,'little')
+                    self.mmap[offset+RETAIN_HOURS_OFFSET:offset+RETAIN_HOURS_OFFSET+4] = int.to_bytes(kwargs.get("retention_hours"),4,'little')
                 if kwargs.get("persist") is not None:
-                    self.mmap[offset+self.PERSIST_OFFSET:offset+self.PERSIST_OFFSET+1] = kwargs.get("persist").to_bytes(1)
+                    self.mmap[offset+PERSIST_OFFSET:offset+PERSIST_OFFSET+1] = kwargs.get("persist").to_bytes(1)
                 if kwargs.get("index_playback") is not None:
-                    self.mmap[offset+self.INDEX_PLAYBACK_OFFSET:offset+self.INDEX_PLAYBACK_OFFSET+1] = kwargs.get("index_playback").to_bytes(1)
+                    self.mmap[offset+INDEX_PLAYBACK_OFFSET:offset+INDEX_PLAYBACK_OFFSET+1] = kwargs.get("index_playback").to_bytes(1)
                 self.mmap.flush()
                 return True
             finally:
@@ -154,9 +159,9 @@ if __name__ == "__main__":
                 # file exists and is correctly sized
                 assert reg.registry_file.exists()
                 assert reg.feed_count == 0
-                assert_eq(reg.ENTRY_SIZE, 128, "ENTRY_SIZE should be 128")
+                assert_eq(ENTRY_SIZE, 128, "ENTRY_SIZE should be 128")
                 # header present
-                assert reg.size >= reg.HEADER_SIZE + reg.ENTRY_SIZE
+                assert reg.size >= HEADER_SIZE + ENTRY_SIZE
             finally:
                 reg.close()
 

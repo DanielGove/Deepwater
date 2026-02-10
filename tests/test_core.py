@@ -22,6 +22,10 @@ def test_platform_init():
 
 def test_feed_creation():
     """Test feed can be created with basic schema"""
+    base = Path('./data/test-core')
+    if base.exists():
+        import shutil
+        shutil.rmtree(base)
     p = Platform('./data/test-core')
     
     p.create_feed({
@@ -32,7 +36,7 @@ def test_feed_creation():
             {'name': 'value', 'type': 'float64'},
             {'name': 'timestamp_us', 'type': 'uint64'},
         ],
-        'ts_col': 'timestamp_us',
+        'clock_level': 1,
         'persist': True,
     })
     
@@ -45,7 +49,7 @@ def test_feed_creation():
             {'name': 'value', 'type': 'float64'},
             {'name': 'timestamp_us', 'type': 'uint64'},
         ],
-        'ts_col': 'timestamp_us',
+        'clock_level': 1,
         'persist': True,
     })
     
@@ -55,6 +59,10 @@ def test_feed_creation():
 
 def test_write_read_cycle():
     """Test write and read basic records"""
+    base = Path('./data/test-core')
+    if base.exists():
+        import shutil
+        shutil.rmtree(base)
     p = Platform('./data/test-core')
     
     # Ensure feed exists
@@ -62,11 +70,11 @@ def test_write_read_cycle():
         'feed_name': 'test_basic',
         'mode': 'UF',
         'fields': [
-            {'name': 'id', 'type': 'uint64'},
-            {'name': 'value', 'type': 'float64'},
             {'name': 'timestamp_us', 'type': 'uint64'},
+            {'name': 'value', 'type': 'float64'},
+            {'name': 'id', 'type': 'uint64'},
         ],
-        'ts_col': 'timestamp_us',
+        'clock_level': 1,
         'persist': True,
     })
     
@@ -75,7 +83,7 @@ def test_write_read_cycle():
     base_time = int(time.time() * 1e6)
     
     for i in range(10):
-        writer.write_values(i, float(i * 10), base_time + i * 1000)
+        writer.write_values(base_time + i, float(i), i)
     
     writer.close()
     
