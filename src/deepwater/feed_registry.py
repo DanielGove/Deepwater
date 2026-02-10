@@ -287,18 +287,29 @@ class FeedRegistry:
         offset = CHUNK_QMAX_OFFSET + HEADER_SIZE + qoff + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
         return self._mv[offset:offset+8].cast('Q')[0]
 
+    def _last_non_empty_idx(self, qoff: int = 0) -> int:
+        """Return highest chunk index that has initialized qmin/qmax for the given clock."""
+        count = self._chunk_count[0]
+        while count > 0:
+            qmin = self._chunk_start_time(count, qoff)
+            qmax = self._chunk_end_time(count, qoff)
+            if qmax != 0 and qmin != UINT64_MAX and qmin <= qmax:
+                return count
+            count -= 1
+        return 0
+
     def get_chunk_metadata(self, index: int) -> memoryview:
         # Inline offset calculation with bit shift
         offset = HEADER_SIZE + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
         return ChunkMeta(self._mv[offset:offset + CHUNK_SIZE])
 
-    def _binary_search_start_time(self, target_time: int, qoff:int = 0) -> int:
+    def _binary_search_start_time(self, target_time: int, qoff:int = 0, bound: int = None) -> int:
         """
         Return the first chunk index whose start_time <= target_time.
         If target_time is greater than all chunk starts, returns 1.
         """
         # Cache chunk_count to avoid repeated property access
-        count = self._chunk_count[0]
+        count = bound if bound is not None else self._chunk_count[0]
         left, right = 1, count + 1  # right is exclusive
         while left < right:
             mid = (left + right) >> 1
@@ -310,13 +321,13 @@ class FeedRegistry:
                 right = mid
         return left
 
-    def _binary_search_end_time(self, target_time: int, qoff: int = 0) -> int:
+    def _binary_search_end_time(self, target_time: int, qoff: int = 0, bound: int = None) -> int:
         """
         Return the first 1-based chunk index whose end_time >= target_time.
         If all chunk end times are <= target_time, returns chunk_count+1.
         """
         # Cache chunk_count to avoid repeated property access
-        count = self._chunk_count[0]
+        count = bound if bound is not None else self._chunk_count[0]
         left, right = 1, count + 1
         while left < right:
             mid = (left + right) >> 1
@@ -330,22 +341,42 @@ class FeedRegistry:
 
     def get_chunks_before(self, time_t: int, qoff: int = 0) -> Iterator[int]:
         """Yield 1-based chunk indices whose start_time is before time_t."""
-        end_idx = self._binary_search_start_time(time_t, qoff)
+        last = self._last_non_empty_idx(qoff)
+        if last == 0:
+            return iter(())
+        end_idx = self._binary_search_start_time(time_t, qoff, bound=last)
         return range(1, min(end_idx, self._chunk_count[0] + 1))
 
     def get_chunks_after(self, time_t: int, qoff: int = 0) -> Iterator[int]:
-        """Yield 1-based chunk indices whose end_time is >= time_t."""
-        start_idx = self._binary_search_end_time(time_t, qoff)
-        return range(start_idx, self._chunk_count[0] + 1)
+        """Yield 1-based chunk indices whose end_time is >= time_t (inclusive). Uses binary search on qmax."""
+        last = self._last_non_empty_idx(qoff)
+        if last == 0:
+            return iter(())
+        start_idx = self._binary_search_end_time(time_t, qoff, bound=last)
+        for idx in range(start_idx, last + 1):
+            qmin = self._chunk_start_time(idx, qoff)
+            qmax = self._chunk_end_time(idx, qoff)
+            if qmax == 0 or qmin == UINT64_MAX or qmin > qmax:
+                continue  # empty/uninitialized chunk
+            yield idx
 
     def get_chunks_in_range(self, start_time: int, end_time: int, qoff: int = 0) -> Iterator[int]:
         """Yield chunk indices whose time window overlaps [start_time, end_time] for a specific time key."""
-        if self._chunk_count[0] == 0:
+        last = self._last_non_empty_idx(qoff)
+        if last == 0:
             return iter(())
-
-        start_idx = self._binary_search_end_time(start_time, qoff)
-        end_idx = 1+self._binary_search_start_time(end_time, qoff)
-        return range(start_idx, min(end_idx, self._chunk_count[0] + 1))
+        # First chunk whose end_time >= start_time
+        idx = self._binary_search_end_time(start_time, qoff, bound=last)
+        while idx <= last:
+            qmin = self._chunk_start_time(idx, qoff)
+            qmax = self._chunk_end_time(idx, qoff)
+            # Stop early if remaining chunks start after the range
+            if qmin > end_time:
+                break
+            if not (qmax == 0 or qmin == UINT64_MAX or qmin > qmax):
+                if qmax >= start_time and qmin <= end_time:
+                    yield idx
+            idx += 1
 
     def get_latest_chunk_idx(self) -> Optional[int]:
         """Return the chunk_id of the most recently registered chunk."""

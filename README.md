@@ -29,17 +29,17 @@ p.create_feed({
     'feed_name': 'trades',
     'mode': 'UF',
     'fields': [
+        {'name': 'timestamp_us', 'type': 'uint64'},  # time axes first
         {'name': 'price', 'type': 'float64'},
         {'name': 'size', 'type': 'float64'},
-        {'name': 'timestamp_us', 'type': 'uint64'},
     ],
-    'ts_col': 'timestamp_us',
+    'clock_level': 1,  # number of time axes (1-3); first N fields must be uint64 timestamps
     'persist': True,  # True=disk, False=memory-only ring buffer
 })
 
 # Write
 writer = p.create_writer('trades')
-writer.write_values(123.45, 100.0, int(time.time() * 1e6))
+writer.write_values(int(time.time() * 1e6), 123.45, 100.0)
 writer.close()
 
 # Read
@@ -49,6 +49,14 @@ for record in reader.stream():  # Live streaming
     break
 records = reader.range(start_us, end_us)  # Historical range
 reader.close()
+
+# Clock Levels
+# -------------
+# clock_level defines how many timelines your feed tracks:
+#   1 → single timeline (e.g., wall clock)
+#   2 → dual timelines (e.g., exchange event time + receive time)
+#   3 → triple timelines (e.g., event, received, processed)
+# Place those time fields first in `fields` (all uint64). They are all queryable via `ts_key`.
 
 # API docs
 help(Platform)
@@ -84,8 +92,11 @@ def test_your_feature():
     p.create_feed({
         'feed_name': 'test',
         'mode': 'UF',
-        'fields': [{'name': 'value', 'type': 'uint64'}],
-        'ts_col': 'value',
+        'fields': [
+            {'name': 'value_ts', 'type': 'uint64'},  # time axis first
+            {'name': 'value', 'type': 'uint64'},
+        ],
+        'clock_level': 1,
         'persist': True,
     })
     

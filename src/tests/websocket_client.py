@@ -30,17 +30,16 @@ def trades_spec(pid: str) -> dict:
             {"name":"_",          "type":"_6",    "desc":"padding"},
             {"name":"trade_id",   "type":"uint64", "desc":"exchange trade id"},
             {"name":"packet_us",  "type":"uint64", "desc":"time packet was sent (us)"},
-            {"name":"recv_us",    "type":"uint64", "desc":"time packet was received (us)"},
-            {"name":"proc_us",    "type":"uint64", "desc":"time packet was ingested (us)"},
-            {"name":"ev_us",      "type":"uint64", "desc":"event timestamp (us)"},
-            {"name":"price",      "type":"float64","desc":"trade price"},
-            {"name":"size",       "type":"float64","desc":"trade size"},
-        ],
-        "ts_col": "proc_us",
-        "query_cols": ["recv_us", "proc_us", "ev_us"],  # Enable multi-key queries
-        "chunk_size_bytes": 0.0625 * 1024 * 1024,
-        "persist": True
-    }
+        {"name":"recv_us",    "type":"uint64", "desc":"time packet was received (us)"},
+        {"name":"proc_us",    "type":"uint64", "desc":"time packet was ingested (us)"},
+        {"name":"ev_us",      "type":"uint64", "desc":"event timestamp (us)"},
+        {"name":"price",      "type":"float64","desc":"trade price"},
+        {"name":"size",       "type":"float64","desc":"trade size"},
+    ],
+    "clock_level": 3,  # three leading timestamp axes
+    "chunk_size_bytes": 0.0625 * 1024 * 1024,
+    "persist": True
+}
 
 def l2_spec(pid: str) -> dict:
     return {
@@ -51,19 +50,18 @@ def l2_spec(pid: str) -> dict:
             {"name":"side",       "type":"char",   "desc":"B=bid,A=ask"},
             {"name":"_",          "type":"_6",     "desc":"padding"},
             {"name":"packet_us",  "type":"uint64", "desc":"time packet was sent (us)"},
-            {"name":"recv_us",    "type":"uint64", "desc":"time packet was received (us)"},
-            {"name":"proc_us",    "type":"uint64", "desc":"time packet was ingested (us)"},
-            {"name":"ev_us",      "type":"uint64", "desc":"event timestamp (us)"},
-            {"name":"price",      "type":"float64","desc":"price level"},
-            {"name":"qty",        "type":"float64","desc":"new quantity at level"},
-            {"name":"_",          "type":"_8",     "desc":"padding"},
-        ],
-        "ts_col": "proc_us",
-        "query_cols": ["recv_us", "proc_us", "ev_us"],  # Enable multi-key queries
-        "chunk_size_bytes": 0.0625 * 1024 * 1024,
-        "persist": True,
-        "index_playback": True
-    }
+        {"name":"recv_us",    "type":"uint64", "desc":"time packet was received (us)"},
+        {"name":"proc_us",    "type":"uint64", "desc":"time packet was ingested (us)"},
+        {"name":"ev_us",      "type":"uint64", "desc":"event timestamp (us)"},
+        {"name":"price",      "type":"float64","desc":"price level"},
+        {"name":"qty",        "type":"float64","desc":"new quantity at level"},
+        {"name":"_",          "type":"_8",     "desc":"padding"},
+    ],
+    "clock_level": 3,
+    "chunk_size_bytes": 0.0625 * 1024 * 1024,
+    "persist": True,
+    "index_playback": True
+}
 
 # ======= tiny allocation-aware helpers =======
 def _now_us() -> int: return time.time_ns() // 1_000

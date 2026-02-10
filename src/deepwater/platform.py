@@ -43,16 +43,16 @@ class Platform:
         >>> from deepwater import Platform
         >>> p = Platform('./my_data')
         >>> 
-        >>> # 2. Define schema
+        >>> # 2. Define schema (clock_level = number of leading uint64 time axes)
         >>> p.create_feed({
         ...     'feed_name': 'trades',
         ...     'mode': 'UF',  # Unindexed feed (simple, fast)
         ...     'fields': [
+        ...         {'name': 'timestamp_us', 'type': 'uint64'},  # time axes first
         ...         {'name': 'price', 'type': 'float64'},
         ...         {'name': 'size', 'type': 'float64'},
-        ...         {'name': 'timestamp_us', 'type': 'uint64'},
         ...     ],
-        ...     'ts_col': 'timestamp_us',  # Time column for range queries
+        ...     'clock_level': 1,  # 1-3; first N fields must be uint64 timestamps
         ...     'persist': True,  # Disk storage (vs memory-only)
         ... })
         >>> 
@@ -92,9 +92,9 @@ class Platform:
         ...         {'name': 'price', 'type': 'float64'},
         ...         {'name': 'quantity', 'type': 'float64'},
         ...         {'name': 'side', 'type': 'uint8'},  # 0=bid, 1=ask
-        ...         {'name': 'timestamp_us', 'type': 'uint64'},
+        ...         {'name': 'timestamp_us', 'type': 'uint64'},  # time axes first
         ...     ],
-        ...     'ts_col': 'timestamp_us',  # Required for range queries
+        ...     'clock_level': 1,  # Required: number of leading uint64 timestamps
         ...     'persist': True,  # True=disk, False=memory-only
         ...     'chunk_size_bytes': 128 * 1024 * 1024,  # 128MB chunks (default)
         ... }
@@ -235,11 +235,11 @@ class Platform:
             ...     "feed_name": "sensor_data",
             ...     "type": "UF",
             ...     "fields": [
+            ...         {"name": "timestamp_us", "type": "uint64"},
             ...         {"name": "sensor_id", "type": "uint32"},
             ...         {"name": "value", "type": "float64"},
-            ...         {"name": "timestamp_us", "type": "uint64"},
             ...     ],
-            ...     "clock_level": 3,  # Reserves 3 timestamp fields for multi-key clock functionality
+            ...     "clock_level": 1,  # Reserves 1 timestamp field for multi-key clock functionality
             ...     "chunk_size_mb": 32,
             ...     "retention_hours": 24,
             ...     "persist": True,
@@ -259,9 +259,8 @@ class Platform:
         fdir.mkdir(parents=True, exist_ok=False)
 
         # 2) build & persist layout.json atomically (UF format)
-        if "fields" not in spec:
-            raise ValueError("UF spec requires 'fields' key with field definitions")
-        layout = build_layout(spec["fields"], clock_level=spec.get("clock_level", 0))
+        # Let layout builder perform schema validation (clock_level, field ordering, etc.)
+        layout = build_layout(spec["fields"], clock_level=spec.get("clock_level"))
         save_layout(fdir, layout)
 
         # 3) persist lifecycle defaults into GlobalRegistry (create or update)

@@ -115,7 +115,8 @@ class Reader:
         self._unpack = struct.Struct(self.record_format["fmt"]).unpack_from
         self._rec_size = self.record_format["record_size"]
         self._index_available = bool(self.feed_config.get("index_playback"))
-        self._ts_fields = self.record_format.get("fields")[:self.record_format.get("clock_level")]
+        clock_level = self.record_format.get("clock_level") or 1
+        self._ts_fields = self.record_format.get("fields")[:clock_level]
         
         # Filter field_names to exclude padding fields (marked with _N in type like _6, _8)
         # These fields are skipped by struct.unpack due to 'x' in format string
@@ -168,14 +169,14 @@ class Reader:
 
     # ================================================================ INTERNAL
 
-    def _resolve_ts_key(self, ts_key: Optional[str]) -> Tuple[int, str]:
-        """Resolve ts_key to (offset, byteorder). Returns primary if ts_key is None."""
+    def _resolve_ts_key(self, ts_key: Optional[str]) -> Tuple[int, str, int]:
+        """Resolve ts_key to (offset, byteorder, key_id). Returns primary if ts_key is None."""
         if ts_key is None:
-            return self._ts_fields[0]["offset"]
+            return self._ts_fields[0]["offset"], "little", 0
         field = [f for f in self._ts_fields if f["name"] == ts_key]
         if not field:
             raise ValueError(f"Timestamp key '{ts_key}' not found, options are: {[f['name'] for f in self._ts_fields]}")
-        return field[0]["offset"]
+        return field[0]["offset"], "little", self._ts_fields.index(field[0])
 
     def _close_chunk(self) -> None:
         if self._chunk is not None:
@@ -216,24 +217,45 @@ class Reader:
         latest = self.registry.get_latest_chunk_idx()
         if latest is None:
             raise RuntimeError(f"Feed '{self.feed_name}' has no chunks")
-        self._open_chunk(latest)
+        chunk_id = latest
+        while chunk_id and chunk_id > 0:
+            meta = self.registry.get_chunk_metadata(chunk_id)
+            if meta is None:
+                chunk_id -= 1
+                continue
+            status = meta.status
+            meta.release()
+            if status == EXPIRED:
+                chunk_id -= 1
+                continue
+            self._open_chunk(chunk_id)
+            return
+        raise RuntimeError(f"Feed '{self.feed_name}' has no available chunks (all expired/deleted)")
 
     def _get_current_timestamp_us(self) -> int:
         """Get current timestamp for latest() queries"""
         return time.time_ns() // 1000
 
     def _iter_chunks_in_range(self, start_us: int, end_us: Optional[int] = None, ts_off: Optional[int] = None):
-        """Iterate chunk IDs that overlap with time range for the requested ts_key."""        
+        """Iterate chunk IDs that overlap with time range for the requested ts_key, skipping expired/missing files."""
         if end_us is not None:
             chunk_ids = self.registry.get_chunks_in_range(start_us, end_us, qoff=ts_off)
         else:
             chunk_ids = self.registry.get_chunks_after(start_us, qoff=ts_off)
         
         for chunk_id in chunk_ids:
+            meta = self.registry.get_chunk_metadata(chunk_id)
+            if meta is None:
+                continue
+            status = meta.status
+            if status == EXPIRED:
+                meta.release()
+                continue
+            meta.release()
             yield chunk_id
 
-    def _binary_search_start(self, start_us: int, ts_offset: Optional[int] = 0) -> int:
-        """Binary search for start position in current chunk (assumes sorted!)"""        
+    def _binary_search_start(self, start_us: int, ts_offset: Optional[int] = 0, ts_byteorder: str = "little") -> int:
+        """Binary search for start position in current chunk (assumes sorted!)"""
         if HAVE_FAST:
             return binary_search_fast(
                 self._chunk.buffer,
@@ -266,18 +288,21 @@ class Reader:
 
     # ================================================================ TUPLE FORMAT
 
-    def _range_tuples(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None) -> List[tuple]:
+    def _range_tuples(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None, key_id: int = 0) -> List[tuple]:
         """Read range as list of tuples (FAST)"""        
         # If caller requests playback and index is available, start from latest snapshot before start_us
         if playback and self._index_available:
-            snapshot_ts = self._get_snapshot_before(start_us)
+            snapshot_ts = self._get_snapshot_before(start_us, key_id)
             if snapshot_ts is not None and snapshot_ts < start_us:
                 start_us = snapshot_ts
         
         result = []
         
         for chunk_id in self._iter_chunks_in_range(start_us, end_us, ts_off=ts_off):
-            self._open_chunk(chunk_id)
+            try:
+                self._open_chunk(chunk_id)
+            except FileNotFoundError:
+                continue
             buf = self._chunk.buffer
             write_pos = self._chunk_meta.write_pos
             
@@ -327,6 +352,10 @@ class Reader:
             latest_chunk_id = self.registry.get_latest_chunk_idx()
             
             for chunk_id in self._iter_chunks_in_range(start_us, None, ts_off=ts_off):
+                try:
+                    self._open_chunk(chunk_id)
+                except FileNotFoundError:
+                    continue
                 buf = self._chunk.buffer
                 write_pos = self._chunk_meta.write_pos
                 pos = self._binary_search_start(start_us, ts_off, "little")
@@ -379,12 +408,19 @@ class Reader:
                     next_meta = self.registry.get_chunk_metadata(next_id)
                     if next_meta is not None:
                         # Check if next chunk file actually exists before rotating
-                        next_path = self.data_dir / f"chunk_{next_id:08d}.bin"
-                        if next_path.exists():
+                        try:
                             self._open_chunk(next_id)
                             read_head = 0
                             next_meta.release()
                             continue
+                        except FileNotFoundError:
+                            next_meta.release()
+                            try:
+                                self._ensure_latest_chunk()
+                                read_head = self._chunk_meta.write_pos
+                                continue
+                            except Exception:
+                                return
                         next_meta.release()
                 # else: we're on the latest chunk, even though it's sealed
             
@@ -392,11 +428,11 @@ class Reader:
 
     # ================================================================ DICT FORMAT
 
-    def _range_dicts(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None) -> List[dict]:
+    def _range_dicts(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None, key_id: int = 0) -> List[dict]:
         """Read range as list of dicts (readable, slower)"""
         names = self._field_names
         # Dict comprehension faster than zip - use len(rec) not len(names) due to unpacking
-        return [{names[i]: rec[i] for i in range(len(names))} for rec in self._range_tuples(start_us, end_us, playback=playback, ts_off=ts_off)]
+        return [{names[i]: rec[i] for i in range(len(names))} for rec in self._range_tuples(start_us, end_us, playback=playback, ts_off=ts_off, key_id=key_id)]
     def _stream_dicts(self, start_us: Optional[int], ts_off: Optional[int] = None) -> Iterator[dict]:
         """Stream dicts"""
         names = self._field_names
@@ -406,11 +442,11 @@ class Reader:
 
     # ================================================================ NUMPY FORMAT
 
-    def _range_numpy(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None):
+    def _range_numpy(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None, key_id: int = 0):
         """Read range as single numpy structured array"""        
         # If caller requests playback and index is available, start from latest snapshot before start_us
         if playback and self._index_available:
-            snapshot_ts = self._get_snapshot_before(start_us)
+            snapshot_ts = self._get_snapshot_before(start_us, key_id)
             if snapshot_ts is not None and snapshot_ts < start_us:
                 start_us = snapshot_ts
         
@@ -420,6 +456,10 @@ class Reader:
         from_bytes = int.from_bytes
         
         for chunk_id in self._iter_chunks_in_range(start_us, end_us, ts_off=ts_off):
+            try:
+                self._open_chunk(chunk_id)
+            except FileNotFoundError:
+                continue
             buf = self._chunk.buffer
             write_pos = self._chunk_meta.write_pos
             pos = self._binary_search_start(start_us, ts_off, "little")
@@ -457,7 +497,7 @@ class Reader:
 
     # ================================================================ RAW FORMAT
 
-    def _range_raw(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None) -> memoryview:
+    def _range_raw(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None, key_id: int = 0) -> memoryview:
         """Read range as single contiguous memoryview (zero-copy if single chunk)"""        
         # If caller requests playback and index is available, start from latest snapshot before start_us
         if playback and self._index_available:
@@ -470,6 +510,10 @@ class Reader:
         from_bytes = int.from_bytes
         
         for chunk_id in self._iter_chunks_in_range(start_us, end_us, ts_off=ts_off):
+            try:
+                self._open_chunk(chunk_id)
+            except FileNotFoundError:
+                continue
             buf = self._chunk.buffer
             write_pos = self._chunk_meta.write_pos
             pos = self._binary_search_start(start_us, ts_off, "little")
@@ -504,6 +548,10 @@ class Reader:
         if start_us is not None:
             # Resolve ts_offset if ts_key provided
             for chunk_id in self._iter_chunks_in_range(start_us, None, ts_off=ts_off):
+                try:
+                    self._open_chunk(chunk_id)
+                except FileNotFoundError:
+                    continue
                 buf = self._chunk.buffer
                 write_pos = self._chunk_meta.write_pos
                 pos = self._binary_search_start(start_us, ts_off, "little")
@@ -589,7 +637,7 @@ class Reader:
             - Spin-waits for new data (100% CPU core usage)
             - Use range() for batch analysis (more efficient)
         """
-        ts_off = self._resolve_ts_key(ts_key)
+        ts_off, ts_bo, key_id = self._resolve_ts_key(ts_key)
         if format == 'tuple':
             return self._stream_tuples(start, ts_off=ts_off)
         elif format == 'dict':
@@ -643,15 +691,15 @@ class Reader:
             - Use latest(seconds) for convenience
             - playback=True only works if feed has index_playback enabled
         """
-        ts_off = self._resolve_ts_key(ts_key)
+        ts_off, ts_bo, key_id = self._resolve_ts_key(ts_key)
         if format == 'tuple':
-            return self._range_tuples(start, end, playback=playback, ts_off=ts_off)
+            return self._range_tuples(start, end, playback=playback, ts_off=ts_off, key_id=key_id)
         elif format == 'dict':
-            return self._range_dicts(start, end, playback=playback, ts_off=ts_off)
+            return self._range_dicts(start, end, playback=playback, ts_off=ts_off, key_id=key_id)
         elif format == 'numpy':
-            return self._range_numpy(start, end, playback=playback, ts_off=ts_off)
+            return self._range_numpy(start, end, playback=playback, ts_off=ts_off, key_id=key_id)
         elif format == 'raw':
-            return self._range_raw(start, end, playback=playback, ts_off=ts_off)
+            return self._range_raw(start, end, playback=playback, ts_off=ts_off, key_id=key_id)
         else:
             raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
 
@@ -779,6 +827,10 @@ class Reader:
                 break
         
         return result    
+
+    # Placeholder snapshot lookup used by playback=True; Python path has no index logic.
+    def _get_snapshot_before(self, start_us: int, key_id: int = 0):
+        return None
 
     def close(self) -> None:
         """Release resources"""

@@ -80,11 +80,11 @@ def cleanup_feed(base_path: Path, feed_name: str, retention_hours: int, dry_run:
                 
                 # ON_DISK chunks: delete if older than retention
                 elif meta.status == ON_DISK:
-                    if meta.end_time == 0:
-                        continue  # Active chunk, skip
-                    
-                    age_us = now_us - meta.end_time
-                    if age_us > retention_us:
+                    end_ts = meta.end_time or meta.last_update or meta.start_time
+                    age_us = now_us - end_ts
+                    if retention_hours == 0:
+                        pass  # keep forever
+                    elif age_us >= retention_us:
                         chunk_file = feed_dir / f"chunk_{chunk_id:08d}.bin"
                         idx_file = feed_dir / f"chunk_{chunk_id:08d}.idx"
                         

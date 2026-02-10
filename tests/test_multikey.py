@@ -19,7 +19,11 @@ def test_multi_key_feature():
     print("Multi-Key Clock Test")
     print("=" * 70)
     
-    p = Platform('./data/test-multikey')
+    import shutil
+    base_dir = Path('./data/test-multikey')
+    if base_dir.exists():
+        shutil.rmtree(base_dir)
+    p = Platform(str(base_dir))
     
     # Create feed with multiple queryable timestamps
     print("\n1. Creating feed with 3 clocks...")

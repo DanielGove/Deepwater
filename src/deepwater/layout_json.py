@@ -72,7 +72,7 @@ def _dtype_to_struct(code: str) -> str:
 def build_layout(
     fields: List[Dict],
     *,
-    clock_level: int = 1,
+    clock_level: int | None = None,
     aligned: bool = False,
 ) -> Dict:
     """
@@ -82,7 +82,8 @@ def build_layout(
       fields : [{'name': str, 'type': str, ...}, ...]
                types may be scalar (e.g. 'uint64','float64','char','bool',...)
                or padding like '_6'
-      clock_level: int (1-3) - how many timestamp fields to reserve up front for reader playback optimizations (e.g. event time, receive time, process time)
+      clock_level: int (required, 1-3) - how many leading timestamp fields (all uint64) to reserve
+                   for reader playback optimizations (e.g. event time, receive time, process time)
       aligned: if True, apply C-style alignment (explicit pads inserted so dtype & struct match)
 
     Returns:
@@ -103,7 +104,9 @@ def build_layout(
 
     endian = "<"  # default to little-endian for both struct & numpy (matches x86_64 native)
 
-    # Clock is required
+    # Clock level validation lives here (keeps Platform thin)
+    if clock_level is None:
+        raise ValueError("clock_level is required (1-3)")
     if clock_level < 1 or clock_level > 3:
         raise ValueError("clock_level must be between 1 and 3")
     # Clocks need corresponding uint64 fields up front in the field list (e.g. 'ev_us', 'recv_us', 'proc_us')

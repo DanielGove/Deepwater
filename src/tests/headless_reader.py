@@ -27,8 +27,8 @@ def print_feeds(platform):
         print(f"  Mode: {info.get('mode', '?')}")
         print(f"  Persist: {info.get('persist', '?')}")
         print(f"  Fields: {len(info.get('fields', []))} columns")
-        if info.get('ts_col'):
-            print(f"  Timestamp column: {info['ts_col']}")
+        if info.get('clock_level'):
+            print(f"  Clock level: {info['clock_level']}")
 
 
 def print_feed_info(platform, feed_name):
@@ -43,7 +43,7 @@ def print_feed_info(platform, feed_name):
     print(f"Mode: {info.get('mode', '?')}")
     print(f"Persist: {info.get('persist', '?')}")
     print(f"Chunk size: {info.get('chunk_size_bytes', 0)} bytes")
-    print(f"Timestamp column: {info.get('ts_col', '(none)')}")
+    print(f"Clock level: {info.get('clock_level', '(unknown)')}")
     
     fields = info.get('fields', [])
     if fields:
