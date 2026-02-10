@@ -94,6 +94,7 @@ class Reader:
     """
     __slots__ = ('platform', 'feed_name', 'feed_config', 'record_format', 
                  'data_dir', 'registry', '_chunk', '_chunk_meta', '_chunk_id',
+                 '_chunk_index', '_chunk_index_id',
                  '_unpack', '_rec_size', '_index_available', '_ts_fields',
                  '_field_names', '_dtype', '_read_head')
 
@@ -110,6 +111,8 @@ class Reader:
         self._chunk: Optional[Chunk] = None
         self._chunk_meta = None
         self._chunk_id: Optional[int] = None
+        self._chunk_index: Optional[ChunkIndex] = None
+        self._chunk_index_id: Optional[int] = None
         
         # Hot path optimizations - pre-cache everything
         self._unpack = struct.Struct(self.record_format["fmt"]).unpack_from
@@ -185,6 +188,10 @@ class Reader:
         if self._chunk_meta is not None:
             self._chunk_meta.release()
             self._chunk_meta = None
+        if self._chunk_index is not None:
+            self._chunk_index.close_shm() if self._chunk_index.is_shm else self._chunk_index.close_file()
+            self._chunk_index = None
+            self._chunk_index_id = None
         self._chunk_id = None
 
     def _open_chunk(self, chunk_id: int) -> None:
@@ -209,6 +216,23 @@ class Reader:
         else:
             raise RuntimeError(f"Unknown chunk status {meta.status}")
         
+        # open accompanying index if available
+        if self._index_available:
+            idx_path = self.data_dir / f"chunk_{chunk_id:08d}.idx"
+            if idx_path.exists():
+                try:
+                    self._chunk_index = ChunkIndex.open_file(str(idx_path))
+                    self._chunk_index_id = chunk_id
+                except FileNotFoundError:
+                    self._chunk_index = None
+                    self._chunk_index_id = None
+            else:
+                self._chunk_index = None
+                self._chunk_index_id = None
+        else:
+            self._chunk_index = None
+            self._chunk_index_id = None
+
         self._chunk_meta = meta
         self._chunk = chunk
         self._chunk_id = chunk_id
@@ -501,7 +525,7 @@ class Reader:
         """Read range as single contiguous memoryview (zero-copy if single chunk)"""        
         # If caller requests playback and index is available, start from latest snapshot before start_us
         if playback and self._index_available:
-            snapshot_ts = self._get_snapshot_before(start_us)
+            snapshot_ts = self._get_snapshot_before(start_us, key_id)
             if snapshot_ts is not None and snapshot_ts < start_us:
                 start_us = snapshot_ts
         
@@ -828,9 +852,61 @@ class Reader:
         
         return result    
 
-    # Placeholder snapshot lookup used by playback=True; Python path has no index logic.
     def _get_snapshot_before(self, start_us: int, key_id: int = 0):
-        return None
+        """
+        Look up the latest indexed record at or before start_us for the requested clock.
+        Returns the timestamp of that snapshot (or None if none found).
+        """
+        if not self._index_available:
+            return None
+
+        latest_chunk = self.registry.get_latest_chunk_idx()
+        if latest_chunk is None:
+            return None
+
+        # Find the newest chunk whose qmin is <= start_us
+        candidate_chunk = None
+        for cid in range(latest_chunk, 0, -1):
+            meta = self.registry.get_chunk_metadata(cid)
+            if meta is None:
+                continue
+            qmin = meta.get_qmin(key_id)
+            qmax = meta.get_qmax(key_id)
+            meta.release()
+            if qmax == 0 or qmin == UINT64_MAX or qmin > qmax:
+                continue  # empty/uninitialized
+            if qmin <= start_us:
+                candidate_chunk = cid
+                break
+
+        if candidate_chunk is None:
+            return None
+
+        idx_path = self.data_dir / f"chunk_{candidate_chunk:08d}.idx"
+        if not idx_path.exists():
+            return None
+
+        idx_obj = None
+        close_after = False
+        if self._chunk_index is not None and self._chunk_index_id == candidate_chunk:
+            idx_obj = self._chunk_index
+        else:
+            try:
+                idx_obj = ChunkIndex.open_file(str(idx_path))
+                close_after = True
+            except FileNotFoundError:
+                return None
+
+        rec = idx_obj.get_latest_at_or_before(start_us, ts_idx=key_id)
+        if rec is None:
+            if close_after and idx_obj is not None:
+                idx_obj.close_file()
+            return None
+        ts = (rec.ts0, rec.ts1, rec.ts2)[key_id]
+        rec.release()
+        if close_after and idx_obj is not None:
+            idx_obj.close_file()
+        return ts
 
     def close(self) -> None:
         """Release resources"""
