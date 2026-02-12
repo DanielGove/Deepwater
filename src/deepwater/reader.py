@@ -172,6 +172,14 @@ class Reader:
 
     # ================================================================ INTERNAL
 
+    def _playback_start(self, start_us: int, key_id: int) -> int:
+        """Return adjusted start_us when playback is enabled and index available."""
+        if self._index_available:
+            snapshot_ts = self._get_snapshot_before(start_us, key_id)
+            if snapshot_ts is not None and snapshot_ts < start_us:
+                return snapshot_ts
+        return start_us
+
     def _resolve_ts_key(self, ts_key: Optional[str]) -> Tuple[int, str, int]:
         """Resolve ts_key to (offset, byteorder, key_id). Returns primary if ts_key is None."""
         if ts_key is None:
@@ -315,10 +323,8 @@ class Reader:
     def _range_tuples(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None, key_id: int = 0) -> List[tuple]:
         """Read range as list of tuples (FAST)"""        
         # If caller requests playback and index is available, start from latest snapshot before start_us
-        if playback and self._index_available:
-            snapshot_ts = self._get_snapshot_before(start_us, key_id)
-            if snapshot_ts is not None and snapshot_ts < start_us:
-                start_us = snapshot_ts
+        if playback:
+            start_us = self._playback_start(start_us, key_id)
         
         result = []
         
@@ -365,13 +371,15 @@ class Reader:
         
         return result
 
-    def _stream_tuples(self, start_us: Optional[int], ts_off: Optional[int] = None) -> Iterator[tuple]:
+    def _stream_tuples(self, start_us: Optional[int], ts_off: Optional[int] = None, playback: bool = False) -> Iterator[tuple]:
         """Stream tuples (historical replay → live)"""
         unpack = self._unpack
         rec_size = self._rec_size
         
         # Historical replay if start_us provided
         if start_us is not None:            
+            if playback:
+                start_us = self._playback_start(start_us, 0 if ts_off == self._ts_fields[0]["offset"] else self._ts_fields.index(next(f for f in self._ts_fields if f["offset"] == ts_off)))
             # Get latest chunk ID to know when to stop historical replay
             latest_chunk_id = self.registry.get_latest_chunk_idx()
             
@@ -457,11 +465,11 @@ class Reader:
         names = self._field_names
         # Dict comprehension faster than zip - use len(rec) not len(names) due to unpacking
         return [{names[i]: rec[i] for i in range(len(names))} for rec in self._range_tuples(start_us, end_us, playback=playback, ts_off=ts_off, key_id=key_id)]
-    def _stream_dicts(self, start_us: Optional[int], ts_off: Optional[int] = None) -> Iterator[dict]:
+    def _stream_dicts(self, start_us: Optional[int], ts_off: Optional[int] = None, playback: bool = False) -> Iterator[dict]:
         """Stream dicts"""
         names = self._field_names
         # Dict comprehension faster than zip
-        for rec in self._stream_tuples(start_us, ts_off=ts_off):
+        for rec in self._stream_tuples(start_us, ts_off=ts_off, playback=playback):
             yield {names[i]: rec[i] for i in range(len(names))}
 
     # ================================================================ NUMPY FORMAT
@@ -469,10 +477,8 @@ class Reader:
     def _range_numpy(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None, key_id: int = 0):
         """Read range as single numpy structured array"""        
         # If caller requests playback and index is available, start from latest snapshot before start_us
-        if playback and self._index_available:
-            snapshot_ts = self._get_snapshot_before(start_us, key_id)
-            if snapshot_ts is not None and snapshot_ts < start_us:
-                start_us = snapshot_ts
+        if playback:
+            start_us = self._playback_start(start_us, key_id)
         
         # Collect all matching data as contiguous blocks
         blocks = []
@@ -510,11 +516,11 @@ class Reader:
         combined = b''.join(blocks)
         return np.frombuffer(combined, dtype=self.dtype)
 
-    def _stream_numpy(self, start_us: Optional[int], ts_off: Optional[int] = None) -> Iterator:
+    def _stream_numpy(self, start_us: Optional[int], ts_off: Optional[int] = None, playback: bool = False) -> Iterator:
         """Stream numpy arrays (yields array per chunk)"""
         import numpy as np
         
-        for rec in self._stream_tuples(start_us, ts_off=ts_off):
+        for rec in self._stream_tuples(start_us, ts_off=ts_off, playback=playback):
             # For streaming, yield individual records as 1-element arrays
             arr = np.array([rec], dtype=self.dtype)
             yield arr[0]
@@ -524,10 +530,8 @@ class Reader:
     def _range_raw(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None, key_id: int = 0) -> memoryview:
         """Read range as single contiguous memoryview (zero-copy if single chunk)"""        
         # If caller requests playback and index is available, start from latest snapshot before start_us
-        if playback and self._index_available:
-            snapshot_ts = self._get_snapshot_before(start_us, key_id)
-            if snapshot_ts is not None and snapshot_ts < start_us:
-                start_us = snapshot_ts
+        if playback:
+            start_us = self._playback_start(start_us, key_id)
         
         blocks = []
         rec_size = self._rec_size
@@ -564,12 +568,14 @@ class Reader:
             return memoryview(blocks[0])
         return memoryview(b''.join(blocks))
 
-    def _stream_raw(self, start_us: Optional[int], ts_off: Optional[int] = None) -> Iterator[memoryview]:
+    def _stream_raw(self, start_us: Optional[int], ts_off: Optional[int] = None, playback: bool = False) -> Iterator[memoryview]:
         """Stream raw memoryview slices (64 bytes each)"""
         rec_size = self._rec_size
         
         # Historical replay
         if start_us is not None:
+            if playback:
+                start_us = self._playback_start(start_us, 0 if ts_off == self._ts_fields[0]["offset"] else self._ts_fields.index(next(f for f in self._ts_fields if f["offset"] == ts_off)))
             # Resolve ts_offset if ts_key provided
             for chunk_id in self._iter_chunks_in_range(start_us, None, ts_off=ts_off):
                 try:
@@ -615,7 +621,7 @@ class Reader:
 
     # ================================================================ PUBLIC API
 
-    def stream(self, start: Optional[int] = None, format: str = 'tuple', ts_key: Optional[str] = None) -> Iterator:
+    def stream(self, start: Optional[int] = None, format: str = 'tuple', ts_key: Optional[str] = None, playback: bool = False) -> Iterator:
         """
         Stream records (infinite iterator, live updates).
         
@@ -625,6 +631,7 @@ class Reader:
                 - timestamp_us: Stream from that point (historical + live)
             format: 'tuple' (default, fast), 'dict' (readable), 'numpy' (batch), 'raw' (memoryview)
             ts_key: Which timestamp column to query on (None = primary ts_col, or specify 'recv_us', 'proc_us', 'ev_us', etc.)
+            playback: If True and index_playback is enabled, start from latest indexed snapshot at/before start
         
         Returns:
             Iterator yielding records in specified format (never ends)
@@ -663,13 +670,13 @@ class Reader:
         """
         ts_off, ts_bo, key_id = self._resolve_ts_key(ts_key)
         if format == 'tuple':
-            return self._stream_tuples(start, ts_off=ts_off)
+            return self._stream_tuples(start, ts_off=ts_off, playback=playback)
         elif format == 'dict':
-            return self._stream_dicts(start, ts_off=ts_off)
+            return self._stream_dicts(start, ts_off=ts_off, playback=playback)
         elif format == 'numpy':
-            return self._stream_numpy(start, ts_off=ts_off)
+            return self._stream_numpy(start, ts_off=ts_off, playback=playback)
         elif format == 'raw':
-            return self._stream_raw(start, ts_off=ts_off)
+            return self._stream_raw(start, ts_off=ts_off, playback=playback)
         else:
             raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
 
@@ -860,13 +867,10 @@ class Reader:
         if not self._index_available:
             return None
 
-        latest_chunk = self.registry.get_latest_chunk_idx()
-        if latest_chunk is None:
-            return None
-
-        # Find the newest chunk whose qmin is <= start_us
-        candidate_chunk = None
-        for cid in range(latest_chunk, 0, -1):
+        latest_chunk = self.registry.get_latest_chunk_idx() or 0
+        # Find the earliest chunk whose qmax >= start_us, then scan backward from there
+        start_chunk = None
+        for cid in range(1, latest_chunk + 1):
             meta = self.registry.get_chunk_metadata(cid)
             if meta is None:
                 continue
@@ -874,39 +878,51 @@ class Reader:
             qmax = meta.get_qmax(key_id)
             meta.release()
             if qmax == 0 or qmin == UINT64_MAX or qmin > qmax:
-                continue  # empty/uninitialized
-            if qmin <= start_us:
-                candidate_chunk = cid
+                continue
+            if qmax >= start_us:
+                start_chunk = cid
                 break
-
-        if candidate_chunk is None:
+        if start_chunk is None:
             return None
 
-        idx_path = self.data_dir / f"chunk_{candidate_chunk:08d}.idx"
-        if not idx_path.exists():
-            return None
+        for cid in range(start_chunk, 0, -1):
+            meta = self.registry.get_chunk_metadata(cid)
+            if meta is None:
+                continue
+            qmin = meta.get_qmin(key_id)
+            qmax = meta.get_qmax(key_id)
+            meta.release()
+            if qmax == 0 or qmin == UINT64_MAX or qmin > qmax:
+                continue
+            if qmin > start_us:
+                continue
 
-        idx_obj = None
-        close_after = False
-        if self._chunk_index is not None and self._chunk_index_id == candidate_chunk:
-            idx_obj = self._chunk_index
-        else:
-            try:
-                idx_obj = ChunkIndex.open_file(str(idx_path))
-                close_after = True
-            except FileNotFoundError:
-                return None
+            # reuse current chunk index if matching
+            idx_obj = None
+            close_after = False
+            if self._chunk_index is not None and self._chunk_index_id == cid:
+                idx_obj = self._chunk_index
+            else:
+                idx_path = self.data_dir / f"chunk_{cid:08d}.idx"
+                if not idx_path.exists():
+                    continue
+                try:
+                    idx_obj = ChunkIndex.open_file(str(idx_path))
+                    close_after = True
+                except FileNotFoundError:
+                    continue
 
-        rec = idx_obj.get_latest_at_or_before(start_us, ts_idx=key_id)
-        if rec is None:
-            if close_after and idx_obj is not None:
+            rec = idx_obj.get_latest_at_or_before(start_us, ts_idx=key_id)
+            if rec is None:
+                if close_after:
+                    idx_obj.close_file()
+                continue
+            ts = (rec.ts0, rec.ts1, rec.ts2)[key_id]
+            rec.release()
+            if close_after:
                 idx_obj.close_file()
-            return None
-        ts = (rec.ts0, rec.ts1, rec.ts2)[key_id]
-        rec.release()
-        if close_after and idx_obj is not None:
-            idx_obj.close_file()
-        return ts
+            return ts
+        return None
 
     def close(self) -> None:
         """Release resources"""
