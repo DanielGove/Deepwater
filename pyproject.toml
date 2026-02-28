@@ -35,6 +35,8 @@ deepwater-health = "deepwater.health_check:main"
 deepwater-repair = "deepwater.repair:main"
 deepwater-create-feed = "deepwater.feed_cli:create_main"
 deepwater-delete-feed = "deepwater.feed_cli:delete_main"
+deepwater-segments = "deepwater.segments_cli:main"
+deepwater-datasets = "deepwater.datasets_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/DanielGove/Deepwater"

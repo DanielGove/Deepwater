@@ -43,6 +43,31 @@ python ./apps/quickstart_app.py
 deepwater-health --base-path "$DEEPWATER_BASE" --check-feeds --max-age-seconds 300
 ```
 
+5) See usable segment windows (for backtests):
+
+```bash
+deepwater-segments --base-path "$DEEPWATER_BASE" --feed trades --status usable --suggest-range
+```
+
+6) Compute common contiguous windows across your strategy feed set:
+
+```bash
+deepwater-datasets --base-path "$DEEPWATER_BASE" \
+  --feeds cb_btcusd,cb_ethusd,cb_solusd,cb_xrpusd,kr_btcusd,kr_ethusd,kr_solusd,kr_xrpusd \
+  --json
+```
+
+Two-base-path example:
+
+```bash
+deepwater-datasets \
+  --source A=./data_us \
+  --source B=./data_de \
+  --feed-ref A:cb_btcusd --feed-ref A:cb_ethusd --feed-ref A:cb_solusd --feed-ref A:cb_xrpusd \
+  --feed-ref B:kr_btcusd --feed-ref B:kr_ethusd --feed-ref B:kr_solusd --feed-ref B:kr_xrpusd \
+  --json
+```
+
 ## If You Need a Hard Reset
 
 ```bash
@@ -93,6 +118,34 @@ deepwater-delete-feed --base-path ./data --config-dir ./configs
 
 Create is idempotent. Delete wipes feed files, feed registries, ring shared memory,
 and the global registry entry.
+
+## Automatic Segmentation
+
+Segmentation is metadata attached to each feed and managed by writers automatically:
+- segment starts on first write (not on `create_feed`)
+- segment closes on writer close
+- if writer crashes, next writer start closes prior open segment at last level-1 timestamp
+
+Query it with:
+
+```bash
+deepwater-segments --base-path ./data --feed trades --status usable --suggest-range
+```
+
+## Multi-Feed Dataset Planning
+
+Use `deepwater-datasets` to avoid manual interval intersection when you have many feeds:
+
+```bash
+deepwater-datasets --base-path ./data --feeds f1,f2,f3 --json
+deepwater-datasets --base-path ./data --feeds f1,f2,f3 --out ./datasets/train_val.json
+
+# multi-source / multi-base-path
+deepwater-datasets --source A=./data_a --source B=./data_b --feed-ref A:f1 --feed-ref B:f2 --json
+```
+
+It computes contiguous common windows across all provided feeds and suggests
+train/validation splits from the longest common window.
 
 ## Python Integration Pattern
 

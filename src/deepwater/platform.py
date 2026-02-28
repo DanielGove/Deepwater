@@ -19,6 +19,8 @@ from .writer import Writer
 from .ring import RingWriter
 from .reader import Reader
 from .manifest import write_manifest, read_manifest
+from .segments import SegmentStore
+from .datasets import common_intervals, with_duration, recommend_train_validation, build_manifest
 from . import __version__
 
 
@@ -127,6 +129,10 @@ class Platform:
         create_writer(feed_name): Get writer instance (one per feed)
         create_reader(feed_name): Get reader instance (multiple allowed)
         delete_feed(feed_name): Delete feed data + metadata for fresh restart
+        list_segments(feed_name): Query feed segments metadata
+        suggested_reader_range(feed_name): Get suggested timestamp window from usable segments
+        common_time_windows(feed_names): Get contiguous intersections across feed segments
+        recommended_train_validation(feed_names): Suggested split from common windows
         list_feeds(): Get all feed names
         feed_exists(feed_name): Check if feed exists
         close(): Clean up resources (releases locks)
@@ -501,6 +507,85 @@ class Platform:
             "fields": lay["fields"],
             "created_us": md.get("created_us"),
         }
+
+    def list_segments(self, feed_name: str, status: Optional[str] = None) -> list[dict]:
+        """List metadata segments for a feed (status: all/open/closed/crash_closed/invalid_empty/usable)."""
+        if not self.feed_exists(feed_name):
+            raise KeyError(feed_name)
+        store = SegmentStore(self.feed_dir(feed_name), feed_name)
+        return store.list_segments(status=status)
+
+    def suggested_reader_range(self, feed_name: str) -> Optional[Tuple[int, int]]:
+        """
+        Suggested [start_us, end_us] for readers from usable segments.
+        Returns None if no closed/crash-closed segments are available.
+        """
+        if not self.feed_exists(feed_name):
+            raise KeyError(feed_name)
+        store = SegmentStore(self.feed_dir(feed_name), feed_name)
+        return store.suggested_timestamp_range()
+
+    def common_time_windows(
+        self,
+        feed_names: list[str],
+        *,
+        status: str = "usable",
+        min_duration_us: int = 0,
+        merge_touching: bool = True,
+    ) -> list[dict]:
+        """
+        Compute contiguous time windows common to all feeds.
+        Returns dict windows with start_us/end_us/duration_us.
+        """
+        if not feed_names:
+            raise ValueError("feed_names cannot be empty")
+
+        interval_sets = []
+        for feed_name in feed_names:
+            if not self.feed_exists(feed_name):
+                raise KeyError(feed_name)
+            segs = self.list_segments(feed_name, status=status)
+            intervals = []
+            for seg in segs:
+                s = seg.get("start_us")
+                e = seg.get("end_us")
+                if s is None or e is None:
+                    continue
+                s_i = int(s)
+                e_i = int(e)
+                if s_i <= e_i:
+                    intervals.append((s_i, e_i))
+            interval_sets.append(intervals)
+
+        commons = common_intervals(interval_sets, merge_touching=merge_touching)
+        return with_duration(commons, min_duration_us=int(min_duration_us))
+
+    def recommended_train_validation(
+        self,
+        feed_names: list[str],
+        *,
+        status: str = "usable",
+        train_ratio: float = 0.8,
+        min_duration_us: int = 0,
+        merge_touching: bool = True,
+    ) -> dict:
+        """
+        Return a manifest with common windows and recommended train/validation split.
+        """
+        intervals = self.common_time_windows(
+            feed_names,
+            status=status,
+            min_duration_us=min_duration_us,
+            merge_touching=merge_touching,
+        )
+        recommendation = recommend_train_validation(intervals, train_ratio=train_ratio)
+        return build_manifest(
+            base_path=str(self.base_path),
+            feeds=list(feed_names),
+            status_filter=status,
+            intervals=intervals,
+            recommendation=recommendation,
+        )
 
     # -------------------------------------------------------------------------
     # SHUTDOWN

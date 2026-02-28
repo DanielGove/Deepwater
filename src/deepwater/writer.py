@@ -9,6 +9,7 @@ from pathlib import Path
 from .chunk import Chunk
 from .index import ChunkIndex
 from .feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED, CHUNK_QMIN_OFFSET, MAX_QUERY_KEYS, UINT64_MAX
+from .segments import SegmentStore
 from .utils.process import ProcessUtils
 
 log = logging.getLogger("dw.writer")
@@ -19,6 +20,7 @@ class Writer:
         "data_dir", "registry",
         "current_chunk", "chunk_index", "current_chunk_metadata", "current_chunk_id",
         "_S", "_rec_size", "_clock_level", "_key_min_set", "_u64", "_qmins", "_qmaxs",
+        "segment_store",
     )
     """
     Writer for persistent disk-based feeds.
@@ -139,8 +141,29 @@ class Writer:
         self._u64 = struct.Struct("<Q")
         self._rec_size = self._S.size
         self._clock_level = self.feed_config.get("clock_level")
+        self.segment_store = SegmentStore(self.data_dir, self.feed_name)
+        self.segment_store.recover_open_segment(self._latest_level1_timestamp())
 
         self._create_new_chunk()
+
+    def _latest_level1_timestamp(self):
+        """Return latest level-1 timestamp observed in feed metadata, or None."""
+        latest_idx = self.registry.get_latest_chunk_idx()
+        if latest_idx is None:
+            return None
+
+        idx = int(latest_idx)
+        while idx > 0:
+            meta = self.registry.get_chunk_metadata(idx)
+            try:
+                qmin = meta.get_qmin(0)
+                qmax = meta.get_qmax(0)
+                if qmax != 0 and qmin != UINT64_MAX and qmin <= qmax:
+                    return int(qmax)
+            finally:
+                meta.release()
+            idx -= 1
+        return None
 
     def _create_new_chunk(self):
         self.current_chunk_id += 1
@@ -227,6 +250,7 @@ class Writer:
         qmins = self._qmins
         qmaxs = self._qmaxs
         ts0 = u64.unpack_from(record_mv, 0)[0]
+        self.segment_store.note_write(ts0, 1)
         if not key_min_set[0]:
             key_min_set[0] = True
             qmins[0] = ts0
@@ -282,6 +306,7 @@ class Writer:
         qmins = self._qmins
         qmaxs = self._qmaxs
         ts0 = vals[0]
+        self.segment_store.note_write(ts0, 1)
         if not key_min_set[0]:
             key_min_set[0] = True
             qmins[0] = ts0
@@ -326,6 +351,7 @@ class Writer:
         u64 = self._u64
         ts_first = u64.unpack_from(mv_data, 0)[0]
         ts_last = u64.unpack_from(mv_data, data_len - rec_sz + 0)[0]
+        self.segment_store.note_batch(ts_first, ts_last, data_len // rec_sz)
         if not key_min_set[0]:
             key_min_set[0] = True
             qmins[0] = ts_first
@@ -379,3 +405,4 @@ class Writer:
             self.current_chunk_metadata.release()
             self.current_chunk = None  # Prevent double-close
             self.registry.close()
+        self.segment_store.close_open_segment("writer_close")

@@ -33,6 +33,10 @@ This creates a local `./deepwater-starter` folder with:
 - `configs/feeds.json` (bundle format)
 - `apps/quickstart_app.py` (runnable integration skeleton)
 
+Also includes segmentation guidance so you can quickly answer:
+- what segments exist?
+- what timestamp range should be passed to readers/backtests?
+
 Optional:
 
 ```bash
@@ -212,6 +216,8 @@ Removes expired chunks based on retention policy.
 After installation (`pip install -e .`), these commands are available globally:
 - `deepwater-create-feed`
 - `deepwater-delete-feed`
+- `deepwater-segments`
+- `deepwater-datasets`
 
 ### Feed Config Format (JSON)
 
@@ -271,6 +277,36 @@ deepwater-delete-feed --base-path ./data --feed trades --strict-missing
 ```
 
 Delete removes feed data, feed registry files, ring shared memory (if used), and the global registry entry.
+
+### Segment Metadata (Automatic)
+
+Writers manage per-feed segments automatically:
+- starts on first write
+- closes on clean writer close
+- crash-open segment is closed on next writer start using last level-1 timestamp
+
+Query segments:
+
+```bash
+deepwater-segments --base-path ./data --feed trades --status usable --suggest-range
+```
+
+Plan common windows across multiple feeds:
+
+```bash
+deepwater-datasets --base-path ./data --feeds cb_btcusd,cb_ethusd,cb_solusd,cb_xrpusd,kr_btcusd,kr_ethusd,kr_solusd,kr_xrpusd --json
+```
+
+Across two base paths:
+
+```bash
+deepwater-datasets \
+  --source A=./data_us \
+  --source B=./data_de \
+  --feed-ref A:cb_btcusd --feed-ref A:cb_ethusd --feed-ref A:cb_solusd --feed-ref A:cb_xrpusd \
+  --feed-ref B:kr_btcusd --feed-ref B:kr_ethusd --feed-ref B:kr_solusd --feed-ref B:kr_xrpusd \
+  --json
+```
 
 ---
 
