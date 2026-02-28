@@ -50,6 +50,9 @@ for record in reader.stream():  # Live streaming
 records = reader.range(start_us, end_us)  # Historical range
 reader.close()
 
+# Delete feed (wipe data + registry entry)
+p.delete_feed('trades')  # Useful for development resets
+
 # Clock Levels
 # -------------
 # clock_level defines how many timelines your feed tracks:

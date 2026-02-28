@@ -5,8 +5,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-import pytest  # optional; if not installed, fallback simple asserts
-
 from deepwater.layout_json import build_layout
 
 

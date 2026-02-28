@@ -102,6 +102,33 @@ class GlobalRegistry:
         finally:
             self._unlock()
 
+    def unregister_feed(self, name: str) -> bool:
+        """
+        Remove a feed entry from the global registry.
+        Returns True if removed, False if it did not exist.
+        """
+        self._lock()
+        try:
+            offset = self._find_feed_offset(name)
+            if offset == 0:
+                return False
+
+            count = self.feed_count
+            end = HEADER_SIZE + (count * ENTRY_SIZE)
+            next_offset = offset + ENTRY_SIZE
+
+            # Shift subsequent entries left to keep sorted dense layout.
+            if next_offset < end:
+                self.mmap[offset:end - ENTRY_SIZE] = self.mmap[next_offset:end]
+
+            # Zero the last slot and update header count.
+            self.mmap[end - ENTRY_SIZE:end] = b"\x00" * ENTRY_SIZE
+            self.feed_count = count - 1
+            self.mmap.flush()
+            return True
+        finally:
+            self._unlock()
+
     def get_metadata(self, name: str) -> Optional[dict]:
         offset = self._find_feed_offset(name)
         if offset == 0:
@@ -139,6 +166,7 @@ class GlobalRegistry:
     def close(self):
         self.mmap.flush()
         self.mmap.close()
+        self.lock_fd.close()
         os.close(self.fd)
 
 

@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import atexit
+import fcntl
+import os
+from multiprocessing import shared_memory
 import signal
+import shutil
 from pathlib import Path
 import orjson
 import struct
@@ -122,6 +126,7 @@ class Platform:
         create_feed(config): Define feed schema (one-time setup)
         create_writer(feed_name): Get writer instance (one per feed)
         create_reader(feed_name): Get reader instance (multiple allowed)
+        delete_feed(feed_name): Delete feed data + metadata for fresh restart
         list_feeds(): Get all feed names
         feed_exists(feed_name): Check if feed exists
         close(): Clean up resources (releases locks)
@@ -352,7 +357,82 @@ class Platform:
 
     def close_writer(self, feed_name: str) -> None:
         w = self._writers.pop(feed_name, None)
-        if w: w.close()
+        if w:
+            w.close()
+
+    def close_reader(self, feed_name: str) -> None:
+        r = self._readers.pop(feed_name, None)
+        if r:
+            r.close()
+
+    def _assert_no_external_writer(self, feed_name: str) -> None:
+        """Fail fast if another process holds the feed writer lock."""
+        reg_path = self.feed_dir(feed_name) / f"{feed_name}.reg"
+        if not reg_path.exists():
+            return
+
+        fd = os.open(reg_path, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError(
+                    f"Cannot delete feed '{feed_name}': active writer holds {reg_path.name}"
+                )
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _unlink_ring_shm(self, feed_name: str) -> None:
+        """Best-effort unlink of ring shared memory names used by this project."""
+        for shm_name in (feed_name, f"{feed_name}-ring"):
+            try:
+                shm = shared_memory.SharedMemory(name=shm_name, create=False)
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+                shm.close()
+            except FileNotFoundError:
+                continue
+
+    def delete_feed(self, feed_name: str, *, missing_ok: bool = False) -> bool:
+        """
+        Delete a feed and all associated data.
+
+        Deletes:
+            - data/<feed_name>/ (chunks, indexes, layout/config, feed registry)
+            - ring shared memory segment(s) for non-persistent feeds
+            - global registry entry (if present)
+
+        Returns:
+            True if any feed state was removed, False only when missing and missing_ok=True.
+        """
+        registered = self.feed_exists(feed_name)
+        feed_dir = self.feed_dir(feed_name)
+        on_disk = feed_dir.exists()
+
+        if not registered and not on_disk:
+            if missing_ok:
+                return False
+            raise KeyError(feed_name)
+
+        # Release local process handles first so file/ring resources can be removed immediately.
+        self.close_writer(feed_name)
+        self.close_reader(feed_name)
+
+        # Protect against deleting a feed while another process is actively writing.
+        self._assert_no_external_writer(feed_name)
+
+        # Shared-memory ring cleanup is cheap; do it for both feed modes as best effort.
+        self._unlink_ring_shm(feed_name)
+
+        if feed_dir.exists():
+            shutil.rmtree(feed_dir)
+
+        removed_from_registry = self.registry.unregister_feed(feed_name)
+        return bool(on_disk or removed_from_registry)
 
     # -------------------------------------------------------------------------
     # DISCOVERY / METADATA
