@@ -31,25 +31,32 @@ export DEEPWATER_BASE=./data
 deepwater-create-feed --base-path "$DEEPWATER_BASE" --config-dir ./configs
 ```
 
-3) Run the integration example:
+3) Inspect available feeds + schema metadata:
+
+```bash
+deepwater-feeds --base-path "$DEEPWATER_BASE"
+deepwater-feeds --base-path "$DEEPWATER_BASE" --feed trades
+```
+
+4) Run the integration example:
 
 ```bash
 python ./apps/quickstart_app.py
 ```
 
-4) Check health:
+5) Check health:
 
 ```bash
 deepwater-health --base-path "$DEEPWATER_BASE" --check-feeds --max-age-seconds 300
 ```
 
-5) See usable segment windows (for backtests):
+6) See usable segment windows (for backtests):
 
 ```bash
 deepwater-segments --base-path "$DEEPWATER_BASE" --feed trades --status usable --suggest-range
 ```
 
-6) Compute common contiguous windows across your strategy feed set:
+7) Compute common contiguous windows across your strategy feed set:
 
 ```bash
 deepwater-datasets --base-path "$DEEPWATER_BASE" \
@@ -118,6 +125,24 @@ deepwater-delete-feed --base-path ./data --config-dir ./configs
 
 Create is idempotent. Delete wipes feed files, feed registries, ring shared memory,
 and the global registry entry.
+
+## Feed Metadata CLI
+
+Use `deepwater-feeds` when you need to answer:
+- what feeds exist?
+- what lifecycle settings does a feed have?
+- what is the record format (`fmt`) and field layout?
+
+```bash
+# list feed names
+deepwater-feeds --base-path ./data
+
+# describe one feed
+deepwater-feeds --base-path ./data --feed trades
+
+# describe all feeds as JSON (good for tooling/agents)
+deepwater-feeds --base-path ./data --all --json
+```
 
 ## Automatic Segmentation
 

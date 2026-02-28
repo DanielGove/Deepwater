@@ -493,6 +493,10 @@ class Platform:
         if not md:
             raise KeyError(feed_name)
         lay = self.get_record_format(feed_name)
+        clock_level = int(lay.get("clock_level") or 1)
+        fields = list(lay.get("fields", []))
+        ts_fields = fields[:clock_level] if fields else []
+        ts_offset = ts_fields[0]["offset"] if ts_fields else 0
         return {
             "feed_name": feed_name,
             "lifecycle": {
@@ -501,10 +505,12 @@ class Platform:
                 "persist": md["persist"],
                 "index_playback": md["index_playback"],
             },
+            "clock_level": clock_level,
+            "timestamp_fields": ts_fields,
             "record_fmt": lay["fmt"],
             "record_size": lay["record_size"],
-            "ts_offset": lay["ts"]["offset"],
-            "fields": lay["fields"],
+            "ts_offset": ts_offset,
+            "fields": fields,
             "created_us": md.get("created_us"),
         }
 

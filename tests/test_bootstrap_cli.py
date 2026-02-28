@@ -36,6 +36,7 @@ def test_bootstrap_creates_starter_folder_and_files():
 
         text = start_here.read_text(encoding="utf-8")
         assert "deepwater-create-feed" in text
+        assert "deepwater-feeds" in text
         assert "deepwater-health" in text
         assert "deepwater-segments" in text
         assert "deepwater-datasets" in text

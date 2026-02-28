@@ -35,6 +35,7 @@ deepwater-health = "deepwater.ops.health_check:main"
 deepwater-repair = "deepwater.ops.repair:main"
 deepwater-create-feed = "deepwater.cli.feed_cli:create_main"
 deepwater-delete-feed = "deepwater.cli.feed_cli:delete_main"
+deepwater-feeds = "deepwater.cli.feeds_cli:main"
 deepwater-segments = "deepwater.cli.segments_cli:main"
 deepwater-datasets = "deepwater.cli.datasets_cli:main"
 

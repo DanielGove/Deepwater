@@ -216,6 +216,7 @@ Removes expired chunks based on retention policy.
 After installation (`pip install -e .`), these commands are available globally:
 - `deepwater-create-feed`
 - `deepwater-delete-feed`
+- `deepwater-feeds`
 - `deepwater-segments`
 - `deepwater-datasets`
 
@@ -277,6 +278,19 @@ deepwater-delete-feed --base-path ./data --feed trades --strict-missing
 ```
 
 Delete removes feed data, feed registry files, ring shared memory (if used), and the global registry entry.
+
+### Feed Metadata
+
+```bash
+# list available feeds
+deepwater-feeds --base-path ./data
+
+# inspect one feed: lifecycle, fmt, record size, fields
+deepwater-feeds --base-path ./data --feed trades
+
+# inspect all feeds in JSON for automation/tools
+deepwater-feeds --base-path ./data --all --json
+```
 
 ### Segment Metadata (Automatic)
 
