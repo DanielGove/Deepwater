@@ -20,7 +20,7 @@ class Writer:
         "data_dir", "registry",
         "current_chunk", "chunk_index", "current_chunk_metadata", "current_chunk_id",
         "_S", "_rec_size", "_clock_level", "_key_min_set", "_u64", "_qmins", "_qmaxs",
-        "segment_store",
+        "_index_enabled", "segment_store", "_segment_note_write", "_segment_note_batch",
     )
     """
     Writer for persistent disk-based feeds.
@@ -141,7 +141,10 @@ class Writer:
         self._u64 = struct.Struct("<Q")
         self._rec_size = self._S.size
         self._clock_level = self.feed_config.get("clock_level")
+        self._index_enabled = bool(self.feed_config.get("index_playback"))
         self.segment_store = SegmentStore(self.data_dir, self.feed_name)
+        self._segment_note_write = self.segment_store.note_write
+        self._segment_note_batch = self.segment_store.note_batch
         self.segment_store.recover_open_segment(self._latest_level1_timestamp())
 
         self._create_new_chunk()
@@ -195,7 +198,7 @@ class Writer:
         self._qmins = self.current_chunk_metadata._qmins
         self._qmaxs = self.current_chunk_metadata._qmaxs
 
-        if self.feed_config.get("index_playback") is True:
+        if self._index_enabled:
             if self.chunk_index is not None:
                 self.chunk_index.close_file()
             self.chunk_index = ChunkIndex.create_file(
@@ -250,7 +253,7 @@ class Writer:
         qmins = self._qmins
         qmaxs = self._qmaxs
         ts0 = u64.unpack_from(record_mv, 0)[0]
-        self.segment_store.note_write(ts0, 1)
+        self._segment_note_write(ts0, 1)
         if not key_min_set[0]:
             key_min_set[0] = True
             qmins[0] = ts0
@@ -306,7 +309,7 @@ class Writer:
         qmins = self._qmins
         qmaxs = self._qmaxs
         ts0 = vals[0]
-        self.segment_store.note_write(ts0, 1)
+        self._segment_note_write(ts0, 1)
         if not key_min_set[0]:
             key_min_set[0] = True
             qmins[0] = ts0
@@ -351,7 +354,7 @@ class Writer:
         u64 = self._u64
         ts_first = u64.unpack_from(mv_data, 0)[0]
         ts_last = u64.unpack_from(mv_data, data_len - rec_sz + 0)[0]
-        self.segment_store.note_batch(ts_first, ts_last, data_len // rec_sz)
+        self._segment_note_batch(ts_first, ts_last, data_len // rec_sz)
         if not key_min_set[0]:
             key_min_set[0] = True
             qmins[0] = ts_first
@@ -393,14 +396,9 @@ class Writer:
             >>> writer.close()
         """
         if self.current_chunk:
-            if self.feed_config.get("persist", True):
-                self.current_chunk.close_file()
-                if self.feed_config.get("index_playback", False) and self.chunk_index:
-                    self.chunk_index.close_file()
-            else:
-                self.current_chunk.close_shm()
-                if self.feed_config.get("index_playback", False) and self.chunk_index:
-                    self.chunk_index.close_shm()
+            self.current_chunk.close_file()
+            if self._index_enabled and self.chunk_index:
+                self.chunk_index.close_file()
             self.current_chunk_metadata.status = ON_DISK
             self.current_chunk_metadata.release()
             self.current_chunk = None  # Prevent double-close

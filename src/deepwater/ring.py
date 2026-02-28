@@ -4,6 +4,7 @@ import atexit
 from multiprocessing import shared_memory
 from typing import Optional, Iterator, Union, List
 
+from .segments import SegmentStore
 from .utils.process import ProcessUtils
 
 
@@ -94,13 +95,19 @@ class RingWriter:
         self.my_pid = ProcessUtils.get_current_pid()
 
         self._S = struct.Struct(self.record_format["fmt"])
+        self._u64 = struct.Struct("<Q")
         self._rec_size = self._S.size
         value_fields = [f.get("name") for f in self.record_format["fields"] if f.get("name") != "_"]
+        self._value_fields = tuple(value_fields)
         ts_name = self.record_format.get("ts_name")
         try:
-            self._ts_idx = value_fields.index(ts_name) if ts_name else None
+            if ts_name:
+                self._ts_idx = value_fields.index(ts_name)
+            else:
+                # Deepwater clock_level model expects level-1 timestamp first.
+                self._ts_idx = 0 if value_fields else None
         except ValueError:
-            self._ts_idx = None
+            self._ts_idx = 0 if value_fields else None
 
         self.ring_bytes = int(self.feed_config.get("chunk_size_bytes", 8 * 1024 * 1024))
         if self.ring_bytes < self._rec_size:
@@ -108,39 +115,39 @@ class RingWriter:
 
         # Shared memory name is the feed name (no "-ring" suffix needed)
         self.ring = RingBuffer(self.feed_name, data_size=self.ring_bytes, create=True)
+        _, _, _, last_ts, _ = self.ring.header()
+        self.segment_store = SegmentStore(platform.base_path / "data" / feed_name, feed_name)
+        self.segment_store.recover_open_segment(last_ts if last_ts > 0 else None)
         
         # Register for cleanup at exit (writer owns the shared memory)
         if self.feed_name not in _RING_BUFFERS_TO_CLEANUP:
             _RING_BUFFERS_TO_CLEANUP.append(self.feed_name)
 
-    def _write_bytes(self, payload: bytes, last_ts: int) -> int:
-        if len(payload) != self._rec_size:
-            raise ValueError(f"record length {len(payload)} != expected {self._rec_size}")
-        hdr = self.ring.header()
-        write_pos, start_pos, generation, _, record_count = hdr
-        
-        # Check if we need to wrap
+    def _prepare_single_write(self):
+        """Compute ring positions for one record write."""
+        write_pos, start_pos, generation, _, record_count = self.ring.header()
         if write_pos + self._rec_size > self.ring_bytes:
             write_pos = 0
             generation += 1
-        
-        # Calculate start_pos BEFORE writing (oldest = next to be overwritten)
+
         ring_capacity = self.ring_bytes // self._rec_size
         if record_count >= ring_capacity:
-            # Ring is full or will be full after this write
-            # Oldest data is at current write position (about to be overwritten)
             start_pos = write_pos
-        # else: ring not yet full, start_pos stays at 0
-        
+
+        next_write_pos = write_pos + self._rec_size
+        new_record_count = record_count + 1
+        return write_pos, next_write_pos, start_pos, generation, new_record_count
+
+    def _write_bytes(self, payload: bytes, last_ts: int) -> int:
+        if len(payload) != self._rec_size:
+            raise ValueError(f"record length {len(payload)} != expected {self._rec_size}")
+        write_pos, next_write_pos, start_pos, generation, new_record_count = self._prepare_single_write()
+
         # Write the record
         self.ring.data[write_pos:write_pos + self._rec_size] = payload
-        
-        # Update positions
-        write_pos += self._rec_size
-        record_count += 1
-        
-        self.ring.update_header(write_pos, start_pos, generation, last_ts, record_count)
-        return write_pos
+        self.ring.update_header(next_write_pos, start_pos, generation, last_ts, new_record_count)
+        self.segment_store.note_write(last_ts, 1)
+        return next_write_pos
 
     def write(self, timestamp: int, record_data: bytes, create_index: bool = False) -> int:
         """Byte-oriented write; create_index is ignored for rings."""
@@ -148,11 +155,13 @@ class RingWriter:
         return self._write_bytes(record_data, last_ts=timestamp)
 
     def write_values(self, *vals) -> int:
-        """Pack values into the ring; overwrites oldest data when full."""
+        """Pack values directly into ring memory; overwrites oldest data when full."""
         last_ts = vals[self._ts_idx] if self._ts_idx is not None else 0
-        buf = bytearray(self._rec_size)
-        self._S.pack_into(buf, 0, *vals)
-        return self._write_bytes(bytes(buf), last_ts=last_ts)
+        write_pos, next_write_pos, start_pos, generation, new_record_count = self._prepare_single_write()
+        self._S.pack_into(self.ring.data, write_pos, *vals)
+        self.ring.update_header(next_write_pos, start_pos, generation, last_ts, new_record_count)
+        self.segment_store.note_write(last_ts, 1)
+        return next_write_pos
 
     def write_tuple(self, record: tuple) -> int:
         """Write a tuple record (same as write_values but accepts tuple)."""
@@ -160,8 +169,7 @@ class RingWriter:
 
     def write_dict(self, record: dict) -> int:
         """Write a dictionary record (converts to tuple based on field order)."""
-        field_names = [f['name'] for f in self.record_format['fields'] if f.get('name') != '_']
-        vals = tuple(record[name] for name in field_names)
+        vals = tuple(record[name] for name in self._value_fields)
         return self.write_values(*vals)
 
     def write_batch_bytes(self, data: bytes) -> int:
@@ -170,17 +178,34 @@ class RingWriter:
         n = len(data)
         if n == 0 or n % rec_sz != 0:
             raise ValueError("batch length must be a multiple of record_size")
-        write_pos, generation, _ = self.ring.header()
+        if n > self.ring_bytes:
+            raise ValueError("batch larger than ring capacity")
+
+        write_pos, start_pos, generation, prev_last_ts, record_count = self.ring.header()
         # If batch won't fit, wrap and overwrite oldest
         if write_pos + n > self.ring_bytes:
             write_pos = 0
             generation += 1
-            if n > self.ring_bytes:
-                raise ValueError("batch larger than ring capacity")
+
+        batch_records = n // rec_sz
+        ring_capacity = self.ring_bytes // rec_sz
+        new_record_count = record_count + batch_records
+        if record_count >= ring_capacity:
+            start_pos = write_pos
+        elif new_record_count > ring_capacity:
+            overwritten = new_record_count - ring_capacity
+            start_pos = (write_pos + (overwritten * rec_sz)) % self.ring_bytes
+
         end = write_pos + n
         self.ring.data[write_pos:end] = data
-        # last ts is unknown here; keep previous
-        self.ring.update_header(end, generation, 0)
+
+        # level-1 timestamps are first 8 bytes of each record
+        mv = memoryview(data)
+        first_ts = self._u64.unpack_from(mv, 0)[0]
+        last_ts = self._u64.unpack_from(mv, n - rec_sz)[0]
+
+        self.ring.update_header(end, start_pos, generation, last_ts if last_ts else prev_last_ts, new_record_count)
+        self.segment_store.note_batch(first_ts, last_ts, batch_records)
         return end
 
     def resize(self, new_size_bytes: int):
@@ -203,6 +228,7 @@ class RingWriter:
 
     def close(self):
         """Close ring buffer (don't unlink - let OS clean up when all processes exit)."""
+        self.segment_store.close_open_segment("writer_close")
         try:
             # Don't unlink! Readers might still be attached. Let OS clean up.
             self.ring.close(unlink=False)
