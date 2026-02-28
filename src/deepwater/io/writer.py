@@ -404,3 +404,14 @@ class Writer:
             self.current_chunk = None  # Prevent double-close
             self.registry.close()
         self.segment_store.close_open_segment("writer_close")
+
+    def mark_segment_boundary(self, reason: str = "disconnect") -> bool:
+        """
+        Close current segment without closing the writer.
+
+        Next write will automatically open a new segment.
+        Useful for websocket disconnect/reconnect boundaries.
+        """
+        if self.current_chunk is None:
+            return False
+        return self.segment_store.close_open_segment(reason)

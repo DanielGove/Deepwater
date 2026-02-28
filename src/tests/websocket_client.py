@@ -153,6 +153,7 @@ class MarketDataEngine:
             self._ws = None
         if self.io_thread and self.io_thread.is_alive():
             self.io_thread.join(timeout=2.0)
+        self._close_all_writers()
         self.platform.close()
         self.book_writers.clear()
         self.trade_writers.clear()
@@ -162,14 +163,7 @@ class MarketDataEngine:
     def subscribe(self, product_id: str) -> None:
         if not product_id: return
         product_id = product_id.upper()
-
-        feed_spec = trades_spec(product_id)
-        self.platform.create_feed(feed_spec)
-        self.trade_writers[product_id] = self.platform.create_writer(feed_spec["feed_name"])
-
-        feed_spec = l2_spec(product_id)
-        self.platform.create_feed(feed_spec)
-        self.book_writers[product_id] = self.platform.create_writer(feed_spec["feed_name"])
+        self._open_writers_for_product(product_id)
 
         self.product_ids.add(product_id)
         self._send_subscribe((product_id,))
@@ -178,19 +172,7 @@ class MarketDataEngine:
         if not product_id: return
         pid = product_id.upper()
         self.product_ids.discard(pid)
-        # Close writers to release feed registry locks
-        if pid in self.trade_writers:
-            try:
-                self.trade_writers[pid].close()
-            except Exception as e:
-                log.warning(f"Error closing trade writer for {pid}: {e}")
-            del self.trade_writers[pid]
-        if pid in self.book_writers:
-            try:
-                self.book_writers[pid].close()
-            except Exception as e:
-                log.warning(f"Error closing book writer for {pid}: {e}")
-            del self.book_writers[pid]
+        self._close_writers_for_product(pid)
         self._send_unsubscribe([pid])
 
     def list_products(self) -> list[str]:
@@ -198,6 +180,52 @@ class MarketDataEngine:
 
     def is_connected(self) -> bool:
         return self._ws is not None
+
+    def _trade_feed_name(self, product_id: str) -> str:
+        return f"CB-TRADES-{product_id}"
+
+    def _book_feed_name(self, product_id: str) -> str:
+        return f"CB-L2-{product_id}"
+
+    def _open_writers_for_product(self, product_id: str) -> None:
+        """Ensure feed specs exist and writers are open for one product."""
+        pid = product_id.upper()
+        trade_spec = trades_spec(pid)
+        self.platform.create_feed(trade_spec)
+        self.trade_writers[pid] = self.platform.create_writer(trade_spec["feed_name"])
+
+        book_spec = l2_spec(pid)
+        self.platform.create_feed(book_spec)
+        self.book_writers[pid] = self.platform.create_writer(book_spec["feed_name"])
+
+    def _ensure_writers_for_subscriptions(self) -> None:
+        """Re-open writers for current subscriptions (used on reconnect)."""
+        for pid in tuple(self.product_ids):
+            if pid not in self.trade_writers or pid not in self.book_writers:
+                self._open_writers_for_product(pid)
+
+    def _close_writers_for_product(self, product_id: str) -> None:
+        """Close product writers via Platform cache-aware API."""
+        pid = product_id.upper()
+        try:
+            self.platform.close_writer(self._trade_feed_name(pid))
+        except Exception as e:
+            log.warning("Error closing trade writer for %s: %s", pid, e)
+        self.trade_writers.pop(pid, None)
+
+        try:
+            self.platform.close_writer(self._book_feed_name(pid))
+        except Exception as e:
+            log.warning("Error closing book writer for %s: %s", pid, e)
+        self.book_writers.pop(pid, None)
+
+    def _close_all_writers(self) -> None:
+        """Close all active writers (finalizes segments for current session)."""
+        pids = set(self.product_ids)
+        pids.update(self.trade_writers.keys())
+        pids.update(self.book_writers.keys())
+        for pid in tuple(pids):
+            self._close_writers_for_product(pid)
     
     # ---- internals ----
 
@@ -261,6 +289,8 @@ class MarketDataEngine:
             try:
                 self._connect()
                 log.info("WS connected %s", self.uri)
+                # Writers are session-scoped for segmentation; reopen on each connect.
+                self._ensure_writers_for_subscriptions()
                 self._send_subscribe(self.product_ids)
 
                 while self._should_run:
@@ -385,6 +415,8 @@ class MarketDataEngine:
                     try: self._ws.close()
                     except Exception: pass
                     self._ws = None
+                # Segment boundary should follow socket session boundaries.
+                self._close_all_writers()
 
             if not self._should_run:
                 return

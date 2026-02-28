@@ -197,7 +197,10 @@ class SegmentStore:
         if start_us is None or end_us is None:
             seg["status"] = "invalid_empty"
         else:
-            seg["status"] = "closed" if reason == "writer_close" else "crash_closed"
+            # Explicit close (writer close, disconnect boundary, rotation, etc.)
+            # should remain a normal closed segment. crash_closed is only set by
+            # recover_open_segment() when previous process terminated unexpectedly.
+            seg["status"] = "closed"
 
         self._save(doc)
         self._open_segment_id = None

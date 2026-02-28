@@ -149,12 +149,21 @@ deepwater-feeds --base-path ./data --all --json
 Segmentation is metadata attached to each feed and managed by writers automatically:
 - segment starts on first write (not on `create_feed`)
 - segment closes on writer close
+- segment can be explicitly split without closing writer: `writer.mark_segment_boundary("disconnect")`
 - if writer crashes, next writer start closes prior open segment at last level-1 timestamp
 
 Query it with:
 
 ```bash
 deepwater-segments --base-path ./data --feed trades --status usable --suggest-range
+```
+
+Disconnect/reconnect boundary pattern:
+
+```python
+trade_writer.mark_segment_boundary("disconnect")
+book_writer.mark_segment_boundary("disconnect")
+# next write starts a new segment automatically
 ```
 
 ## Multi-Feed Dataset Planning

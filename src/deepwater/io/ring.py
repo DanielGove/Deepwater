@@ -235,6 +235,15 @@ class RingWriter:
         except Exception:
             pass
 
+    def mark_segment_boundary(self, reason: str = "disconnect") -> bool:
+        """
+        Close current segment without closing the ring writer.
+
+        Next write will automatically open a new segment.
+        Useful for disconnect/reconnect boundaries.
+        """
+        return self.segment_store.close_open_segment(reason)
+
 
 class RingReader:
     """Reader that tails a shared-memory ring without chunk/index files."""

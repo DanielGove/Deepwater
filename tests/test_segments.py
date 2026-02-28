@@ -149,12 +149,45 @@ def test_ring_writer_auto_segments_closed():
         p.close()
 
 
+def test_writer_manual_segment_boundary_without_close():
+    with tempfile.TemporaryDirectory(prefix="dw-seg-boundary-") as td:
+        base = Path(td)
+        p = Platform(str(base))
+        p.create_feed(_spec("segmanual"))
+        w = p.create_writer("segmanual")
+        w.write_values(6_000_000, 1)
+        w.write_values(6_000_001, 2)
+        assert w.mark_segment_boundary("disconnect") is True
+        w.write_values(6_000_100, 3)
+        w.write_values(6_000_101, 4)
+        w.close()
+
+        segs = p.list_segments("segmanual")
+        assert len(segs) == 2, f"expected two segments, got {len(segs)}"
+
+        first = segs[0]
+        assert first["status"] == "closed"
+        assert first["close_reason"] == "disconnect"
+        assert first["start_us"] == 6_000_000
+        assert first["end_us"] == 6_000_001
+        assert first["records"] == 2
+
+        second = segs[1]
+        assert second["status"] == "closed"
+        assert second["close_reason"] == "writer_close"
+        assert second["start_us"] == 6_000_100
+        assert second["end_us"] == 6_000_101
+        assert second["records"] == 2
+        p.close()
+
+
 def run_tests():
     tests = [
         ("writer_auto_segment_closed_and_suggested_range", test_writer_auto_segment_closed_and_suggested_range),
         ("writer_recovery_crash_closes_previous_open_segment_at_last_ts", test_writer_recovery_crash_closes_previous_open_segment_at_last_ts),
         ("segments_cli_lists_and_suggests_range", test_segments_cli_lists_and_suggests_range),
         ("ring_writer_auto_segments_closed", test_ring_writer_auto_segments_closed),
+        ("writer_manual_segment_boundary_without_close", test_writer_manual_segment_boundary_without_close),
     ]
     print("Segments Tests")
     print("=" * 60)

@@ -297,12 +297,23 @@ deepwater-feeds --base-path ./data --all --json
 Writers manage per-feed segments automatically:
 - starts on first write
 - closes on clean writer close
+- can be explicitly split without closing writer using `writer.mark_segment_boundary("disconnect")`
 - crash-open segment is closed on next writer start using last level-1 timestamp
 
 Query segments:
 
 ```bash
 deepwater-segments --base-path ./data --feed trades --status usable --suggest-range
+```
+
+Disconnect/reconnect boundary example:
+
+```python
+# websocket disconnected, but process stays alive
+trade_writer.mark_segment_boundary("disconnect")
+book_writer.mark_segment_boundary("disconnect")
+
+# on next write, a new segment starts automatically
 ```
 
 Plan common windows across multiple feeds:
