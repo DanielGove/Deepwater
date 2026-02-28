@@ -8,9 +8,9 @@ from pathlib import Path
 
 from .chunk import Chunk
 from .index import ChunkIndex
-from .feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED, CHUNK_QMIN_OFFSET, MAX_QUERY_KEYS, UINT64_MAX
-from .segments import SegmentStore
-from .utils.process import ProcessUtils
+from ..metadata.feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED, CHUNK_QMIN_OFFSET, MAX_QUERY_KEYS, UINT64_MAX
+from ..metadata.segments import SegmentStore
+from ..utils.process import ProcessUtils
 
 log = logging.getLogger("dw.writer")
 
@@ -208,7 +208,7 @@ class Writer:
 
     def _validate_chunk(self):
         """Validate previous chunk and auto-repair if corrupted."""
-        from . import repair
+        from ..ops import repair
         
         meta = self.registry.get_chunk_metadata(self.current_chunk_id)
         if meta is None:

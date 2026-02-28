@@ -20,8 +20,8 @@ if sys.platform == "darwin":
 
 extensions = [
     Extension(
-        "deepwater.reader_fast",
-        ["src/deepwater/reader_fast.pyx"],
+        "deepwater.io.reader_fast",
+        ["src/deepwater/io/reader_fast.pyx"],
         extra_compile_args=extra_compile_args,
         extra_link_args=["-O3"],
     )

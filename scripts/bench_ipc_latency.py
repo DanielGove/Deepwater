@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import List
 
 from deepwater import Platform
-from deepwater.feed_registry import HEADER_SIZE
+from deepwater.metadata.feed_registry import HEADER_SIZE
 
 
 def make_platform(base: Path, chunk_mb: int) -> Platform:

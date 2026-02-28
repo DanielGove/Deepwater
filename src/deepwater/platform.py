@@ -12,15 +12,15 @@ import orjson
 import struct
 from typing import Dict, Optional, Tuple
 
-from .global_registry import GlobalRegistry
-from .layout_json import build_layout, save_layout, load_layout
-from .feed_registry import FeedRegistry
-from .writer import Writer
-from .ring import RingWriter
-from .reader import Reader
-from .manifest import write_manifest, read_manifest
-from .segments import SegmentStore
-from .datasets import common_intervals, with_duration, recommend_train_validation, build_manifest
+from .metadata.global_registry import GlobalRegistry
+from .metadata.layout_json import build_layout, save_layout, load_layout
+from .metadata.feed_registry import FeedRegistry
+from .io.writer import Writer
+from .io.ring import RingWriter
+from .io.reader import Reader
+from .metadata.manifest import write_manifest, read_manifest
+from .metadata.segments import SegmentStore
+from .metadata.datasets import common_intervals, with_duration, recommend_train_validation, build_manifest
 from . import __version__
 
 
@@ -356,7 +356,7 @@ class Platform:
             if lifecycle.get("persist", True):
                 r = Reader(self, feed_name)
             else:
-                from .ring import RingReader
+                from .io.ring import RingReader
                 r = RingReader(self, feed_name)
             self._readers[feed_name] = r
         return r  

@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from deepwater import Platform
-from deepwater.datasets_cli import main as datasets_cli_main
+from deepwater.cli.datasets_cli import main as datasets_cli_main
 
 
 def _spec(name: str) -> dict:

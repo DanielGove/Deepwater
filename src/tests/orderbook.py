@@ -10,8 +10,8 @@ log = logging.getLogger("dw.orderbook")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 from deepwater.platform import Platform
-from deepwater.feed_registry import FeedRegistry
-from deepwater.index import ChunkIndex
+from deepwater.metadata.feed_registry import FeedRegistry
+from deepwater.io.index import ChunkIndex
 from deepwater.utils.timestamps import us_to_iso
 
 

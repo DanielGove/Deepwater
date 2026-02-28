@@ -4,8 +4,8 @@ import atexit
 from multiprocessing import shared_memory
 from typing import Optional, Iterator, Union, List
 
-from .segments import SegmentStore
-from .utils.process import ProcessUtils
+from ..metadata.segments import SegmentStore
+from ..utils.process import ProcessUtils
 
 
 # Global registry of ring buffers to clean up at exit

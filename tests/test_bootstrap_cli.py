@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from deepwater.bootstrap import main as bootstrap_main
+from deepwater.cli.bootstrap import main as bootstrap_main
 
 
 def test_bootstrap_creates_starter_folder_and_files():

@@ -8,8 +8,8 @@ import time
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from deepwater import Platform
-from deepwater.health_check import check_manifest, check_global_registry, check_feeds
-from deepwater.cleanup import cleanup_all_feeds
+from deepwater.ops.health_check import check_manifest, check_global_registry, check_feeds
+from deepwater.ops.cleanup import cleanup_all_feeds
 
 
 def _make_feed(base: Path, name: str, retention_hours: int = 0, clock_level: int = 1, persist=True):
@@ -61,7 +61,7 @@ def test_cleanup_deletes_expired_chunks():
         size_before = chunk_file.stat().st_size
 
         # Force metadata end_time/last_update to old timestamp to trigger retention
-        from deepwater.feed_registry import FeedRegistry, ON_DISK
+        from deepwater.metadata.feed_registry import FeedRegistry, ON_DISK
         reg = FeedRegistry(str(reg_path), mode="w")
         meta = reg.get_latest_chunk()
         meta.end_time = base_ts

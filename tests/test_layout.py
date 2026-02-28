@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from deepwater.layout_json import build_layout
+from deepwater.metadata.layout_json import build_layout
 
 
 def _raises(msg_sub, fn, *args, **kwargs):

@@ -4,16 +4,16 @@ Deepwater cleanup daemon - deletes expired chunks based on retention policy.
 
 Usage:
     # One-time cleanup
-    python -m deepwater.cleanup --base-path ./data
+    python -m deepwater.ops.cleanup --base-path ./data
     
     # Install cron job (runs every 15 minutes)
-    python -m deepwater.cleanup --install-cron --base-path ./data [--interval 15]
+    python -m deepwater.ops.cleanup --install-cron --base-path ./data [--interval 15]
     
     # Remove cron job
-    python -m deepwater.cleanup --uninstall-cron
+    python -m deepwater.ops.cleanup --uninstall-cron
     
     # Check what would be deleted (dry run)
-    python -m deepwater.cleanup --base-path ./data --dry-run
+    python -m deepwater.ops.cleanup --base-path ./data --dry-run
 """
 import argparse
 import logging
@@ -32,7 +32,7 @@ if __name__ == "__main__":
         sys.path.insert(0, str(src_dir))
 
 from deepwater.platform import Platform
-from deepwater.feed_registry import FeedRegistry, EXPIRED, ON_DISK
+from deepwater.metadata.feed_registry import FeedRegistry, EXPIRED, ON_DISK
 
 log = logging.getLogger("dw.cleanup")
 
@@ -150,7 +150,7 @@ def install_cron(base_path: str, interval: int = 15) -> None:
     
     script_path = Path(__file__).resolve()
     python_path = sys.executable
-    command = f"{python_path} -m deepwater.cleanup --base-path {base_path}"
+    command = f"{python_path} -m deepwater.ops.cleanup --base-path {base_path}"
     
     # Get current user's crontab
     cron = CronTab(user=True)

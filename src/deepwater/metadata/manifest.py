@@ -9,7 +9,7 @@ from typing import Optional
 
 def write_manifest(base_path: Path) -> None:
     """Create or update manifest.json with current Deepwater version."""
-    from . import __version__
+    from .. import __version__
     
     manifest_path = base_path / "manifest.json"
     manifest = {

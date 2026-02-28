@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 
 from deepwater import Platform
-from deepwater.feed_registry import FeedRegistry
+from deepwater.metadata.feed_registry import FeedRegistry
 
 
 def _make_feed(tmpdir: Path, name: str = "test_bounds"):

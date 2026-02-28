@@ -9,8 +9,8 @@ from pathlib import Path
 
 import orjson
 
-from .platform import Platform
-from .datasets import common_intervals, with_duration, recommend_train_validation, build_multi_manifest
+from ..platform import Platform
+from ..metadata.datasets import common_intervals, with_duration, recommend_train_validation, build_multi_manifest
 
 
 def _collect_feeds(feed_args: list[str], feeds_arg: str | None) -> list[str]:

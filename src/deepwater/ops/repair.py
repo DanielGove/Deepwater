@@ -9,13 +9,13 @@ Only works with persist=True (disk chunks). Rings (persist=False) don't need rep
 
 Usage:
     # Repair specific feed
-    python -m deepwater.repair --feed BTCUSDT --base-path ./data
+    python -m deepwater.ops.repair --feed BTCUSDT --base-path ./data
     
     # Repair all idle feeds
-    python -m deepwater.repair --all --base-path ./data
+    python -m deepwater.ops.repair --all --base-path ./data
     
     # Check without fixing (dry run)
-    python -m deepwater.repair --all --base-path ./data --dry-run
+    python -m deepwater.ops.repair --all --base-path ./data --dry-run
 """
 import argparse
 import fcntl
@@ -35,7 +35,7 @@ if __name__ == "__main__":
         sys.path.insert(0, str(src_dir))
 
 from deepwater.platform import Platform
-from deepwater.feed_registry import FeedRegistry, ON_DISK, IN_MEMORY, EXPIRED
+from deepwater.metadata.feed_registry import FeedRegistry, ON_DISK, IN_MEMORY, EXPIRED
 
 log = logging.getLogger("dw.repair")
 

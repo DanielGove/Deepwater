@@ -6,15 +6,20 @@ import numpy as np
 
 from .chunk import Chunk
 from .index import ChunkIndex
-from .feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED, UINT64_MAX
-from .utils.process import ProcessUtils
+from ..metadata.feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED, UINT64_MAX
+from ..utils.process import ProcessUtils
 
 # Try to import Cython-optimized hot paths
 try:
     from .reader_fast import binary_search_fast, range_tuples_fast
     HAVE_FAST = True
 except ImportError:
-    HAVE_FAST = False
+    # Backward-compatible import path while extension artifacts still live at deepwater.reader_fast
+    try:
+        from ..reader_fast import binary_search_fast, range_tuples_fast
+        HAVE_FAST = True
+    except ImportError:
+        HAVE_FAST = False
 
 
 class Reader:

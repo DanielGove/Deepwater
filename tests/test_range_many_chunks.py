@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from deepwater import Platform
-from deepwater.feed_registry import FeedRegistry
+from deepwater.metadata.feed_registry import FeedRegistry
 
 
 def test_range_spans_hundred_chunks():

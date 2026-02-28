@@ -9,7 +9,7 @@ import orjson
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from deepwater import Platform
-from deepwater.feed_cli import create_main, delete_main
+from deepwater.cli.feed_cli import create_main, delete_main
 
 
 def _spec(name: str, persist: bool = True) -> dict:

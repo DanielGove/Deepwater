@@ -47,9 +47,9 @@ __version__ = "0.0.1"
 
 # Export public API
 from .platform import Platform
-from .writer import Writer
-from .reader import Reader
-from .ring import RingWriter, RingReader
+from .io.writer import Writer
+from .io.reader import Reader
+from .io.ring import RingWriter, RingReader
 
 __all__ = [
     "Platform",

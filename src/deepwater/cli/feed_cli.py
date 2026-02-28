@@ -15,7 +15,7 @@ from typing import Iterable, Optional
 
 import orjson
 
-from .platform import Platform
+from ..platform import Platform
 
 
 def _load_specs_from_file(path: Path) -> list[dict]:

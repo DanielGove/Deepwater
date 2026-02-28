@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from deepwater import Platform
-from deepwater.segments_cli import main as segments_cli_main
+from deepwater.cli.segments_cli import main as segments_cli_main
 
 
 def _spec(name: str) -> dict:

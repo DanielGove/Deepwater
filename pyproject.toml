@@ -29,14 +29,14 @@ dev = [
 ]
 
 [project.scripts]
-deepwater = "deepwater.bootstrap:main"
-deepwater-cleanup = "deepwater.cleanup:main"
-deepwater-health = "deepwater.health_check:main"
-deepwater-repair = "deepwater.repair:main"
-deepwater-create-feed = "deepwater.feed_cli:create_main"
-deepwater-delete-feed = "deepwater.feed_cli:delete_main"
-deepwater-segments = "deepwater.segments_cli:main"
-deepwater-datasets = "deepwater.datasets_cli:main"
+deepwater = "deepwater.cli.bootstrap:main"
+deepwater-cleanup = "deepwater.ops.cleanup:main"
+deepwater-health = "deepwater.ops.health_check:main"
+deepwater-repair = "deepwater.ops.repair:main"
+deepwater-create-feed = "deepwater.cli.feed_cli:create_main"
+deepwater-delete-feed = "deepwater.cli.feed_cli:delete_main"
+deepwater-segments = "deepwater.cli.segments_cli:main"
+deepwater-datasets = "deepwater.cli.datasets_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/DanielGove/Deepwater"

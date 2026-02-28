@@ -7,7 +7,7 @@ import sys
 
 import orjson
 
-from .platform import Platform
+from ..platform import Platform
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -11,7 +11,7 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from helpers import make_platform, seed_records, close_all
-from deepwater.feed_registry import FeedRegistry
+from deepwater.metadata.feed_registry import FeedRegistry
 
 
 def test_reuse_single_creation():

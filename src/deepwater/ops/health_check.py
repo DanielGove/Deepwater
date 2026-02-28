@@ -8,7 +8,7 @@ Exit codes:
     2 = error running check
 
 Usage:
-    python -m deepwater.health_check --base-path ./data [--check-feeds] [--max-age-seconds 300]
+    python -m deepwater.ops.health_check --base-path ./data [--check-feeds] [--max-age-seconds 300]
     
 Checks:
     - Manifest exists and is readable
@@ -50,7 +50,7 @@ def check_global_registry(base_path: Path) -> Tuple[bool, str]:
         return False, "global_registry.bin missing"
     
     try:
-        from deepwater.global_registry import GlobalRegistry
+        from deepwater.metadata.global_registry import GlobalRegistry
         reg = GlobalRegistry(base_path)
         feed_count = len(reg.list_feeds())
         reg.close()
@@ -77,7 +77,7 @@ def check_feeds(base_path: Path) -> Tuple[bool, str]:
             continue
         
         try:
-            from deepwater.feed_registry import FeedRegistry
+            from deepwater.metadata.feed_registry import FeedRegistry
             reg = FeedRegistry(str(reg_file), mode="r")
             latest = reg.get_latest_chunk_idx()
             reg.close()
