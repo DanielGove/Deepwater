@@ -16,6 +16,32 @@ pip install -e .
 
 ---
 
+## Quick Start Folder
+
+After install, run:
+
+```bash
+deepwater
+```
+
+This creates a local `./deepwater-starter` folder with:
+- `START_HERE.md` (2-minute launch checklist)
+- `OPS_RUNBOOK.md` (copy-paste incident/run operations)
+- `GUIDE.md` (full usage details)
+- `configs/trades.json`
+- `configs/quotes.json`
+- `configs/feeds.json` (bundle format)
+- `apps/quickstart_app.py` (runnable integration skeleton)
+
+Optional:
+
+```bash
+deepwater --path ./my-deepwater-guide
+deepwater --path ./my-deepwater-guide --force
+```
+
+---
+
 ## Platform Core
 
 ```python
@@ -178,6 +204,73 @@ deepwater-cleanup --uninstall-cron
 ```
 
 Removes expired chunks based on retention policy.
+
+---
+
+## Feed Management CLI
+
+After installation (`pip install -e .`), these commands are available globally:
+- `deepwater-create-feed`
+- `deepwater-delete-feed`
+
+### Feed Config Format (JSON)
+
+Single feed file:
+
+```json
+{
+  "feed_name": "trades",
+  "mode": "UF",
+  "fields": [
+    {"name": "ts", "type": "uint64"},
+    {"name": "price", "type": "float64"},
+    {"name": "size", "type": "float64"}
+  ],
+  "clock_level": 1,
+  "persist": true,
+  "chunk_size_mb": 64,
+  "retention_hours": 0,
+  "index_playback": false
+}
+```
+
+Bundle file:
+
+```json
+{
+  "feeds": [
+    {"feed_name": "trades", "...": "..."},
+    {"feed_name": "quotes", "...": "..."}
+  ]
+}
+```
+
+### Create Feeds
+
+```bash
+# one file
+deepwater-create-feed --base-path ./data --config ./configs/trades.json
+
+# many files in a directory
+deepwater-create-feed --base-path ./data --config-dir ./configs/feeds
+```
+
+`deepwater-create-feed` is idempotent: existing feeds are left unchanged (no error).
+
+### Delete Feeds
+
+```bash
+# by name
+deepwater-delete-feed --base-path ./data --feed trades --feed quotes
+
+# from config(s): uses feed_name values
+deepwater-delete-feed --base-path ./data --config ./configs/trades.json
+
+# strict mode (missing feed = error)
+deepwater-delete-feed --base-path ./data --feed trades --strict-missing
+```
+
+Delete removes feed data, feed registry files, ring shared memory (if used), and the global registry entry.
 
 ---
 
