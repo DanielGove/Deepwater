@@ -600,25 +600,44 @@ class Platform:
         """Register signal handlers and atexit for graceful shutdown."""
         if self._shutdown_handlers_registered:
             return
-        
+
+        import logging
+        log = logging.getLogger("dw.platform")
+
         def shutdown_handler(signum, frame):
             try:
-                import logging
-                log = logging.getLogger("dw.platform")
                 log.info(f"Received signal {signum}, shutting down gracefully...")
             except Exception:
                 pass
             self.close()
             import sys
             sys.exit(0)
-        
-        # Register signal handlers
-        signal.signal(signal.SIGTERM, shutdown_handler)
-        signal.signal(signal.SIGINT, shutdown_handler)
-        
-        # Register atexit cleanup (catches normal exit)
+
+        # Tag handler so later Platform instances can safely replace it.
+        shutdown_handler._deepwater_platform_handler = True  # type: ignore[attr-defined]
+
+        def _is_default_or_ours(handler) -> bool:
+            return handler in (signal.SIG_DFL, None) or bool(
+                getattr(handler, "_deepwater_platform_handler", False)
+            )
+
+        current_term = signal.getsignal(signal.SIGTERM)
+        current_int = signal.getsignal(signal.SIGINT)
+
+        # Do not clobber app-owned handlers (daemons/services usually manage their own lifecycle).
+        if _is_default_or_ours(current_term) and _is_default_or_ours(current_int):
+            signal.signal(signal.SIGTERM, shutdown_handler)
+            signal.signal(signal.SIGINT, shutdown_handler)
+        else:
+            log.debug(
+                "Skipping Platform signal handler install (existing handlers: SIGTERM=%r SIGINT=%r)",
+                current_term,
+                current_int,
+            )
+
+        # Register atexit cleanup (catches normal process exit).
         atexit.register(self.close)
-        
+
         self._shutdown_handlers_registered = True
     
     def close(self):
