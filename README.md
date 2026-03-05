@@ -306,8 +306,8 @@ Query segments:
 deepwater-segments --base-path ./data --feed trades --status usable --suggest-range
 ```
 
-Text-mode timestamp fields default to human-readable UTC output.
-Use `--timestamp-format us` on `deepwater-feeds`, `deepwater-segments`, or `deepwater-datasets` for raw microseconds.
+Text-mode timestamp fields default to human-readable local time.
+Use `--ts-fmt epoch` for raw microseconds, `--ts-fmt utc` for UTC, or `--ts-fmt America/New_York` for a specific timezone.
 
 Disconnect/reconnect boundary example:
 

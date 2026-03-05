@@ -112,14 +112,15 @@ def test_segments_cli_lists_and_suggests_range():
                 "--base-path", str(base),
                 "--feed", "segfeed",
                 "--suggest-range",
+                "--ts-fmt", "utc",
             ])
         out = buf.getvalue()
         assert rc == 0
         assert "segments=1" in out
-        assert "start=1970-01-01T00:00:04.000000Z (4000000 us)" in out
-        assert "end=1970-01-01T00:00:04.000002Z (4000002 us)" in out
-        assert "suggested_range_start=1970-01-01T00:00:04.000000Z (4000000 us)" in out
-        assert "suggested_range_end=1970-01-01T00:00:04.000002Z (4000002 us)" in out
+        assert "start=1970-01-01T00:00:04.000000Z" in out
+        assert "end=1970-01-01T00:00:04.000002Z" in out
+        assert "suggested_range_start=1970-01-01T00:00:04.000000Z" in out
+        assert "suggested_range_end=1970-01-01T00:00:04.000002Z" in out
 
 
 def test_segments_cli_timestamp_format_us():
@@ -139,7 +140,7 @@ def test_segments_cli_timestamp_format_us():
                 "--base-path", str(base),
                 "--feed", "segfeed",
                 "--suggest-range",
-                "--timestamp-format", "us",
+                "--ts-fmt", "epoch",
             ])
         out = buf.getvalue()
         assert rc == 0
@@ -147,6 +148,33 @@ def test_segments_cli_timestamp_format_us():
         assert "end_us=4000002" in out
         assert "suggested_range_start_us=4000000" in out
         assert "suggested_range_end_us=4000002" in out
+
+
+def test_segments_cli_timestamp_format_timezone_name():
+    with tempfile.TemporaryDirectory(prefix="dw-seg-cli-tzname-") as td:
+        base = Path(td)
+        p = Platform(str(base))
+        p.create_feed(_spec("segfeed"))
+        w = p.create_writer("segfeed")
+        for i in range(3):
+            w.write_values(4_000_000 + i, i)
+        w.close()
+        p.close()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = segments_cli_main([
+                "--base-path", str(base),
+                "--feed", "segfeed",
+                "--suggest-range",
+                "--ts-fmt", "America/New_York",
+            ])
+        out = buf.getvalue()
+        assert rc == 0
+        assert "start=1969-12-31T19:00:04.000000-05:00" in out
+        assert "end=1969-12-31T19:00:04.000002-05:00" in out
+        assert "suggested_range_start=1969-12-31T19:00:04.000000-05:00" in out
+        assert "suggested_range_end=1969-12-31T19:00:04.000002-05:00" in out
 
 
 def test_ring_writer_auto_segments_closed():
@@ -216,6 +244,7 @@ def run_tests():
         ("writer_recovery_crash_closes_previous_open_segment_at_last_ts", test_writer_recovery_crash_closes_previous_open_segment_at_last_ts),
         ("segments_cli_lists_and_suggests_range", test_segments_cli_lists_and_suggests_range),
         ("segments_cli_timestamp_format_us", test_segments_cli_timestamp_format_us),
+        ("segments_cli_timestamp_format_timezone_name", test_segments_cli_timestamp_format_timezone_name),
         ("ring_writer_auto_segments_closed", test_ring_writer_auto_segments_closed),
         ("writer_manual_segment_boundary_without_close", test_writer_manual_segment_boundary_without_close),
     ]

@@ -11,7 +11,7 @@ import orjson
 
 from ..platform import Platform
 from ..metadata.datasets import common_intervals, with_duration, recommend_train_validation, build_multi_manifest
-from .timefmt import add_timestamp_format_arg, format_timestamp_us
+from .timefmt import add_ts_fmt_arg, format_timestamp_us, parse_ts_fmt
 
 
 def _collect_feeds(feed_args: list[str], feeds_arg: str | None) -> list[str]:
@@ -123,10 +123,16 @@ def main(argv: list[str] | None = None) -> int:
         default=20,
         help="How many intervals to print in text mode",
     )
-    add_timestamp_format_arg(parser)
+    add_ts_fmt_arg(parser)
     parser.add_argument("--json", action="store_true", help="Print JSON manifest")
     parser.add_argument("--out", help="Write JSON manifest to file path")
     args = parser.parse_args(argv)
+
+    try:
+        ts_fmt = parse_ts_fmt(args.ts_fmt)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
 
     min_duration_us = int(args.min_duration_seconds * 1_000_000)
     try:
@@ -246,14 +252,14 @@ def main(argv: list[str] | None = None) -> int:
 
     top = max(0, int(args.show_top))
     for i, seg in enumerate(intervals[:top], start=1):
-        if args.timestamp_format == "us":
+        if ts_fmt.epoch:
             print(
                 f"  {i}. start_us={seg['start_us']} end_us={seg['end_us']} duration_us={seg['duration_us']}"
             )
         else:
             print(
-                f"  {i}. start={format_timestamp_us(seg['start_us'], args.timestamp_format)} "
-                f"end={format_timestamp_us(seg['end_us'], args.timestamp_format)} "
+                f"  {i}. start={format_timestamp_us(seg['start_us'], ts_fmt)} "
+                f"end={format_timestamp_us(seg['end_us'], ts_fmt)} "
                 f"duration_us={seg['duration_us']}"
             )
 
@@ -262,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         t = rec["train"]
         v = rec["validation"]
-        if args.timestamp_format == "us":
+        if ts_fmt.epoch:
             print(
                 "recommended_split "
                 f"train=[{t['start_us']},{t['end_us']}] "
@@ -272,10 +278,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(
                 "recommended_split "
-                f"train_start={format_timestamp_us(t['start_us'], args.timestamp_format)} "
-                f"train_end={format_timestamp_us(t['end_us'], args.timestamp_format)} "
-                f"validation_start={format_timestamp_us(v['start_us'], args.timestamp_format)} "
-                f"validation_end={format_timestamp_us(v['end_us'], args.timestamp_format)} "
+                f"train_start={format_timestamp_us(t['start_us'], ts_fmt)} "
+                f"train_end={format_timestamp_us(t['end_us'], ts_fmt)} "
+                f"validation_start={format_timestamp_us(v['start_us'], ts_fmt)} "
+                f"validation_end={format_timestamp_us(v['end_us'], ts_fmt)} "
                 f"ratio={rec['train_ratio']}"
             )
 

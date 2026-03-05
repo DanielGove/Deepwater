@@ -119,20 +119,21 @@ def test_describe_single_feed_text_timestamp_formats():
             rc_human = feeds_main([
                 "--base-path", str(base),
                 "--feed", "trades",
+                "--ts-fmt", "utc",
             ])
         assert rc_human == 0
         human_out = human_buf.getvalue()
         assert "feed=trades" in human_out
         assert "created=" in human_out
         assert "created_us=" not in human_out
-        assert " us)" in human_out
+        assert "created=20" in human_out
 
         us_buf = io.StringIO()
         with redirect_stdout(us_buf):
             rc_us = feeds_main([
                 "--base-path", str(base),
                 "--feed", "trades",
-                "--timestamp-format", "us",
+                "--ts-fmt", "epoch",
             ])
         assert rc_us == 0
         us_out = us_buf.getvalue()

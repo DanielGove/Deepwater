@@ -152,13 +152,14 @@ def test_datasets_cli_text_timestamp_formats():
                 "--base-path", str(base),
                 "--feed", "f1",
                 "--feed", "f2",
+                "--ts-fmt", "utc",
             ])
         assert rc_human == 0
         human_out = human_buf.getvalue()
-        assert "start=1970-01-01T00:00:01.000100Z (1000100 us)" in human_out
-        assert "end=1970-01-01T00:00:01.000200Z (1000200 us)" in human_out
-        assert "train_start=1970-01-01T00:00:01.000100Z (1000100 us)" in human_out
-        assert "validation_start=1970-01-01T00:00:01.000180Z (1000180 us)" in human_out
+        assert "start=1970-01-01T00:00:01.000100Z" in human_out
+        assert "end=1970-01-01T00:00:01.000200Z" in human_out
+        assert "train_start=1970-01-01T00:00:01.000100Z" in human_out
+        assert "validation_start=1970-01-01T00:00:01.000180Z" in human_out
 
         us_buf = io.StringIO()
         with redirect_stdout(us_buf):
@@ -166,7 +167,7 @@ def test_datasets_cli_text_timestamp_formats():
                 "--base-path", str(base),
                 "--feed", "f1",
                 "--feed", "f2",
-                "--timestamp-format", "us",
+                "--ts-fmt", "epoch",
             ])
         assert rc_us == 0
         us_out = us_buf.getvalue()

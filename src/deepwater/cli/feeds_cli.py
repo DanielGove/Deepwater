@@ -9,7 +9,7 @@ from pathlib import Path
 import orjson
 
 from ..platform import Platform
-from .timefmt import add_timestamp_format_arg, format_timestamp_us
+from .timefmt import TimestampFormat, add_ts_fmt_arg, format_timestamp_us, parse_ts_fmt
 
 
 def _unique(items: list[str]) -> list[str]:
@@ -23,7 +23,7 @@ def _unique(items: list[str]) -> list[str]:
     return out
 
 
-def _print_feed(desc: dict, timestamp_format: str) -> None:
+def _print_feed(desc: dict, ts_fmt: TimestampFormat) -> None:
     lifecycle = desc.get("lifecycle", {})
     print(f"feed={desc.get('feed_name')}")
     print(
@@ -39,10 +39,10 @@ def _print_feed(desc: dict, timestamp_format: str) -> None:
         f"record_size={desc.get('record_size')} "
         f"ts_offset={desc.get('ts_offset')}"
     )
-    if timestamp_format == "us":
+    if ts_fmt.epoch:
         print(f"  created_us={desc.get('created_us')}")
     else:
-        print(f"  created={format_timestamp_us(desc.get('created_us'), timestamp_format)}")
+        print(f"  created={format_timestamp_us(desc.get('created_us'), ts_fmt)}")
     print("  fields:")
     for f in desc.get("fields", []):
         print(
@@ -66,9 +66,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Describe all feeds (full metadata)",
     )
-    add_timestamp_format_arg(parser)
+    add_ts_fmt_arg(parser)
     parser.add_argument("--json", action="store_true", help="Output JSON")
     args = parser.parse_args(argv)
+
+    try:
+        ts_fmt = parse_ts_fmt(args.ts_fmt)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
 
     feed_names = _unique(args.feed)
     if args.all and feed_names:
@@ -113,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         for i, desc in enumerate(described):
             if i:
                 print()
-            _print_feed(desc, args.timestamp_format)
+            _print_feed(desc, ts_fmt)
         return 0
     finally:
         p.close()
