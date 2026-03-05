@@ -135,11 +135,52 @@ def test_datasets_cli_multi_source_two_base_paths():
         assert payload["intervals"][0]["end_us"] == 20_000
 
 
+def test_datasets_cli_text_timestamp_formats():
+    with tempfile.TemporaryDirectory(prefix="dw-datasets-text-") as td:
+        base = Path(td) / "base"
+
+        p = Platform(str(base))
+        p.create_feed(_spec("f1"))
+        p.create_feed(_spec("f2"))
+        _write_segment(p, "f1", 1_000_000, 1_000_200)
+        _write_segment(p, "f2", 1_000_100, 1_000_300)
+        p.close()
+
+        human_buf = io.StringIO()
+        with redirect_stdout(human_buf):
+            rc_human = datasets_cli_main([
+                "--base-path", str(base),
+                "--feed", "f1",
+                "--feed", "f2",
+            ])
+        assert rc_human == 0
+        human_out = human_buf.getvalue()
+        assert "start=1970-01-01T00:00:01.000100Z (1000100 us)" in human_out
+        assert "end=1970-01-01T00:00:01.000200Z (1000200 us)" in human_out
+        assert "train_start=1970-01-01T00:00:01.000100Z (1000100 us)" in human_out
+        assert "validation_start=1970-01-01T00:00:01.000180Z (1000180 us)" in human_out
+
+        us_buf = io.StringIO()
+        with redirect_stdout(us_buf):
+            rc_us = datasets_cli_main([
+                "--base-path", str(base),
+                "--feed", "f1",
+                "--feed", "f2",
+                "--timestamp-format", "us",
+            ])
+        assert rc_us == 0
+        us_out = us_buf.getvalue()
+        assert "start_us=1000100 end_us=1000200 duration_us=101" in us_out
+        assert "train=[1000100,1000179]" in us_out
+        assert "validation=[1000180,1000200]" in us_out
+
+
 def run_tests():
     tests = [
         ("common_windows_across_two_feeds", test_common_windows_across_two_feeds),
         ("datasets_cli_json_and_manifest_output", test_datasets_cli_json_and_manifest_output),
         ("datasets_cli_multi_source_two_base_paths", test_datasets_cli_multi_source_two_base_paths),
+        ("datasets_cli_text_timestamp_formats", test_datasets_cli_text_timestamp_formats),
     ]
     print("Datasets Tests")
     print("=" * 60)

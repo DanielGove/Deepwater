@@ -107,12 +107,45 @@ def test_describe_missing_feed_fails():
         assert "not found" in err.getvalue()
 
 
+def test_describe_single_feed_text_timestamp_formats():
+    with tempfile.TemporaryDirectory(prefix="dw-feeds-text-ts-") as td:
+        base = Path(td) / "platform"
+        p = Platform(str(base))
+        p.create_feed(_spec("trades"))
+        p.close()
+
+        human_buf = io.StringIO()
+        with redirect_stdout(human_buf):
+            rc_human = feeds_main([
+                "--base-path", str(base),
+                "--feed", "trades",
+            ])
+        assert rc_human == 0
+        human_out = human_buf.getvalue()
+        assert "feed=trades" in human_out
+        assert "created=" in human_out
+        assert "created_us=" not in human_out
+        assert " us)" in human_out
+
+        us_buf = io.StringIO()
+        with redirect_stdout(us_buf):
+            rc_us = feeds_main([
+                "--base-path", str(base),
+                "--feed", "trades",
+                "--timestamp-format", "us",
+            ])
+        assert rc_us == 0
+        us_out = us_buf.getvalue()
+        assert "created_us=" in us_out
+
+
 def run_tests():
     tests = [
         ("list_feeds_text", test_list_feeds_text),
         ("describe_single_feed_json", test_describe_single_feed_json),
         ("describe_all_json", test_describe_all_json),
         ("describe_missing_feed_fails", test_describe_missing_feed_fails),
+        ("describe_single_feed_text_timestamp_formats", test_describe_single_feed_text_timestamp_formats),
     ]
     print("Feeds CLI Tests")
     print("=" * 60)

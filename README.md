@@ -306,6 +306,9 @@ Query segments:
 deepwater-segments --base-path ./data --feed trades --status usable --suggest-range
 ```
 
+Text-mode timestamp fields default to human-readable UTC output.
+Use `--timestamp-format us` on `deepwater-feeds`, `deepwater-segments`, or `deepwater-datasets` for raw microseconds.
+
 Disconnect/reconnect boundary example:
 
 ```python

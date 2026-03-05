@@ -11,6 +11,7 @@ import orjson
 
 from ..platform import Platform
 from ..metadata.datasets import common_intervals, with_duration, recommend_train_validation, build_multi_manifest
+from .timefmt import add_timestamp_format_arg, format_timestamp_us
 
 
 def _collect_feeds(feed_args: list[str], feeds_arg: str | None) -> list[str]:
@@ -122,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         default=20,
         help="How many intervals to print in text mode",
     )
+    add_timestamp_format_arg(parser)
     parser.add_argument("--json", action="store_true", help="Print JSON manifest")
     parser.add_argument("--out", help="Write JSON manifest to file path")
     args = parser.parse_args(argv)
@@ -244,21 +246,38 @@ def main(argv: list[str] | None = None) -> int:
 
     top = max(0, int(args.show_top))
     for i, seg in enumerate(intervals[:top], start=1):
-        print(
-            f"  {i}. start_us={seg['start_us']} end_us={seg['end_us']} duration_us={seg['duration_us']}"
-        )
+        if args.timestamp_format == "us":
+            print(
+                f"  {i}. start_us={seg['start_us']} end_us={seg['end_us']} duration_us={seg['duration_us']}"
+            )
+        else:
+            print(
+                f"  {i}. start={format_timestamp_us(seg['start_us'], args.timestamp_format)} "
+                f"end={format_timestamp_us(seg['end_us'], args.timestamp_format)} "
+                f"duration_us={seg['duration_us']}"
+            )
 
     if rec is None:
         print("recommended_split=None")
     else:
         t = rec["train"]
         v = rec["validation"]
-        print(
-            "recommended_split "
-            f"train=[{t['start_us']},{t['end_us']}] "
-            f"validation=[{v['start_us']},{v['end_us']}] "
-            f"ratio={rec['train_ratio']}"
-        )
+        if args.timestamp_format == "us":
+            print(
+                "recommended_split "
+                f"train=[{t['start_us']},{t['end_us']}] "
+                f"validation=[{v['start_us']},{v['end_us']}] "
+                f"ratio={rec['train_ratio']}"
+            )
+        else:
+            print(
+                "recommended_split "
+                f"train_start={format_timestamp_us(t['start_us'], args.timestamp_format)} "
+                f"train_end={format_timestamp_us(t['end_us'], args.timestamp_format)} "
+                f"validation_start={format_timestamp_us(v['start_us'], args.timestamp_format)} "
+                f"validation_end={format_timestamp_us(v['end_us'], args.timestamp_format)} "
+                f"ratio={rec['train_ratio']}"
+            )
 
     if args.out:
         print(f"manifest_written={args.out}")

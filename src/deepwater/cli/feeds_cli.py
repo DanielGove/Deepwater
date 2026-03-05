@@ -9,6 +9,7 @@ from pathlib import Path
 import orjson
 
 from ..platform import Platform
+from .timefmt import add_timestamp_format_arg, format_timestamp_us
 
 
 def _unique(items: list[str]) -> list[str]:
@@ -22,7 +23,7 @@ def _unique(items: list[str]) -> list[str]:
     return out
 
 
-def _print_feed(desc: dict) -> None:
+def _print_feed(desc: dict, timestamp_format: str) -> None:
     lifecycle = desc.get("lifecycle", {})
     print(f"feed={desc.get('feed_name')}")
     print(
@@ -38,7 +39,10 @@ def _print_feed(desc: dict) -> None:
         f"record_size={desc.get('record_size')} "
         f"ts_offset={desc.get('ts_offset')}"
     )
-    print(f"  created_us={desc.get('created_us')}")
+    if timestamp_format == "us":
+        print(f"  created_us={desc.get('created_us')}")
+    else:
+        print(f"  created={format_timestamp_us(desc.get('created_us'), timestamp_format)}")
     print("  fields:")
     for f in desc.get("fields", []):
         print(
@@ -62,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Describe all feeds (full metadata)",
     )
+    add_timestamp_format_arg(parser)
     parser.add_argument("--json", action="store_true", help="Output JSON")
     args = parser.parse_args(argv)
 
@@ -108,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         for i, desc in enumerate(described):
             if i:
                 print()
-            _print_feed(desc)
+            _print_feed(desc, args.timestamp_format)
         return 0
     finally:
         p.close()
