@@ -12,6 +12,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from deepwater import Platform
 from deepwater.cli.segments_cli import main as segments_cli_main
+from deepwater.metadata.feed_registry import FeedRegistry, UINT64_MAX
+from deepwater.ops import repair
+from deepwater.metadata.segments import SegmentStore
 
 
 def _spec(name: str) -> dict:
@@ -87,11 +90,136 @@ os._exit(0)
         assert first["status"] == "crash_closed", f"unexpected first status: {first}"
         assert first["start_us"] == 2_000_000
         assert first["end_us"] == 2_000_003
+        assert first["records"] == 4
 
         last = segs[-1]
         assert last["status"] == "closed"
         assert last["start_us"] == 3_000_000
         assert last["end_us"] == 3_000_000
+        p.close()
+
+
+def test_writer_recovery_repairs_chunk_metadata_before_segment_close():
+    with tempfile.TemporaryDirectory(prefix="dw-seg-repair-meta-") as td:
+        base = Path(td)
+        src = Path(__file__).parent.parent / "src"
+
+        child_code = f"""
+import os
+import sys
+sys.path.insert(0, {str(src)!r})
+from deepwater import Platform
+
+base = {str(base)!r}
+p = Platform(base)
+p.create_feed({{'feed_name':'segfeed','mode':'UF','fields':[{{'name':'ts','type':'uint64'}},{{'name':'v','type':'uint64'}}],'clock_level':1,'persist':True,'chunk_size_mb':1}})
+w = p.create_writer('segfeed')
+for i in range(5):
+    w.write_values(2_100_000 + i, i)
+os._exit(0)
+"""
+        proc = subprocess.run([sys.executable, "-c", child_code], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+
+        feed_dir = base / "data" / "segfeed"
+        reg = FeedRegistry(str(feed_dir / "segfeed.reg"), mode="w")
+        try:
+            idx = reg.get_latest_chunk_idx()
+            assert idx is not None
+            meta = reg.get_chunk_metadata(int(idx))
+            try:
+                # Simulate stale/invalid metadata from abrupt crash.
+                meta.num_records = 0
+                meta.set_qbounds(0, UINT64_MAX, 0)
+            finally:
+                meta.release()
+        finally:
+            reg.close()
+
+        p = Platform(str(base))
+        w = p.create_writer("segfeed")
+        w.write_values(3_100_000, 999)
+        w.close()
+
+        segs = p.list_segments("segfeed")
+        assert len(segs) >= 2, f"expected at least two segments, got {len(segs)}"
+        first = segs[0]
+        assert first["status"] == "crash_closed", f"unexpected first status: {first}"
+        assert first["start_us"] == 2_100_000
+        assert first["end_us"] == 2_100_004
+        assert first["records"] == 5
+        p.close()
+
+
+def test_repair_utility_backfills_legacy_segment_zero_records():
+    with tempfile.TemporaryDirectory(prefix="dw-seg-repair-utility-") as td:
+        base = Path(td)
+        p = Platform(str(base))
+        p.create_feed(_spec("segfeed"))
+        w = p.create_writer("segfeed")
+        for i in range(5):
+            w.write_values(7_000_000 + i, i)
+        w.close()
+        p.close()
+
+        store = SegmentStore(base / "data" / "segfeed", "segfeed")
+        fd, mm = store._open_mmap()
+        try:
+            header = store._read_header(mm)
+            assert int(header["segment_count"]) >= 1
+            seg = store._read_entry(mm, 1)
+            seg["records"] = 0
+            store._write_entry(mm, 1, seg)
+            mm.flush()
+        finally:
+            mm.close()
+            os.close(fd)
+
+        checked, repaired = repair.repair_feed(base, "segfeed", dry_run=False)
+        assert checked >= 2  # at least one chunk + one segment checked
+        assert repaired >= 1
+
+        p = Platform(str(base))
+        segs = p.list_segments("segfeed")
+        assert segs[0]["status"] == "closed"
+        assert segs[0]["records"] == 5
+        p.close()
+
+
+def test_repair_utility_crash_closes_open_segment():
+    with tempfile.TemporaryDirectory(prefix="dw-seg-repair-open-") as td:
+        base = Path(td)
+        src = Path(__file__).parent.parent / "src"
+
+        child_code = f"""
+import os
+import sys
+sys.path.insert(0, {str(src)!r})
+from deepwater import Platform
+
+base = {str(base)!r}
+p = Platform(base)
+p.create_feed({{'feed_name':'segfeed','mode':'UF','fields':[{{'name':'ts','type':'uint64'}},{{'name':'v','type':'uint64'}}],'clock_level':1,'persist':True,'chunk_size_mb':1}})
+w = p.create_writer('segfeed')
+for i in range(3):
+    w.write_values(8_000_000 + i, i)
+os._exit(0)
+"""
+        proc = subprocess.run([sys.executable, "-c", child_code], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+
+        checked, repaired = repair.repair_feed(base, "segfeed", dry_run=False)
+        assert checked >= 2  # at least one chunk + one segment checked
+        assert repaired >= 1
+
+        p = Platform(str(base))
+        segs = p.list_segments("segfeed")
+        assert len(segs) >= 1
+        seg = segs[0]
+        assert seg["status"] == "crash_closed"
+        assert seg["start_us"] == 8_000_000
+        assert seg["end_us"] == 8_000_002
+        assert seg["records"] == 3
         p.close()
 
 
@@ -242,6 +370,9 @@ def run_tests():
     tests = [
         ("writer_auto_segment_closed_and_suggested_range", test_writer_auto_segment_closed_and_suggested_range),
         ("writer_recovery_crash_closes_previous_open_segment_at_last_ts", test_writer_recovery_crash_closes_previous_open_segment_at_last_ts),
+        ("writer_recovery_repairs_chunk_metadata_before_segment_close", test_writer_recovery_repairs_chunk_metadata_before_segment_close),
+        ("repair_utility_backfills_legacy_segment_zero_records", test_repair_utility_backfills_legacy_segment_zero_records),
+        ("repair_utility_crash_closes_open_segment", test_repair_utility_crash_closes_open_segment),
         ("segments_cli_lists_and_suggests_range", test_segments_cli_lists_and_suggests_range),
         ("segments_cli_timestamp_format_us", test_segments_cli_timestamp_format_us),
         ("segments_cli_timestamp_format_timezone_name", test_segments_cli_timestamp_format_timezone_name),

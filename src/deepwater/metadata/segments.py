@@ -15,6 +15,9 @@ from typing import Optional
 
 import orjson
 
+from .feed_registry import FeedRegistry
+from .layout_json import load_layout
+
 
 USABLE_SEGMENT_STATUSES = ("closed", "crash_closed")
 
@@ -370,8 +373,82 @@ class SegmentStore:
                 seg["end_us"] = end_us
                 seg["status"] = "crash_closed"
 
-            if seg.get("records", 0) == 0:
+            if seg.get("records", 0) == 0 and seg.get("status") == "crash_closed":
                 seg["records"] = None
+                try:
+                    start_i = int(seg["start_us"])
+                    end_i = int(seg["end_us"])
+                    if end_i < start_i:
+                        raise ValueError("end before start")
+
+                    feed_dir = self.path.parent
+                    reg_path = feed_dir / f"{self.feed_name}.reg"
+                    layout = load_layout(feed_dir)
+                    rec_size = int(layout["record_size"])
+                    ts_offset = int(layout.get("ts", {}).get("offset", 0))
+                    if not reg_path.exists() or rec_size <= 0 or ts_offset < 0 or (ts_offset + 8) > rec_size:
+                        raise ValueError("missing recovery prerequisites")
+
+                    registry = FeedRegistry(str(reg_path), mode="r")
+                    try:
+                        total = 0
+                        counted_any = False
+                        for chunk_idx in registry.get_chunks_in_range(start_i, end_i, qoff=0):
+                            meta = registry.get_chunk_metadata(chunk_idx)
+                            try:
+                                chunk_id = int(meta.chunk_id)
+                                qmin = int(meta.get_qmin(0))
+                                qmax = int(meta.get_qmax(0))
+                                num_records = int(meta.num_records)
+                            finally:
+                                meta.release()
+
+                            if num_records <= 0:
+                                continue
+                            if qmin >= start_i and qmax <= end_i:
+                                total += num_records
+                                counted_any = True
+                                continue
+
+                            chunk_path = feed_dir / f"chunk_{chunk_id:08d}.bin"
+                            if not chunk_path.exists():
+                                continue
+
+                            to_read = num_records * rec_size
+                            if to_read <= 0:
+                                continue
+
+                            local_count = 0
+                            with open(chunk_path, "rb") as f:
+                                remaining = to_read
+                                carry = b""
+                                while remaining > 0:
+                                    block = f.read(min(remaining, 4 * 1024 * 1024))
+                                    if not block:
+                                        break
+                                    remaining -= len(block)
+                                    data = carry + block
+                                    full = (len(data) // rec_size) * rec_size
+                                    mv = memoryview(data)
+                                    try:
+                                        for pos in range(0, full, rec_size):
+                                            ts = int.from_bytes(mv[pos + ts_offset:pos + ts_offset + 8], "little")
+                                            if start_i <= ts <= end_i:
+                                                local_count += 1
+                                    finally:
+                                        mv.release()
+                                    carry = data[full:]
+
+                            total += local_count
+                            counted_any = True
+
+                        if counted_any:
+                            seg["records"] = int(total)
+                    finally:
+                        registry.close()
+                except Exception:
+                    # Keep records=None when exact reconstruction is not possible.
+                    pass
 
             self._write_entry(mm, open_idx, seg)
             self._write_header(
