@@ -14,6 +14,44 @@ from ..metadata.datasets import common_intervals, with_duration, recommend_train
 from .timefmt import add_ts_fmt_arg, format_timestamp_us, parse_ts_fmt
 
 
+def _format_duration_us(duration_us: object) -> str:
+    """Format microsecond duration for human-readable text output."""
+    try:
+        raw = int(duration_us)
+    except (TypeError, ValueError):
+        return str(duration_us)
+
+    sign = "-" if raw < 0 else ""
+    total_us = abs(raw)
+    if total_us == 0:
+        return "0us"
+
+    units = (
+        ("d", 86_400_000_000),
+        ("h", 3_600_000_000),
+        ("m", 60_000_000),
+        ("s", 1_000_000),
+        ("ms", 1_000),
+        ("us", 1),
+    )
+
+    for suffix, size in units:
+        if total_us < size:
+            continue
+
+        if size == 1:
+            return f"{sign}{total_us}us"
+
+        # Keep one unit only and round to thousandths for compact readability.
+        scaled = (total_us * 1000 + (size // 2)) // size
+        whole, frac = divmod(scaled, 1000)
+        if frac == 0:
+            return f"{sign}{whole}{suffix}"
+        return f"{sign}{whole}.{str(frac).zfill(3).rstrip('0')}{suffix}"
+
+    return f"{sign}{total_us}us"
+
+
 def _collect_feeds(feed_args: list[str], feeds_arg: str | None) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -254,13 +292,14 @@ def main(argv: list[str] | None = None) -> int:
     for i, seg in enumerate(intervals[:top], start=1):
         if ts_fmt.epoch:
             print(
-                f"  {i}. start_us={seg['start_us']} end_us={seg['end_us']} duration_us={seg['duration_us']}"
+                f"  {i}. start_us={seg['start_us']} end_us={seg['end_us']} "
+                f"duration={_format_duration_us(seg['duration_us'])}"
             )
         else:
             print(
                 f"  {i}. start={format_timestamp_us(seg['start_us'], ts_fmt)} "
                 f"end={format_timestamp_us(seg['end_us'], ts_fmt)} "
-                f"duration_us={seg['duration_us']}"
+                f"duration={_format_duration_us(seg['duration_us'])}"
             )
 
     if rec is None:

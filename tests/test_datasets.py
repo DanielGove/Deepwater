@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from deepwater import Platform
-from deepwater.cli.datasets_cli import main as datasets_cli_main
+from deepwater.cli.datasets_cli import _format_duration_us, main as datasets_cli_main
 
 
 def _spec(name: str) -> dict:
@@ -158,6 +158,7 @@ def test_datasets_cli_text_timestamp_formats():
         human_out = human_buf.getvalue()
         assert "start=1970-01-01T00:00:01.000100Z" in human_out
         assert "end=1970-01-01T00:00:01.000200Z" in human_out
+        assert "duration=101us" in human_out
         assert "train_start=1970-01-01T00:00:01.000100Z" in human_out
         assert "validation_start=1970-01-01T00:00:01.000180Z" in human_out
 
@@ -171,9 +172,21 @@ def test_datasets_cli_text_timestamp_formats():
             ])
         assert rc_us == 0
         us_out = us_buf.getvalue()
-        assert "start_us=1000100 end_us=1000200 duration_us=101" in us_out
+        assert "start_us=1000100 end_us=1000200 duration=101us" in us_out
         assert "train=[1000100,1000179]" in us_out
         assert "validation=[1000180,1000200]" in us_out
+
+
+def test_datasets_cli_duration_formatting():
+    assert _format_duration_us(0) == "0us"
+    assert _format_duration_us(999) == "999us"
+    assert _format_duration_us(1_000) == "1ms"
+    assert _format_duration_us(1_500) == "1.5ms"
+    assert _format_duration_us(1_000_000) == "1s"
+    assert _format_duration_us(1_234_567) == "1.235s"
+    assert _format_duration_us(61_000_000) == "1.017m"
+    assert _format_duration_us(3_661_000_000) == "1.017h"
+    assert _format_duration_us(-1_500) == "-1.5ms"
 
 
 def run_tests():
@@ -182,6 +195,7 @@ def run_tests():
         ("datasets_cli_json_and_manifest_output", test_datasets_cli_json_and_manifest_output),
         ("datasets_cli_multi_source_two_base_paths", test_datasets_cli_multi_source_two_base_paths),
         ("datasets_cli_text_timestamp_formats", test_datasets_cli_text_timestamp_formats),
+        ("datasets_cli_duration_formatting", test_datasets_cli_duration_formatting),
     ]
     print("Datasets Tests")
     print("=" * 60)
