@@ -154,8 +154,9 @@ class RingWriter:
         _ = create_index
         return self._write_bytes(record_data, last_ts=timestamp)
 
-    def write_values(self, *vals) -> int:
+    def write_values(self, *vals, create_index: bool = False) -> int:
         """Pack values directly into ring memory; overwrites oldest data when full."""
+        _ = create_index
         last_ts = vals[self._ts_idx] if self._ts_idx is not None else 0
         write_pos, next_write_pos, start_pos, generation, new_record_count = self._prepare_single_write()
         self._S.pack_into(self.ring.data, write_pos, *vals)
@@ -163,14 +164,14 @@ class RingWriter:
         self.segment_store.note_write(last_ts, 1)
         return next_write_pos
 
-    def write_tuple(self, record: tuple) -> int:
+    def write_tuple(self, record: tuple, create_index: bool = False) -> int:
         """Write a tuple record (same as write_values but accepts tuple)."""
-        return self.write_values(*record)
+        return self.write_values(*record, create_index=create_index)
 
-    def write_dict(self, record: dict) -> int:
+    def write_dict(self, record: dict, create_index: bool = False) -> int:
         """Write a dictionary record (converts to tuple based on field order)."""
         vals = tuple(record[name] for name in self._value_fields)
-        return self.write_values(*vals)
+        return self.write_values(*vals, create_index=create_index)
 
     def write_batch_bytes(self, data: bytes) -> int:
         """Write a blob of packed records (len must be multiple of record_size) with one header update."""

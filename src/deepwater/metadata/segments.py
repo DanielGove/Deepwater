@@ -469,6 +469,23 @@ class SegmentStore:
             mm.close()
             os.close(fd)
 
+    def has_open_segment(self) -> bool:
+        """
+        Cheaply check whether this feed has an open segment to recover.
+        """
+        self._ensure_initialized()
+        fd, mm = self._open_mmap()
+        try:
+            header = self._read_header(mm)
+            open_idx = int(header["open_index"])
+            count = int(header["segment_count"])
+            if 0 < open_idx <= count:
+                return True
+            return self._find_open_index(mm, count) > 0
+        finally:
+            mm.close()
+            os.close(fd)
+
     def _open_segment(self, start_us: int) -> int:
         self._ensure_initialized()
         fd, mm = self._open_mmap()

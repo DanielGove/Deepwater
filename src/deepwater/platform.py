@@ -171,6 +171,8 @@ class Platform:
         # process-local caches
         self._writers: Dict[str, Writer] = {}
         self._readers: Dict[str, Reader] = {}
+        self._lifecycle_cache: Dict[str, dict] = {}
+        self._record_format_cache: Dict[str, dict] = {}
         
         # Graceful shutdown on signals
         self._shutdown_handlers_registered = False
@@ -287,6 +289,15 @@ class Platform:
 
         # 5) Construct the feed registry (binary)
         self.registry.register_feed(name, lifecycle, clock_level=layout["clock_level"])
+        self._lifecycle_cache[name] = {
+            "feed_name": name,
+            "chunk_size_bytes": lifecycle["chunk_size_bytes"],
+            "retention_hours": lifecycle["retention_hours"],
+            "persist": lifecycle["persist"],
+            "index_playback": lifecycle["index_playback"],
+            "clock_level": layout["clock_level"],
+        }
+        self._record_format_cache[name] = layout
 
     # -------------------------------------------------------------------------
     # OPEN/CLOSE
@@ -438,6 +449,8 @@ class Platform:
             shutil.rmtree(feed_dir)
 
         removed_from_registry = self.registry.unregister_feed(feed_name)
+        self._lifecycle_cache.pop(feed_name, None)
+        self._record_format_cache.pop(feed_name, None)
         return bool(on_disk or removed_from_registry)
 
     # -------------------------------------------------------------------------
@@ -448,7 +461,11 @@ class Platform:
 
     def get_record_format(self, feed_name: str) -> dict:
         """Load layout.json."""
-        return load_layout(self.feed_dir(feed_name))
+        layout = self._record_format_cache.get(feed_name)
+        if layout is None:
+            layout = load_layout(self.feed_dir(feed_name))
+            self._record_format_cache[feed_name] = layout
+        return layout
 
     def codec(self, feed_name: str) -> Tuple[struct.Struct, int]:
         """
@@ -462,12 +479,18 @@ class Platform:
 
     def lifecycle(self, feed_name: str) -> dict:
         """Return lifecycle defaults from the global registry."""
-        return self.registry.get_metadata(feed_name)
+        metadata = self._lifecycle_cache.get(feed_name)
+        if metadata is None:
+            metadata = self.registry.get_metadata(feed_name)
+            if metadata is not None:
+                self._lifecycle_cache[feed_name] = metadata
+        return metadata
 
     def set_lifecycle(self, feed_name: str, **kwargs) -> None:
         """Partial update of lifecycle defaults (e.g., retention_hours=168)."""
         if not self.registry.update_metadata(feed_name, **kwargs):
             raise KeyError(f"feed '{feed_name}' not found")
+        self._lifecycle_cache.pop(feed_name, None)
 
     def list_feeds(self) -> list[dict]:
         """
@@ -674,3 +697,5 @@ class Platform:
             self.registry.close()
         except Exception:
             pass
+        self._lifecycle_cache = dict()
+        self._record_format_cache = dict()

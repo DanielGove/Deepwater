@@ -1,8 +1,12 @@
 import time
 import struct
 import logging
+import os
+import threading
 import numpy as np
 
+from collections import deque
+from dataclasses import dataclass
 from typing import Union
 from pathlib import Path
 
@@ -14,6 +18,46 @@ from ..utils.process import ProcessUtils
 
 log = logging.getLogger("dw.writer")
 
+_MAX_PENDING_SEALED_CHUNKS = 8
+
+
+@dataclass(slots=True)
+class _SealedChunk:
+    chunk: Chunk
+    chunk_index: ChunkIndex | None
+
+
+@dataclass(slots=True)
+class _PreparedChunk:
+    chunk_id: int
+    chunk_path: Path
+    chunk: Chunk
+    chunk_index: ChunkIndex | None
+    index_path: Path | None
+
+
+@dataclass(slots=True)
+class _TimingAccum:
+    count: int = 0
+    total_ns: int = 0
+    max_ns: int = 0
+
+    def add(self, dt_ns: int) -> None:
+        self.count += 1
+        self.total_ns += dt_ns
+        if dt_ns > self.max_ns:
+            self.max_ns = dt_ns
+
+    def status(self) -> dict[str, float | int]:
+        avg_ns = (self.total_ns / self.count) if self.count else 0.0
+        return {
+            "count": self.count,
+            "total_ms": self.total_ns / 1_000_000.0,
+            "avg_us": avg_ns / 1_000.0,
+            "max_ms": self.max_ns / 1_000_000.0,
+        }
+
+
 class Writer:
     __slots__ = (
         "platform", "feed_name", "feed_config", "record_format", "my_pid",
@@ -21,6 +65,13 @@ class Writer:
         "current_chunk", "chunk_index", "current_chunk_metadata", "current_chunk_id",
         "_S", "_rec_size", "_clock_level", "_key_min_set", "_u64", "_qmins", "_qmaxs",
         "_index_enabled", "segment_store", "_segment_note_write", "_segment_note_batch",
+        "_persist_cv", "_persist_queue", "_persist_inflight", "_persist_stop",
+        "_persist_error", "_persist_thread", "_prepared_chunk",
+        "persist_queue_high_water", "persist_enqueue_wait_count",
+        "persist_enqueue_wait_ns_total", "persist_enqueue_wait_ns_max",
+        "rotate_total_ns", "rotate_finalize_ns", "rotate_enqueue_ns",
+        "rotate_prepare_wait_ns", "rotate_register_chunk_ns",
+        "rotate_meta_open_ns", "rotate_index_create_ns",
     )
     """
     Writer for persistent disk-based feeds.
@@ -132,6 +183,7 @@ class Writer:
         self.current_chunk_metadata = None
         self.current_chunk_id = self.registry.get_latest_chunk_idx() or 0
         self._key_min_set = None
+        self._cleanup_unregistered_future_chunks()
 
         # Validate previous chunk before starting (handles corruption/missing files)
         if self.current_chunk_id > 0:
@@ -145,7 +197,32 @@ class Writer:
         self.segment_store = SegmentStore(self.data_dir, self.feed_name)
         self._segment_note_write = self.segment_store.note_write
         self._segment_note_batch = self.segment_store.note_batch
-        self.segment_store.recover_open_segment(self._latest_level1_timestamp())
+        if self.segment_store.has_open_segment():
+            self.segment_store.recover_open_segment(self._latest_level1_timestamp())
+
+        self._persist_cv = threading.Condition()
+        self._persist_queue = deque()
+        self._persist_inflight = 0
+        self._persist_stop = False
+        self._persist_error = None
+        self._prepared_chunk = None
+        self.persist_queue_high_water = 0
+        self.persist_enqueue_wait_count = 0
+        self.persist_enqueue_wait_ns_total = 0
+        self.persist_enqueue_wait_ns_max = 0
+        self.rotate_total_ns = _TimingAccum()
+        self.rotate_finalize_ns = _TimingAccum()
+        self.rotate_enqueue_ns = _TimingAccum()
+        self.rotate_prepare_wait_ns = _TimingAccum()
+        self.rotate_register_chunk_ns = _TimingAccum()
+        self.rotate_meta_open_ns = _TimingAccum()
+        self.rotate_index_create_ns = _TimingAccum()
+        self._persist_thread = threading.Thread(
+            target=self._persist_loop,
+            name=f"dw-persist-{self.feed_name}",
+            daemon=True,
+        )
+        self._persist_thread.start()
 
         self._create_new_chunk()
 
@@ -169,42 +246,214 @@ class Writer:
         return None
 
     def _create_new_chunk(self):
-        self.current_chunk_id += 1
-        
+        rotate_started = time.perf_counter_ns()
+
         # Release old metadata BEFORE register_chunk in case it triggers resize
         _new_start_time = None
         if self.current_chunk_metadata is not None:
-            self.current_chunk.close_file()
+            finalize_started = time.perf_counter_ns()
+            sealed_chunk = self.current_chunk
+            sealed_index = self.chunk_index if self._index_enabled else None
             self.current_chunk_metadata.status = ON_DISK
             self.current_chunk_metadata.end_time = self.current_chunk_metadata.last_update
             _new_start_time = self.current_chunk_metadata.end_time
             self.current_chunk_metadata.release()
+            self.current_chunk = None
+            self.chunk_index = None
+            self.rotate_finalize_ns.add(time.perf_counter_ns() - finalize_started)
+
+            enqueue_started = time.perf_counter_ns()
+            self._enqueue_sealed_chunk(sealed_chunk, sealed_index)
+            self.rotate_enqueue_ns.add(time.perf_counter_ns() - enqueue_started)
 
         # reset per-key bounds for new chunk
         self._key_min_set = [False for _ in range(self._clock_level)]
 
-        # Writer only handles persist=True (disk chunks)
-        chunk_path = self.data_dir / f"chunk_{self.current_chunk_id:08d}.bin"
-        self.current_chunk = Chunk.create_file(path=str(chunk_path), size=self.feed_config["chunk_size_bytes"])
+        prepared_started = time.perf_counter_ns()
+        prepared = self._acquire_prepared_chunk()
+        self.rotate_prepare_wait_ns.add(time.perf_counter_ns() - prepared_started)
+        self.current_chunk_id = prepared.chunk_id
+        self.current_chunk = prepared.chunk
+        self.chunk_index = prepared.chunk_index
+
+        register_started = time.perf_counter_ns()
         self.registry.register_chunk(
             time.time_ns() // 1_000, self.current_chunk_id,
             self.feed_config["chunk_size_bytes"], status=ON_DISK,
             clock_level=self._clock_level
         )
+        self.rotate_register_chunk_ns.add(time.perf_counter_ns() - register_started)
 
+        meta_started = time.perf_counter_ns()
         self.current_chunk_metadata = self.registry.get_chunk_metadata(self.current_chunk_id)
         self.current_chunk_metadata.start_time = _new_start_time if _new_start_time is not None else self.current_chunk_metadata.start_time
         self.current_chunk_metadata.clock_level = self._clock_level
         self._qmins = self.current_chunk_metadata._qmins
         self._qmaxs = self.current_chunk_metadata._qmaxs
+        self.rotate_meta_open_ns.add(time.perf_counter_ns() - meta_started)
 
         if self._index_enabled:
-            if self.chunk_index is not None:
-                self.chunk_index.close_file()
-            self.chunk_index = ChunkIndex.create_file(
-                path=str(self.data_dir / f"chunk_{self.current_chunk_id:08d}.idx"),
-                capacity=2047
+            # index creation is handled during background preallocation
+            self.rotate_index_create_ns.add(0)
+
+        self.rotate_total_ns.add(time.perf_counter_ns() - rotate_started)
+
+    def _check_persist_error(self) -> None:
+        err = self._persist_error
+        if err is not None:
+            raise RuntimeError(f"background persist failed for feed '{self.feed_name}'") from err
+
+    def _enqueue_sealed_chunk(self, chunk: Chunk, chunk_index: ChunkIndex | None) -> None:
+        self._check_persist_error()
+        with self._persist_cv:
+            wait_started = None
+            while (
+                (len(self._persist_queue) + self._persist_inflight) >= _MAX_PENDING_SEALED_CHUNKS
+                and self._persist_error is None
+            ):
+                if wait_started is None:
+                    wait_started = time.perf_counter_ns()
+                self._persist_cv.wait()
+            if wait_started is not None:
+                waited_ns = time.perf_counter_ns() - wait_started
+                self.persist_enqueue_wait_count += 1
+                self.persist_enqueue_wait_ns_total += waited_ns
+                if waited_ns > self.persist_enqueue_wait_ns_max:
+                    self.persist_enqueue_wait_ns_max = waited_ns
+            self._check_persist_error()
+            self._persist_queue.append(_SealedChunk(chunk=chunk, chunk_index=chunk_index))
+            queue_depth = len(self._persist_queue) + self._persist_inflight
+            if queue_depth > self.persist_queue_high_water:
+                self.persist_queue_high_water = queue_depth
+            self._persist_cv.notify()
+
+    def _acquire_prepared_chunk(self) -> _PreparedChunk:
+        self._check_persist_error()
+        with self._persist_cv:
+            while self._prepared_chunk is None and self._persist_error is None:
+                self._persist_cv.notify()
+                self._persist_cv.wait()
+            self._check_persist_error()
+            if self._prepared_chunk is None:
+                raise RuntimeError(f"no prepared chunk available for feed '{self.feed_name}'")
+            prepared = self._prepared_chunk
+            self._prepared_chunk = None
+            self._persist_cv.notify()
+            return prepared
+
+    def _make_prepared_chunk(self, chunk_id: int) -> _PreparedChunk:
+        chunk_path = self.data_dir / f"chunk_{chunk_id:08d}.bin"
+        chunk = Chunk.create_file(path=str(chunk_path), size=self.feed_config["chunk_size_bytes"])
+        chunk_index = None
+        index_path = None
+        if self._index_enabled:
+            index_path = self.data_dir / f"chunk_{chunk_id:08d}.idx"
+            chunk_index = ChunkIndex.create_file(
+                path=str(index_path),
+                capacity=2047,
             )
+        return _PreparedChunk(
+            chunk_id=chunk_id,
+            chunk_path=chunk_path,
+            chunk=chunk,
+            chunk_index=chunk_index,
+            index_path=index_path,
+        )
+
+    def _discard_prepared_chunk(self, prepared: _PreparedChunk) -> None:
+        prepared.chunk.close_file()
+        if prepared.chunk_index is not None:
+            prepared.chunk_index.close_file()
+        if prepared.chunk_path.exists():
+            os.unlink(prepared.chunk_path)
+        if prepared.index_path is not None and prepared.index_path.exists():
+            os.unlink(prepared.index_path)
+
+    def _persist_loop(self) -> None:
+        while True:
+            sealed = None
+            prepare_chunk_id = None
+            with self._persist_cv:
+                while (
+                    not self._persist_queue
+                    and self._prepared_chunk is not None
+                    and not self._persist_stop
+                ):
+                    self._persist_cv.wait()
+                if self._persist_stop and not self._persist_queue:
+                    self._persist_cv.notify_all()
+                    return
+                if self._persist_queue:
+                    sealed = self._persist_queue.popleft()
+                    self._persist_inflight += 1
+                elif self._prepared_chunk is None:
+                    prepare_chunk_id = self.current_chunk_id + 1
+                else:
+                    continue
+            try:
+                if sealed is not None:
+                    sealed.chunk.close_file()
+                    if sealed.chunk_index is not None:
+                        sealed.chunk_index.close_file()
+                    self.registry.flush()
+                elif prepare_chunk_id is not None:
+                    prepared = self._make_prepared_chunk(prepare_chunk_id)
+                    with self._persist_cv:
+                        expected_chunk_id = self.current_chunk_id + 1
+                        if (
+                            self._prepared_chunk is None
+                            and not self._persist_stop
+                            and prepare_chunk_id == expected_chunk_id
+                        ):
+                            self._prepared_chunk = prepared
+                            self._persist_cv.notify_all()
+                        else:
+                            prepared_to_discard = prepared
+                            prepared = None
+                    if prepared is None:
+                        self._discard_prepared_chunk(prepared_to_discard)
+            except BaseException as exc:
+                with self._persist_cv:
+                    if self._persist_error is None:
+                        self._persist_error = exc
+                        self._persist_stop = True
+                    if sealed is not None:
+                        self._persist_inflight -= 1
+                    self._persist_cv.notify_all()
+                return
+            else:
+                if sealed is not None:
+                    with self._persist_cv:
+                        self._persist_inflight -= 1
+                        self._persist_cv.notify_all()
+
+    def _stop_persister(self) -> None:
+        with self._persist_cv:
+            self._persist_stop = True
+            self._persist_cv.notify_all()
+            while (self._persist_queue or self._persist_inflight) and self._persist_error is None:
+                self._persist_cv.wait()
+            self._persist_cv.notify_all()
+        if self._persist_thread.is_alive():
+            self._persist_thread.join()
+        self._check_persist_error()
+
+    def _cleanup_unregistered_future_chunks(self) -> None:
+        latest_chunk_id = int(self.current_chunk_id)
+        if not self.data_dir.exists():
+            return
+        for pattern in ("chunk_*.bin", "chunk_*.idx"):
+            for path in self.data_dir.glob(pattern):
+                stem = path.stem
+                try:
+                    chunk_id = int(stem.split("_", 1)[1])
+                except (IndexError, ValueError):
+                    continue
+                if chunk_id > latest_chunk_id:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
 
     def _validate_chunk(self):
         """Validate previous chunk and auto-repair if corrupted."""
@@ -230,6 +479,7 @@ class Writer:
         # Guard against write after close
         if self.current_chunk is None:
             return 0  # Silently ignore writes after close
+        self._check_persist_error()
         
         if isinstance(record_data, np.ndarray):
             record_data = record_data.tobytes()
@@ -294,6 +544,7 @@ class Writer:
         # Guard against write after close
         if self.current_chunk is None:
             return 0  # Silently ignore writes after close
+        self._check_persist_error()
         if self.current_chunk_metadata.write_pos + self._rec_size > self.current_chunk_metadata.size:
             self._create_new_chunk()
         pos = self.current_chunk_metadata.write_pos
@@ -335,6 +586,7 @@ class Writer:
         # Guard against write after close
         if self.current_chunk is None:
             return 0
+        self._check_persist_error()
         
         data_len = len(data)
         if data_len == 0 or data_len % self._rec_size != 0:
@@ -395,15 +647,48 @@ class Writer:
         Example:
             >>> writer.close()
         """
-        if self.current_chunk:
-            self.current_chunk.close_file()
-            if self._index_enabled and self.chunk_index:
-                self.chunk_index.close_file()
-            self.current_chunk_metadata.status = ON_DISK
-            self.current_chunk_metadata.release()
-            self.current_chunk = None  # Prevent double-close
-            self.registry.close()
-        self.segment_store.close_open_segment("writer_close")
+        persist_error = None
+        try:
+            if self.current_chunk:
+                empty = int(self.current_chunk_metadata.num_records) == 0
+                chunk_id = self.current_chunk_id
+                active_chunk = self.current_chunk
+                active_index = self.chunk_index if self._index_enabled else None
+                meta = self.current_chunk_metadata
+                self.current_chunk = None
+                self.chunk_index = None
+                self.current_chunk_metadata = None
+                if empty:
+                    active_chunk.close_file()
+                    if active_index is not None:
+                        active_index.close_file()
+                    meta.release()
+                    self.registry.pop_latest_chunk()
+                    os.unlink(self.data_dir / f"chunk_{chunk_id:08d}.bin")
+                    if self._index_enabled:
+                        idx_path = self.data_dir / f"chunk_{chunk_id:08d}.idx"
+                        if idx_path.exists():
+                            os.unlink(idx_path)
+                else:
+                    meta.status = ON_DISK
+                    meta.end_time = meta.last_update
+                    meta.release()
+                    self._enqueue_sealed_chunk(active_chunk, active_index)
+            self._stop_persister()
+            if self._prepared_chunk is not None:
+                prepared = self._prepared_chunk
+                self._prepared_chunk = None
+                self._discard_prepared_chunk(prepared)
+        except Exception as exc:
+            persist_error = exc
+        finally:
+            try:
+                if self.registry is not None:
+                    self.registry.close()
+            finally:
+                self.segment_store.close_open_segment("writer_close")
+        if persist_error is not None:
+            raise persist_error
 
     def mark_segment_boundary(self, reason: str = "disconnect") -> bool:
         """

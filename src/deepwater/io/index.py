@@ -120,6 +120,25 @@ class ChunkIndex:
         mm = mmap.mmap(fd, length=size, access=mmap.ACCESS_WRITE)
         HEADER_STRUCT.pack_into(mm, 0, 0, capacity)
         return cls(memoryview(mm), [mm, fd], read_only=False, is_shm=False)
+
+    def _resize_file(self, new_capacity: int) -> None:
+        if self.read_only or self.is_shm:
+            raise PermissionError("cannot resize read-only or shm index")
+        mm = self.closeables[0]
+        fd = self.closeables[1]
+        new_size = HEADER_SIZE + int(new_capacity) * INDEX_SIZE
+        self._capacity.release()
+        self._count.release()
+        self._mv.release()
+        mm.flush()
+        mm.close()
+        os.ftruncate(fd, new_size)
+        mm = mmap.mmap(fd, length=new_size, access=mmap.ACCESS_WRITE)
+        self.closeables[0] = mm
+        self._mv = memoryview(mm)
+        self._count = self._mv[0:8].cast("Q")
+        self._capacity = self._mv[8:16].cast("Q")
+        self._capacity[0] = int(new_capacity)
     
     @classmethod
     def open_file(cls, path: str):
@@ -156,7 +175,10 @@ class ChunkIndex:
             ts2 = ts_list[2] if len(ts_list) > 2 else 0
         idx = self.count
         if idx >= self.capacity:
-            raise IndexError("Chunk index at capacity")
+            if self.read_only or self.is_shm:
+                raise IndexError("Chunk index at capacity")
+            self._resize_file(max(4096, int(self.capacity) * 2))
+            idx = self.count
         entry_offset = HEADER_SIZE + (idx * INDEX_SIZE)
         INDEX_STRUCT.pack_into(self._mv, entry_offset, ts0, ts1, ts2, chunk_offset)
         self._count[0] = idx + 1

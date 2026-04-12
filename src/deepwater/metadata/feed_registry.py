@@ -212,10 +212,13 @@ class FeedRegistry:
     def close(self):
         self._mv.release()
         self._chunk_count.release()
-        self.mm.flush()
+        self.flush()
         self.mm.close()
         fcntl.flock(self.fd, fcntl.LOCK_UN)
         os.close(self.fd)
+
+    def flush(self) -> None:
+        self.mm.flush()
 
     def _get_defaults(self) -> tuple[int, int, int]:
         def_size = int.from_bytes(self._mv[8:16], 'little')
@@ -252,7 +255,6 @@ class FeedRegistry:
             base = offset + CHUNK_QMIN_OFFSET + (MAX_QUERY_KEYS * 8) + (i * 8)
             self._mv[base:base+8] = b"\x00"*8
         
-        self.mm.flush()
         return self._chunk_count[0]
     
     def _resize_file(self, new_max_chunks: int):
@@ -381,6 +383,15 @@ class FeedRegistry:
     def get_latest_chunk_idx(self) -> Optional[int]:
         """Return the chunk_id of the most recently registered chunk."""
         return self._chunk_count[0] if self._chunk_count[0] > 0 else None
+
+    def pop_latest_chunk(self) -> bool:
+        if not self.is_writer or self._chunk_count[0] == 0:
+            return False
+        offset = HEADER_SIZE + ((self._chunk_count[0] - 1) << 7)
+        self._mv[offset:offset + CHUNK_SIZE] = b"\x00" * CHUNK_SIZE
+        self._chunk_count[0] -= 1
+        self.mm.flush()
+        return True
     
     def get_latest_chunk(self) -> Optional[ChunkMeta]:
         """Return metadata for the newest chunk (1-indexed internally)."""
