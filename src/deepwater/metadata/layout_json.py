@@ -136,6 +136,10 @@ def build_layout(
 
         # scalars
         scalar = _SCALARS.get(typ)
+        if scalar is None and isinstance(typ, str) and typ.startswith("bytes") and typ[5:].isdigit():
+            n = int(typ[5:])
+            if n > 0:
+                scalar = (f"|S{n}", f"{n}s", n, 1)
         if scalar is None:
             raise ValueError(f"unknown field type: {typ}")
         np_code, st_code, size, align = scalar

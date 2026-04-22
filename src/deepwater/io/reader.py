@@ -14,7 +14,6 @@ try:
     from .reader_fast import binary_search_fast, range_tuples_fast
     HAVE_FAST = True
 except ImportError:
-    # Backward-compatible import path while extension artifacts still live at deepwater.reader_fast
     try:
         from ..reader_fast import binary_search_fast, range_tuples_fast
         HAVE_FAST = True
@@ -22,7 +21,7 @@ except ImportError:
         HAVE_FAST = False
 
 
-class Reader:
+class ChunkReader:
     """
     Zero-copy reader for persistent disk-based feeds.
     

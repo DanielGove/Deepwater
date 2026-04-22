@@ -39,22 +39,22 @@ Quick Start:
 
 Core API:
     Platform: Entry point for all operations
-    Writer: Write records to feeds
-    Reader: Read records from feeds
+    Writer: Unified ingress writer (ring-backed in both persist modes)
+    Reader: Unified reader (persistent feeds front durable chunks + ring)
 """
 
 __version__ = "0.0.1"
 
 # Export public API
 from .platform import Platform
-from .io.writer import Writer
-from .io.reader import Reader
-from .io.ring import RingWriter, RingReader
+from .io import Writer, Reader, ChunkWriter, ChunkReader, RingWriter, RingReader
 
 __all__ = [
     "Platform",
-    "Writer", 
+    "Writer",
     "Reader",
+    "ChunkWriter",
+    "ChunkReader",
     "RingWriter",
     "RingReader",
     "__version__",

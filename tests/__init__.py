@@ -16,12 +16,16 @@ def run_test_file(test_file: Path) -> tuple[bool, str]:
     import subprocess
     
     try:
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / "src")
+        env["PYTHONPATH"] = src_path if not env.get("PYTHONPATH") else f"{src_path}:{env['PYTHONPATH']}"
         result = subprocess.run(
             [sys.executable, str(test_file)],
             capture_output=True,
             text=True,
             timeout=30,
-            cwd=test_file.parent
+            cwd=test_file.parent,
+            env=env,
         )
         
         success = result.returncode == 0

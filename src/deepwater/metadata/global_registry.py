@@ -4,17 +4,25 @@ from pathlib import Path
 from typing import Optional
 import time
 
+from ..utils.process import ProcessUtils
+
 
 FEED_NAME_LEN = 32
+PERSISTER_STALE_US = 5_000_000
+
 # name:32  chunk_sz_bytes:I  retain_h:I  persist:bool index_callback:bool  clock_level:Q created_us:Q
 _ENTRY_CORE   = struct.Struct('<32sII??6xQQ64x') # Pad to 128
+_HEADER_CORE = struct.Struct('<QQQQ96x')  # feed_count, persister_pid, started_us, heartbeat_us
 ENTRY_SIZE = _ENTRY_CORE.size
-HEADER_SIZE = _ENTRY_CORE.size
+HEADER_SIZE = _HEADER_CORE.size
 CHUNK_SIZE_OFFSET = 32
 RETAIN_HOURS_OFFSET = 36
 PERSIST_OFFSET = 40
 INDEX_PLAYBACK_OFFSET = 41
 CLOCK_LEVEL_OFFSET = 48
+PERSISTER_PID_OFFSET = 8
+PERSISTER_STARTED_US_OFFSET = 16
+PERSISTER_HEARTBEAT_US_OFFSET = 24
 
 
 class GlobalRegistry:
@@ -33,7 +41,7 @@ class GlobalRegistry:
 
         if not self.registry_file.exists():
             with open(self.registry_file, 'wb') as f:
-                f.write(struct.pack('<Q120x', 0))  # feed_count = 0
+                f.write(_HEADER_CORE.pack(0, 0, 0, 0))
                 f.write(b'\x00' * (self.size - HEADER_SIZE))
 
         self.fd = os.open(self.registry_file, os.O_RDWR)
@@ -53,6 +61,12 @@ class GlobalRegistry:
     @feed_count.setter
     def feed_count(self, v: int) -> None:
         self.mmap[0:8] = int.to_bytes(v,8)
+
+    def _read_qword(self, offset: int) -> int:
+        return int.from_bytes(self.mmap[offset:offset + 8], "little")
+
+    def _write_qword(self, offset: int, value: int) -> None:
+        self.mmap[offset:offset + 8] = int(value).to_bytes(8, "little")
 
     # ---------- locate ----------
     def _find_insert_offset(self, name: str) -> int:
@@ -162,6 +176,83 @@ class GlobalRegistry:
                 return True
             finally:
                 self._unlock()
+
+    def get_persistent_ring_owner(self) -> dict:
+        pid = self._read_qword(PERSISTER_PID_OFFSET)
+        started_us = self._read_qword(PERSISTER_STARTED_US_OFFSET)
+        heartbeat_us = self._read_qword(PERSISTER_HEARTBEAT_US_OFFSET)
+        now_us = time.time_ns() // 1_000
+        alive = ProcessUtils.is_process_alive(pid)
+        stale = bool(pid and heartbeat_us and (now_us - heartbeat_us) > PERSISTER_STALE_US)
+        healthy = bool(pid and alive)
+        return {
+            "pid": pid,
+            "started_us": started_us,
+            "heartbeat_us": heartbeat_us,
+            "alive": alive,
+            "healthy": healthy,
+            "stale": stale,
+        }
+
+    def claim_persistent_ring_owner(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        now_us = time.time_ns() // 1_000
+        self._lock()
+        try:
+            current_pid = self._read_qword(PERSISTER_PID_OFFSET)
+            current_started_us = self._read_qword(PERSISTER_STARTED_US_OFFSET)
+            current_heartbeat_us = self._read_qword(PERSISTER_HEARTBEAT_US_OFFSET)
+            current_alive = ProcessUtils.is_process_alive(current_pid)
+            current_stale = bool(
+                current_pid
+                and current_heartbeat_us
+                and (now_us - current_heartbeat_us) > PERSISTER_STALE_US
+            )
+            if current_pid and current_alive and current_pid != pid:
+                return False
+
+            self._write_qword(PERSISTER_PID_OFFSET, pid)
+            self._write_qword(
+                PERSISTER_STARTED_US_OFFSET,
+                current_started_us if current_pid == pid and current_started_us and not current_stale else now_us,
+            )
+            self._write_qword(PERSISTER_HEARTBEAT_US_OFFSET, now_us)
+            self.mmap.flush()
+            return True
+        finally:
+            self._unlock()
+
+    def heartbeat_persistent_ring_owner(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        now_us = time.time_ns() // 1_000
+        self._lock()
+        try:
+            current_pid = self._read_qword(PERSISTER_PID_OFFSET)
+            if current_pid != pid:
+                return False
+            self._write_qword(PERSISTER_HEARTBEAT_US_OFFSET, now_us)
+            self.mmap.flush()
+            return True
+        finally:
+            self._unlock()
+
+    def release_persistent_ring_owner(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        self._lock()
+        try:
+            current_pid = self._read_qword(PERSISTER_PID_OFFSET)
+            if current_pid != pid:
+                return False
+            self._write_qword(PERSISTER_PID_OFFSET, 0)
+            self._write_qword(PERSISTER_STARTED_US_OFFSET, 0)
+            self._write_qword(PERSISTER_HEARTBEAT_US_OFFSET, 0)
+            self.mmap.flush()
+            return True
+        finally:
+            self._unlock()
 
     def close(self):
         self.mmap.flush()

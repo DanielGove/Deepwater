@@ -49,7 +49,6 @@ class Chunk:
         fd = self.closeables[1]
         if not self.read_only:
             mm.flush()
-            os.ftruncate(fd, self.size)
             os.fsync(fd)
         mm.close()
         os.close(fd)

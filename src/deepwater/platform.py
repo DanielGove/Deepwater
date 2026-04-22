@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import atexit
 import fcntl
+import logging
 import os
 from multiprocessing import shared_memory
 import signal
+import subprocess
 import shutil
+import sys
+import time
 from pathlib import Path
 import orjson
 import struct
@@ -14,10 +18,7 @@ from typing import Dict, Optional, Tuple
 
 from .metadata.global_registry import GlobalRegistry
 from .metadata.layout_json import build_layout, save_layout, load_layout
-from .metadata.feed_registry import FeedRegistry
-from .io.writer import Writer
-from .io.ring import RingWriter
-from .io.reader import Reader
+from .io.ring import RingWriter, ring_buffer_shm_names
 from .metadata.manifest import write_manifest, read_manifest
 from .metadata.segments import SegmentStore
 from .metadata.datasets import common_intervals, with_duration, recommend_train_validation, build_manifest
@@ -169,10 +170,11 @@ class Platform:
         self.registry = GlobalRegistry(self.base_path)
 
         # process-local caches
-        self._writers: Dict[str, Writer] = {}
-        self._readers: Dict[str, Reader] = {}
+        self._writers: Dict[str, object] = {}
+        self._readers: Dict[str, object] = {}
         self._lifecycle_cache: Dict[str, dict] = {}
         self._record_format_cache: Dict[str, dict] = {}
+        self._persister_process: Optional[subprocess.Popen] = None
         
         # Graceful shutdown on signals
         self._shutdown_handlers_registered = False
@@ -192,29 +194,39 @@ class Platform:
             return
         
         log_file = self.base_path / "deepwater.log"
-        
-        # Rotating file handler (10MB max, keep 5 backups)
-        file_handler = RotatingFileHandler(
-            log_file,
-            maxBytes=10 * 1024 * 1024,
-            backupCount=5
-        )
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(
-            logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
-        )
-        
+
         # Console handler for warnings and errors
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.WARNING)
         console_handler.setFormatter(
             logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
         )
-        
+
         # Configure root logger
         root_logger.setLevel(logging.INFO)
-        root_logger.addHandler(file_handler)
         root_logger.addHandler(console_handler)
+        try:
+            # Rotating file handler (10MB max, keep 5 backups)
+            file_handler = RotatingFileHandler(
+                log_file,
+                maxBytes=10 * 1024 * 1024,
+                backupCount=5
+            )
+        except OSError:
+            root_logger.warning("deepwater file logging disabled: %s", log_file)
+            return
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(
+            logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+        )
+        root_logger.addHandler(file_handler)
+
+    def _write_feed_config(self, feed_name: str, config_spec: dict) -> None:
+        fdir = self.feed_dir(feed_name)
+        path = fdir / "config.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_bytes(orjson.dumps(config_spec))
+        tmp.replace(path)
 
     # -------------------------------------------------------------------------
     # FEED CREATION
@@ -271,21 +283,35 @@ class Platform:
         fdir = self.feed_dir(name)
         fdir.mkdir(parents=True, exist_ok=False)
 
-        # 2) build & persist layout.json atomically (UF format)
+        persist = bool(spec.get("persist", True))
+        chunk_size_mb = int(spec.get("chunk_size_mb", 64))
+        chunk_size_bytes = chunk_size_mb * 1024 * 1024
+        ring_size_mb = int(spec.get("ring_size_mb", max(8, chunk_size_mb * 8)))
+        ring_size_bytes = ring_size_mb * 1024 * 1024
+
+        # 2) build & persist layout.json atomically
         # Let layout builder perform schema validation (clock_level, field ordering, etc.)
         layout = build_layout(spec["fields"], clock_level=spec.get("clock_level"))
+        layout["ring_size_bytes"] = ring_size_bytes
+        layout["durable_chunk_size_bytes"] = chunk_size_bytes if persist else 0
         save_layout(fdir, layout)
 
         # 3) persist lifecycle defaults into GlobalRegistry (create or update)
         lifecycle = {
-            "chunk_size_bytes": int(spec.get("chunk_size_mb", 64)*1024*1024),
+            "chunk_size_bytes": chunk_size_bytes,
             "retention_hours":  int(spec.get("retention_hours", 0)),
-            "persist":          bool(spec.get("persist", True)),
+            "persist":          persist,
             "index_playback":   bool(spec.get("index_playback", False)),
         }
 
         # 4) keep full app spec for ops/debug
-        (fdir / "config.json").write_bytes(orjson.dumps(spec))
+        config_spec = dict(spec)
+        config_spec["persist"] = persist
+        config_spec["chunk_size_mb"] = chunk_size_mb
+        config_spec["ring_size_mb"] = ring_size_mb
+        config_spec["segment_tracking"] = bool(spec.get("segment_tracking", True))
+        config_spec["prefault_ring"] = bool(spec.get("prefault_ring", True))
+        self._write_feed_config(name, config_spec)
 
         # 5) Construct the feed registry (binary)
         self.registry.register_feed(name, lifecycle, clock_level=layout["clock_level"])
@@ -296,6 +322,9 @@ class Platform:
             "persist": lifecycle["persist"],
             "index_playback": lifecycle["index_playback"],
             "clock_level": layout["clock_level"],
+            "ring_size_bytes": layout["ring_size_bytes"],
+            "segment_tracking": config_spec["segment_tracking"],
+            "prefault_ring": config_spec["prefault_ring"],
         }
         self._record_format_cache[name] = layout
 
@@ -306,14 +335,15 @@ class Platform:
         """
         Create or return cached writer for a feed.
         
-        Returns Writer (disk) if persist=True, RingWriter (SHM) if persist=False.
+        Returns the unified feed writer.
+        Current implementation always ingresses through RingWriter.
         Writers are cached per process - multiple calls return same instance.
         
         Args:
             feed_name: Name of the feed
         
         Returns:
-            Writer or RingWriter instance (same interface)
+            Writer-like instance (currently RingWriter)
         
         Raises:
             KeyError: If feed does not exist
@@ -328,11 +358,10 @@ class Platform:
             lifecycle = self.lifecycle(feed_name)
             if lifecycle is None:
                 raise KeyError(feed_name)
-            # persist=True -> Writer (disk chunks), persist=False -> RingWriter (SHM ring)
             if lifecycle.get("persist", True):
-                w = Writer(self, feed_name)
-            else:
-                w = RingWriter(self, feed_name)
+                if not self._ensure_persistent_ring_persister():
+                    raise RuntimeError(f"persistent ring persister unavailable for feed '{feed_name}'")
+            w = RingWriter(self, feed_name)
             self._writers[feed_name] = w
         return w
     
@@ -340,14 +369,14 @@ class Platform:
         """
         Create or return cached reader for a feed.
         
-        Returns Reader (disk) if persist=True, RingReader (SHM) if persist=False.
+        Returns the unified feed reader.
         Readers are cached per process - multiple calls return same instance.
         
         Args:
             feed_name: Name of the feed
         
         Returns:
-            Reader or RingReader instance (same interface)
+            Reader-like instance selected from feed lifecycle
         
         Raises:
             KeyError: If feed does not exist
@@ -363,9 +392,9 @@ class Platform:
             lifecycle = self.lifecycle(feed_name)
             if lifecycle is None:
                 raise KeyError(feed_name)
-            # persist=True -> Reader (chunks), persist=False -> RingReader (ring)
             if lifecycle.get("persist", True):
-                r = Reader(self, feed_name)
+                from .io.persistent_ring import PersistentRingReader
+                r = PersistentRingReader(self, feed_name)
             else:
                 from .io.ring import RingReader
                 r = RingReader(self, feed_name)
@@ -384,26 +413,29 @@ class Platform:
 
     def _assert_no_external_writer(self, feed_name: str) -> None:
         """Fail fast if another process holds the feed writer lock."""
-        reg_path = self.feed_dir(feed_name) / f"{feed_name}.reg"
-        if not reg_path.exists():
-            return
-
-        fd = os.open(reg_path, os.O_RDWR)
-        try:
+        candidates = [
+            self.feed_dir(feed_name) / f"{feed_name}.writer.lock",
+            self.feed_dir(feed_name) / f"{feed_name}.reg",
+        ]
+        for path in candidates:
+            if not path.exists():
+                continue
+            fd = os.open(path, os.O_RDWR)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise RuntimeError(
-                    f"Cannot delete feed '{feed_name}': active writer holds {reg_path.name}"
-                )
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise RuntimeError(
+                        f"Cannot delete feed '{feed_name}': active writer holds {path.name}"
+                    )
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+                os.close(fd)
 
     def _unlink_ring_shm(self, feed_name: str) -> None:
         """Best-effort unlink of ring shared memory names used by this project."""
-        for shm_name in (feed_name, f"{feed_name}-ring"):
+        for shm_name in ring_buffer_shm_names(self.base_path, feed_name):
             try:
                 shm = shared_memory.SharedMemory(name=shm_name, create=False)
                 try:
@@ -483,6 +515,17 @@ class Platform:
         if metadata is None:
             metadata = self.registry.get_metadata(feed_name)
             if metadata is not None:
+                metadata = dict(metadata)
+                metadata["ring_size_bytes"] = int(self.get_record_format(feed_name).get("ring_size_bytes") or 0)
+                config_path = self.feed_dir(feed_name) / "config.json"
+                if config_path.exists():
+                    try:
+                        config_spec = orjson.loads(config_path.read_bytes())
+                    except Exception:
+                        config_spec = None
+                    if isinstance(config_spec, dict):
+                        metadata["segment_tracking"] = bool(config_spec.get("segment_tracking", True))
+                        metadata["prefault_ring"] = bool(config_spec.get("prefault_ring", True))
                 self._lifecycle_cache[feed_name] = metadata
         return metadata
 
@@ -491,6 +534,78 @@ class Platform:
         if not self.registry.update_metadata(feed_name, **kwargs):
             raise KeyError(f"feed '{feed_name}' not found")
         self._lifecycle_cache.pop(feed_name, None)
+
+    def update_feed_config(
+        self,
+        feed_name: str,
+        spec: dict,
+        *,
+        require_same_layout: bool = True,
+    ) -> dict:
+        """
+        Rewrite data/<feed>/config.json without recreating the feed.
+
+        This is intended for semantic/documentation metadata refreshes.
+        By default it refuses to write if the provided spec would change the
+        persisted binary layout.
+        """
+        if not self.feed_exists(feed_name):
+            raise KeyError(feed_name)
+
+        current_layout = self.get_record_format(feed_name)
+        current_lifecycle = self.lifecycle(feed_name)
+        if current_lifecycle is None:
+            raise KeyError(feed_name)
+
+        config_spec = dict(spec)
+        config_spec["feed_name"] = feed_name
+
+        if require_same_layout:
+            if "fields" not in config_spec:
+                raise ValueError("spec must include fields when require_same_layout=True")
+            candidate_layout = build_layout(
+                config_spec["fields"],
+                clock_level=config_spec.get("clock_level"),
+            )
+            candidate_core = {
+                "fmt": candidate_layout["fmt"],
+                "record_size": int(candidate_layout["record_size"]),
+                "clock_level": int(candidate_layout["clock_level"]),
+                "fields": candidate_layout["fields"],
+            }
+            current_core = {
+                "fmt": current_layout["fmt"],
+                "record_size": int(current_layout["record_size"]),
+                "clock_level": int(current_layout["clock_level"]),
+                "fields": current_layout["fields"],
+            }
+            if candidate_core != current_core:
+                raise ValueError(
+                    f"spec changes binary layout for feed '{feed_name}'; "
+                    "recreate or migrate the feed instead"
+                )
+
+        config_spec.setdefault("persist", bool(current_lifecycle.get("persist", True)))
+        config_spec.setdefault(
+            "chunk_size_mb",
+            max(1, int(current_lifecycle["chunk_size_bytes"]) // (1024 * 1024)),
+        )
+        config_spec.setdefault(
+            "ring_size_mb",
+            max(1, int(current_layout.get("ring_size_bytes") or 0) // (1024 * 1024)),
+        )
+        config_spec.setdefault(
+            "segment_tracking",
+            bool(current_lifecycle.get("segment_tracking", True)),
+        )
+        config_spec.setdefault(
+            "prefault_ring",
+            bool(current_lifecycle.get("prefault_ring", True)),
+        )
+
+        self._write_feed_config(feed_name, config_spec)
+        self._lifecycle_cache.pop(feed_name, None)
+        return config_spec
 
     def list_feeds(self) -> list[dict]:
         """
@@ -527,6 +642,7 @@ class Platform:
                 "retention_hours": md["retention_hours"],
                 "persist": md["persist"],
                 "index_playback": md["index_playback"],
+                "ring_size_bytes": md.get("ring_size_bytes"),
             },
             "clock_level": clock_level,
             "timestamp_fields": ts_fields,
@@ -662,6 +778,37 @@ class Platform:
         atexit.register(self.close)
 
         self._shutdown_handlers_registered = True
+
+    def _ensure_persistent_ring_persister(self) -> bool:
+        log = logging.getLogger("dw.platform")
+
+        owner = self.registry.get_persistent_ring_owner()
+        if owner.get("healthy"):
+            return True
+
+        if self._persister_process is not None and self._persister_process.poll() is None:
+            return True
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "deepwater.io.persistent_ring", str(self.base_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self._persister_process = proc
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            owner = self.registry.get_persistent_ring_owner()
+            if owner.get("healthy"):
+                return True
+            if proc.poll() is not None:
+                break
+            time.sleep(0.01)
+        owner = self.registry.get_persistent_ring_owner()
+        if owner.get("healthy"):
+            return True
+        log.error("persistent ring persister failed to start for %s", self.base_path)
+        return False
     
     def close(self):
         """
@@ -692,7 +839,18 @@ class Platform:
             except Exception:
                 pass
         self._readers = dict()
-        
+
+        if self._persister_process is not None:
+            try:
+                self._persister_process.terminate()
+                self._persister_process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._persister_process.kill()
+                except Exception:
+                    pass
+            self._persister_process = None
+
         try:
             self.registry.close()
         except Exception:

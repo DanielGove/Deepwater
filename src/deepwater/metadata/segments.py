@@ -548,7 +548,17 @@ class SegmentStore:
         if self._open_segment_id is None:
             self._open_segment(ts)
         self._open_last_ts = ts
-        self._open_records += int(records)
+        if records == 1:
+            self._open_records += 1
+        else:
+            self._open_records += int(records)
+
+    def note_write_one(self, ts_level1: int) -> None:
+        ts = int(ts_level1)
+        if self._open_segment_id is None:
+            self._open_segment(ts)
+        self._open_last_ts = ts
+        self._open_records += 1
 
     def note_batch(self, start_ts_level1: int, end_ts_level1: int, records: int) -> None:
         start_ts = int(start_ts_level1)
@@ -556,7 +566,7 @@ class SegmentStore:
         if self._open_segment_id is None:
             self._open_segment(start_ts)
         self._open_last_ts = end_ts
-        self._open_records += int(records)
+        self._open_records += records if isinstance(records, int) else int(records)
 
     def close_open_segment(self, reason: str = "writer_close") -> bool:
         if self._open_segment_id is None:
