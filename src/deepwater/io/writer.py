@@ -44,34 +44,61 @@ class ChunkWriter:
             self.platform.registry.register_feed(feed_name)
 
         self.data_dir = platform.base_path / "data" / feed_name
-        self.registry = FeedRegistry(self.data_dir / f"{feed_name}.reg", mode="w")
-
+        self.registry = None
         self.current_chunk = None
         self.chunk_index = None
         self.current_chunk_metadata = None
-        self.current_chunk_id = self.registry.get_latest_chunk_idx() or 0
+        self.segment_store = None
         self._key_min_set = None
 
-        if self.current_chunk_id > 0:
-            self._validate_chunk()
+        try:
+            self.registry = FeedRegistry(self.data_dir / f"{feed_name}.reg", mode="w")
+            self.current_chunk_id = self.registry.get_latest_chunk_idx() or 0
 
-        self._S = struct.Struct(self.record_format["fmt"])
-        self._u64 = struct.Struct("<Q")
-        self._rec_size = self._S.size
-        self._clock_level = self.feed_config.get("clock_level")
-        self._index_enabled = bool(self.feed_config.get("index_playback"))
-        if bool(self.feed_config.get("segment_tracking", True) if segment_tracking is None else segment_tracking):
-            self.segment_store = SegmentStore(self.data_dir, self.feed_name)
-            self._segment_note_write = self.segment_store.note_write_one
-            self._segment_note_batch = self.segment_store.note_batch
-            if self.segment_store.has_open_segment():
-                self.segment_store.recover_open_segment(self._latest_level1_timestamp())
-        else:
-            self.segment_store = None
-            self._segment_note_write = _noop_note_write
-            self._segment_note_batch = _noop_note_batch
+            if self.current_chunk_id > 0:
+                self._validate_chunk()
 
-        self._create_new_chunk()
+            self._S = struct.Struct(self.record_format["fmt"])
+            self._u64 = struct.Struct("<Q")
+            self._rec_size = self._S.size
+            self._clock_level = self.feed_config.get("clock_level")
+            self._index_enabled = bool(self.feed_config.get("index_playback"))
+            if bool(self.feed_config.get("segment_tracking", True) if segment_tracking is None else segment_tracking):
+                self.segment_store = SegmentStore(self.data_dir, self.feed_name)
+                self._segment_note_write = self.segment_store.note_write_one
+                self._segment_note_batch = self.segment_store.note_batch
+                if self.segment_store.has_open_segment():
+                    self.segment_store.recover_open_segment(self._latest_level1_timestamp())
+            else:
+                self.segment_store = None
+                self._segment_note_write = _noop_note_write
+                self._segment_note_batch = _noop_note_batch
+
+            self._create_new_chunk()
+        except Exception:
+            try:
+                self._close_current_chunk_file()
+            except Exception:
+                pass
+            if self.current_chunk_metadata is not None:
+                try:
+                    self.current_chunk_metadata.release()
+                except Exception:
+                    pass
+                self.current_chunk_metadata = None
+            if self.registry is not None:
+                try:
+                    self.registry.close()
+                except Exception:
+                    pass
+                self.registry = None
+            if self.segment_store is not None:
+                try:
+                    self.segment_store.close_open_segment("writer_init_failed")
+                except Exception:
+                    pass
+                self.segment_store = None
+            raise
 
     @property
     def chunk_record_capacity(self) -> int:

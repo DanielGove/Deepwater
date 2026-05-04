@@ -22,7 +22,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 log = logging.getLogger("dw.health")
 
@@ -59,36 +59,111 @@ def check_global_registry(base_path: Path) -> Tuple[bool, str]:
         return False, f"global registry error: {e}"
 
 
-def check_feeds(base_path: Path) -> Tuple[bool, str]:
-    """Verify feed registries are readable."""
-    data_dir = base_path / "data"
-    if not data_dir.exists():
-        return True, "no feeds yet"
-    
-    issues = []
-    healthy_count = 0
-    
-    for feed_dir in data_dir.iterdir():
-        if not feed_dir.is_dir():
-            continue
-        
-        reg_file = feed_dir / f"{feed_dir.name}.reg"
-        if not reg_file.exists():
-            continue
-        
+def _reader_state(reader) -> Optional[dict]:
+    if hasattr(reader, "_ring_state"):
         try:
-            from deepwater.metadata.feed_registry import FeedRegistry
-            reg = FeedRegistry(str(reg_file), mode="r")
-            latest = reg.get_latest_chunk_idx()
-            reg.close()
-            healthy_count += 1
-        except Exception as e:
-            issues.append(f"{feed_dir.name}: {e}")
-    
-    if issues:
-        return False, f"{len(issues)} feeds unhealthy: {'; '.join(issues)}"
-    
-    return True, f"{healthy_count} feeds healthy"
+            return reader._ring_state()
+        except FileNotFoundError:
+            return None
+    if hasattr(reader, "state"):
+        try:
+            return reader.state()
+        except FileNotFoundError:
+            return None
+    return None
+
+
+def check_feeds(base_path: Path) -> Tuple[bool, str, list[dict]]:
+    """Verify feed registries/readers are readable and rings are not dropping data."""
+    from deepwater import Platform
+
+    if not (base_path / "data").exists():
+        return True, "no feeds yet", []
+
+    platform = Platform(str(base_path))
+    issues = []
+    details = []
+
+    try:
+        feed_names = platform.list_feeds()
+        persistent_feed_count = 0
+        live_ring_count = 0
+
+        for feed_name in feed_names:
+            md = platform.registry.get_metadata(feed_name) or {}
+            persist = bool(md.get("persist", True))
+            if persist:
+                persistent_feed_count += 1
+
+            feed_dir = base_path / "data" / feed_name
+            reg_file = feed_dir / f"{feed_name}.reg"
+            detail = {
+                "feed": feed_name,
+                "persist": persist,
+                "registry_present": reg_file.exists(),
+            }
+
+            if persist and not reg_file.exists():
+                detail["healthy"] = False
+                detail["error"] = "registry missing"
+                details.append(detail)
+                issues.append(f"{feed_name}: registry missing")
+                continue
+
+            try:
+                reader = platform.create_reader(feed_name)
+                state = _reader_state(reader)
+                detail["ring_present"] = state is not None
+
+                if state is not None:
+                    live_ring_count += 1
+                    record_count = int(state.get("record_count", 0))
+                    durable_record_count = int(state.get("durable_record_count", 0))
+                    overrun_count = int(state.get("overrun_count", 0))
+                    lost_records = int(state.get("lost_records", 0))
+                    detail.update({
+                        "record_count": record_count,
+                        "durable_record_count": durable_record_count,
+                        "backlog": record_count - durable_record_count,
+                        "ring_capacity": int(state.get("ring_capacity", 0) or 0),
+                        "overrun_count": overrun_count,
+                        "lost_records": lost_records,
+                    })
+                    if overrun_count or lost_records:
+                        issues.append(
+                            f"{feed_name}: overrun_count={overrun_count} lost_records={lost_records}"
+                        )
+                detail["healthy"] = "error" not in detail and not (
+                    int(detail.get("overrun_count", 0)) or int(detail.get("lost_records", 0))
+                )
+            except Exception as e:
+                detail["healthy"] = False
+                detail["error"] = str(e)
+                issues.append(f"{feed_name}: {e}")
+
+            details.append(detail)
+
+        owner = platform.registry.get_persistent_ring_owner()
+        if persistent_feed_count and (not owner.get("healthy") or owner.get("stale")):
+            issues.append(
+                "persistent ring owner unhealthy"
+                f" (pid={owner.get('pid')} alive={owner.get('alive')} stale={owner.get('stale')})"
+            )
+
+        if issues:
+            return (
+                False,
+                f"{len(feed_names)} feeds checked, {len(issues)} issues, {live_ring_count} live rings",
+                details,
+            )
+
+        return (
+            True,
+            f"{len(feed_names)} feeds checked, 0 issues, {live_ring_count} live rings",
+            details,
+        )
+    finally:
+        platform.close()
 
 
 def check_recent_activity(base_path: Path, max_age_seconds: int) -> Tuple[bool, str]:
@@ -171,7 +246,10 @@ def main():
     
     # Optional checks
     if args.check_feeds:
-        checks.append(("Feed Registries", check_feeds(base_path)))
+        feeds_healthy, feeds_message, feed_details = check_feeds(base_path)
+        checks.append(("Feeds", (feeds_healthy, feeds_message)))
+    else:
+        feed_details = []
     
     if args.max_age_seconds:
         checks.append(("Recent Activity", check_recent_activity(base_path, args.max_age_seconds)))
@@ -183,6 +261,28 @@ def main():
         print(f"{status} {name}: {message}")
         if not healthy:
             all_healthy = False
+
+    if args.verbose and feed_details:
+        print("\nFeed Details:")
+        for detail in sorted(feed_details, key=lambda x: x["feed"]):
+            status = "✓" if detail.get("healthy") else "✗"
+            feed = detail["feed"]
+            persist = "persist" if detail.get("persist") else "ring"
+            ring = "live-ring" if detail.get("ring_present") else "no-ring"
+            if "error" in detail:
+                print(f"  {status} {feed} [{persist} {ring}] error={detail['error']}")
+                continue
+            backlog = detail.get("backlog")
+            overrun = detail.get("overrun_count", 0)
+            lost = detail.get("lost_records", 0)
+            cap = detail.get("ring_capacity", 0)
+            if backlog is None:
+                print(f"  {status} {feed} [{persist} {ring}]")
+            else:
+                print(
+                    f"  {status} {feed} [{persist} {ring}] "
+                    f"backlog={backlog} cap={cap} overrun={overrun} lost={lost}"
+                )
     
     if all_healthy:
         print("\nHEALTHY")

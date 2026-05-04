@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import struct
 import sys
 import time
@@ -20,6 +21,18 @@ log = logging.getLogger("dw.persistent_ring")
 _HEARTBEAT_INTERVAL_S = 0.25
 _U64 = struct.Struct("<Q")
 _PERSIST_EVENT_FEED = "dw-persist-events"
+
+
+def _raise_nofile_limit(target: int = 65536) -> None:
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        desired = min(max(int(soft), int(target)), int(hard))
+        if desired > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
+    except Exception:
+        pass
 
 
 def _persist_event_spec() -> dict:
@@ -131,8 +144,11 @@ def _pending_window(ring: RingBuffer, record_size: int) -> tuple[int, int, int, 
 
 
 def _target_flush_records(ring: RingBuffer, writer: ChunkWriter, record_size: int) -> tuple[int, int]:
-    max_batch_records = max(1, int(writer.feed_config["chunk_size_bytes"]) // record_size)
-    return max_batch_records, max_batch_records
+    chunk_records = max(1, int(writer.feed_config["chunk_size_bytes"]) // record_size)
+    capacity_records = max(1, ring.data_size // record_size)
+    max_batch_records = min(chunk_records, capacity_records)
+    target_records = min(max_batch_records, max(1, capacity_records // 2))
+    return target_records, max_batch_records
 
 
 def _persist_feed(
@@ -246,6 +262,7 @@ def _persist_feed(
 def persistent_ring_persister_main(base_path: str) -> None:
     from deepwater import Platform
 
+    _raise_nofile_limit()
     _configure_persister_logging(base_path)
     platform = Platform(base_path)
     pid = os.getpid()
@@ -259,6 +276,14 @@ def persistent_ring_persister_main(base_path: str) -> None:
     record_sizes: dict[str, int] = {}
     last_heartbeat = 0.0
     persist_event_writer = None
+    stop_requested = False
+
+    def _handle_stop(_signum, _frame) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
 
     try:
         try:
@@ -269,7 +294,7 @@ def persistent_ring_persister_main(base_path: str) -> None:
             log.exception("persist event feed init failed")
             persist_event_writer = None
 
-        while True:
+        while not stop_requested:
             now = time.monotonic()
             if now - last_heartbeat >= _HEARTBEAT_INTERVAL_S:
                 if not platform.registry.heartbeat_persistent_ring_owner(pid):

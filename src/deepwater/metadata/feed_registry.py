@@ -183,38 +183,71 @@ class FeedRegistry:
         already_exists = os.path.exists(path)
 
         self.fd = os.open(path, os.O_RDWR | os.O_CREAT)
-        current_size = os.fstat(self.fd).st_size
+        self.mm = None
+        self._mv = None
+        self._chunk_count = None
+        try:
+            current_size = os.fstat(self.fd).st_size
+            if current_size >= HEADER_SIZE:
+                self.max_chunks = max(
+                    int(self.max_chunks),
+                    int((current_size - HEADER_SIZE) // CHUNK_SIZE),
+                )
 
-        if self.is_writer:
+            if self.is_writer:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise RuntimeError("Feed registry locked by another writer") from exc
+
+                if current_size < desired_size:
+                    os.posix_fallocate(self.fd, 0, desired_size)
+                    current_size = desired_size
+
+                if (not already_exists) or current_size == 0:
+                    header_data = HEADER_STRUCT.pack(0)
+                    os.pwrite(self.fd, header_data, 0)
+                    current_size = desired_size
+
+            # For reader mode on empty/nonexistent files, ensure minimum size
+            if not self.is_writer and current_size == 0:
+                current_size = desired_size
+
+            self.mm = mmap.mmap(self.fd, current_size, mmap.MAP_SHARED,
+                                mmap.PROT_WRITE | mmap.PROT_READ)
+            self._mv = memoryview(self.mm)
+            self._chunk_count = self._mv[0:8].cast("Q")
+        except Exception:
+            if self.mm is not None:
+                try:
+                    self.mm.close()
+                except Exception:
+                    pass
             try:
-                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise RuntimeError("Feed registry locked by another writer")
-
-            if current_size < desired_size:
-                os.posix_fallocate(self.fd, 0, desired_size)
-                current_size = desired_size
-
-            if (not already_exists) or current_size == 0:
-                header_data = HEADER_STRUCT.pack(0)
-                os.pwrite(self.fd, header_data, 0)
-                current_size = desired_size
-
-        # For reader mode on empty/nonexistent files, ensure minimum size
-        if not self.is_writer and current_size == 0:
-            current_size = desired_size
-
-        self.mm = mmap.mmap(self.fd, current_size, mmap.MAP_SHARED,
-                            mmap.PROT_WRITE | mmap.PROT_READ)
-        self._mv = memoryview(self.mm)
-        self._chunk_count = self._mv[0:8].cast("Q")
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            raise
 
     def close(self):
-        self._mv.release()
-        self._chunk_count.release()
-        self.flush()
-        self.mm.close()
-        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        if self._chunk_count is not None:
+            self._chunk_count.release()
+            self._chunk_count = None
+        if self._mv is not None:
+            self._mv.release()
+            self._mv = None
+        if self.mm is not None:
+            self.flush()
+            self.mm.close()
+            self.mm = None
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
         os.close(self.fd)
 
     def flush(self) -> None:
@@ -230,32 +263,45 @@ class FeedRegistry:
                       status: int = None, clock_level: int = 1) -> int:
         if not self.is_writer:
             raise PermissionError("Read-only mode")
-        self._chunk_count[0] += 1
-        if self._chunk_count[0] >= self.max_chunks:
+        next_count = int(self._chunk_count[0]) + 1
+        if next_count > self.max_chunks:
             if self.max_chunks >= 1048576:  # 1M chunks = 128MB, reasonable limit
                 raise IndexError(f"Registry at maximum size: {self.max_chunks}")
-            new_max = min(1 + self.max_chunks * 2, 1048576)  # Double it, cap at 1M
+            new_max = int(self.max_chunks)
+            while next_count > new_max:
+                if new_max >= 1048576:
+                    raise IndexError(f"Registry at maximum size: {self.max_chunks}")
+                new_max = min(max(next_count, 1 + new_max * 2), 1048576)
             self._resize_file(new_max)
+        self._chunk_count[0] = next_count
         
-        offset = HEADER_SIZE + ((self._chunk_count[0]-1) * CHUNK_SIZE)
-        self._mv[offset + CHUNK_START_OFFSET:offset + CHUNK_END_OFFSET] = start_time.to_bytes(8, 'little')
-        self._mv[offset + CHUNK_END_OFFSET:offset + CHUNK_WRITE_POS_OFFSET] = b"\x00"*8            # End Time, write position,
-        self._mv[offset + CHUNK_WRITE_POS_OFFSET:offset + CHUNK_NUM_RECORDS_OFFSET] = b"\x00"*8    # and number of records
-        self._mv[offset + CHUNK_NUM_RECORDS_OFFSET:offset + CHUNK_LAST_UPDATE_OFFSET] = b"\x00"*8
-        self._mv[offset + CHUNK_LAST_UPDATE_OFFSET:offset + CHUNK_ID_OFFSET] = b"\x00"*8
-        self._mv[offset + CHUNK_ID_OFFSET:offset + CHUNK_SIZE_OFFSET] = chunk_id.to_bytes(8, 'little')
-        self._mv[offset + CHUNK_SIZE_OFFSET:offset + CHUNK_STATUS_OFFSET] = size.to_bytes(8, 'little')
-        self._mv[offset + CHUNK_STATUS_OFFSET] = status
-        self._mv[offset + CHUNK_QCOUNT_OFFSET] = clock_level & 0xFF
-        # initialize qmins to UINT64_MAX and qmaxs to 0
-        for i in range(MAX_QUERY_KEYS):
-            base = offset + CHUNK_QMIN_OFFSET + (i * 8)
-            self._mv[base:base+8] = UINT64_MAX.to_bytes(8, 'little')
-        for i in range(MAX_QUERY_KEYS):
-            base = offset + CHUNK_QMIN_OFFSET + (MAX_QUERY_KEYS * 8) + (i * 8)
-            self._mv[base:base+8] = b"\x00"*8
+        offset = HEADER_SIZE + ((next_count - 1) * CHUNK_SIZE)
+        try:
+            CHUNK_STRUCT.pack_into(
+                self.mm,
+                offset,
+                int(start_time),
+                0,
+                0,
+                0,
+                0,
+                int(chunk_id),
+                int(size),
+                int(status) & 0xFF,
+                int(clock_level) & 0xFF,
+                UINT64_MAX,
+                UINT64_MAX,
+                UINT64_MAX,
+                0,
+                0,
+                0,
+            )
+        except Exception:
+            if int(self._chunk_count[0]) == next_count:
+                self._chunk_count[0] = next_count - 1
+            raise
         
-        return self._chunk_count[0]
+        return next_count
     
     def _resize_file(self, new_max_chunks: int):
         """Resize file and remap for writer. Readers will handle this separately."""
@@ -266,18 +312,19 @@ class FeedRegistry:
         
         # Extend the file
         os.posix_fallocate(self.fd, 0, new_total_size)
+        map_size = max(new_total_size, os.fstat(self.fd).st_size)
         
         # Close and remap to new size
         self._chunk_count.release()
         self._mv.release()
         self.mm.close()
-        self.mm = mmap.mmap(self.fd, new_total_size, mmap.MAP_SHARED,
+        self.mm = mmap.mmap(self.fd, map_size, mmap.MAP_SHARED,
                             mmap.PROT_WRITE | mmap.PROT_READ)
         self._mv = memoryview(self.mm)
         self._chunk_count = self._mv[0:8].cast("Q")
         
         # Update our max_chunks
-        self.max_chunks = new_max_chunks
+        self.max_chunks = max(int(new_max_chunks), int((map_size - HEADER_SIZE) // CHUNK_SIZE))
 
     def _chunk_start_time(self, index: int, qoff: int = 0) -> int:
         """returns recorded chunk start for a specific time key"""
