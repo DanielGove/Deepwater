@@ -63,7 +63,7 @@ def test_range_spans_multiple_chunks():
         start = base_ts + start_idx * 10 + 10  # proc_us = recv+10
         end = base_ts + end_idx * 10 + 10
         out = r.range(start, end, ts_key="proc_us")
-        expected = end_idx - start_idx + 1  # reader.range includes end if ts <= end
+        expected = end_idx - start_idx  # [start, end)
         assert len(out) == expected, f"proc_us range count mismatch: {len(out)} vs {expected}"
 
         # Tight range around a chunk boundary (~every 26k records). Pick boundary near 52k.

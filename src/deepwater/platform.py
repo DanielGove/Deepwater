@@ -24,6 +24,8 @@ from .metadata.segments import SegmentStore
 from .metadata.datasets import common_intervals, with_duration, recommend_train_validation, build_manifest
 from . import __version__
 
+_ACTIVE_WRITER_KEYS: set[tuple[str, str]] = set()
+
 
 def _mb_to_bytes(value, *, default: float) -> int:
     mb = float(default if value is None else value)
@@ -152,6 +154,17 @@ class Platform:
         - Always close() writers (Platform.close() does this for you)
         - Timestamps must be uint64 microseconds (standard convention)
     """
+
+    def __new__(cls, base_path: str = "./platform_data"):
+        if cls is Platform:
+            from .network.path import parse_target
+
+            target = parse_target(base_path)
+            if target.is_remote:
+                from .network.client import RemotePlatform
+
+                return RemotePlatform(target.host, target.path, port=target.port)
+        return super().__new__(cls)
 
     def __init__(self, base_path: str = "./platform_data"):
         self.base_path = Path(base_path)
@@ -375,6 +388,7 @@ class Platform:
                 raise KeyError(feed_name)
             w = RingWriter(self, feed_name)
             self._writers[feed_name] = w
+            _ACTIVE_WRITER_KEYS.add(self._writer_key(feed_name))
             if lifecycle.get("persist", True):
                 if (
                     not self._ensure_persistent_ring_persister()
@@ -429,6 +443,12 @@ class Platform:
         if w:
             w.close()
 
+    def _writer_key(self, feed_name: str) -> tuple[str, str]:
+        return (os.fspath(self.base_path.resolve()), feed_name)
+
+    def _active_writer_closed(self, feed_name: str) -> None:
+        _ACTIVE_WRITER_KEYS.discard(self._writer_key(feed_name))
+
     def close_reader(self, feed_name: str) -> None:
         r = self._readers.pop(feed_name, None)
         if r:
@@ -436,6 +456,8 @@ class Platform:
 
     def _assert_no_external_writer(self, feed_name: str) -> None:
         """Fail fast if another process holds the feed writer lock."""
+        if self._writer_key(feed_name) in _ACTIVE_WRITER_KEYS and feed_name not in self._writers:
+            raise RuntimeError(f"Cannot delete feed '{feed_name}': active writer in this process")
         candidates = [
             self.feed_dir(feed_name) / f"{feed_name}.writer.lock",
             self.feed_dir(feed_name) / f"{feed_name}.reg",
@@ -468,6 +490,19 @@ class Platform:
                 shm.close()
             except FileNotFoundError:
                 continue
+
+    def _unlink_owned_ring_shm(self) -> None:
+        """Unlink feed-scoped ring SHM when this platform can prove no writer owns it."""
+        try:
+            feed_names = list(self.list_feeds())
+        except Exception:
+            return
+        for feed_name in feed_names:
+            try:
+                self._assert_no_external_writer(feed_name)
+            except Exception:
+                continue
+            self._unlink_ring_shm(feed_name)
 
     def delete_feed(self, feed_name: str, *, missing_ok: bool = False) -> bool:
         """
@@ -911,6 +946,8 @@ class Platform:
         self._readers = dict()
 
         self._stop_persistent_ring_persister()
+
+        self._unlink_owned_ring_shm()
 
         try:
             self.registry.close()

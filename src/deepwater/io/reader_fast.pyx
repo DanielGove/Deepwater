@@ -93,7 +93,7 @@ def range_tuples_fast(
             continue
         
         # Stop at end timestamp
-        if end_us > 0 and ts > end_us:
+        if end_us > 0 and ts >= end_us:
             break
         
         # Unpack and append (Python call, but minimized)

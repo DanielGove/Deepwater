@@ -53,7 +53,7 @@ def test_range_spans_hundred_chunks():
         start = base_ts + start_idx * 10 + 10
         end = base_ts + end_idx * 10 + 10
         out = r.range(start, end, ts_key="proc_us")
-        expected = end_idx - start_idx + 1  # inclusive end
+        expected = end_idx - start_idx  # [start, end)
         assert len(out) == expected, f"proc_us span count mismatch {len(out)} vs {expected}"
 
         # Small window near a later boundary

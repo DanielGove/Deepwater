@@ -104,10 +104,86 @@ def test_delete_ring_feed_unlinks_shared_memory_and_registry_entry():
         p.close()
 
 
+def test_platform_close_unlinks_ring_shared_memory_with_exported_view():
+    with tempfile.TemporaryDirectory(prefix="dw-close-ring-") as td:
+        base = Path(td)
+        p = Platform(str(base))
+        spec = {
+            "feed_name": "live",
+            "mode": "UF",
+            "fields": [
+                {"name": "ts", "type": "uint64"},
+                {"name": "v", "type": "uint64"},
+            ],
+            "clock_level": 1,
+            "persist": False,
+            "chunk_size_mb": 0.01,
+        }
+        p.create_feed(spec)
+        w = p.create_writer("live")
+        w.write_values(1_000_000, 1)
+
+        r = p.create_reader("live")
+        raw_record = next(r.stream_from_seq(0, format="raw"))
+        assert bytes(raw_record[:8]) != b""
+
+        shm_name = ring_buffer_shm_names(base, "live")[0]
+        shm = shared_memory.SharedMemory(name=shm_name, create=False)
+        shm.close()
+
+        p.close()
+
+        try:
+            shared_memory.SharedMemory(name=shm_name, create=False)
+            raise AssertionError("ring shared memory still exists after platform close")
+        except FileNotFoundError:
+            pass
+        raw_record.release()
+        r.close()
+
+
+def test_read_only_platform_close_does_not_unlink_ring_shared_memory():
+    with tempfile.TemporaryDirectory(prefix="dw-close-readonly-ring-") as td:
+        base = Path(td)
+        p1 = Platform(str(base))
+        spec = {
+            "feed_name": "live",
+            "mode": "UF",
+            "fields": [
+                {"name": "ts", "type": "uint64"},
+                {"name": "v", "type": "uint64"},
+            ],
+            "clock_level": 1,
+            "persist": False,
+            "chunk_size_mb": 0.01,
+        }
+        p1.create_feed(spec)
+        w = p1.create_writer("live")
+        w.write_values(1_000_000, 1)
+
+        shm_name = ring_buffer_shm_names(base, "live")[0]
+        p2 = Platform(str(base))
+        r2 = p2.create_reader("live")
+        r2.close()
+        p2.close()
+
+        shm = shared_memory.SharedMemory(name=shm_name, create=False)
+        shm.close()
+
+        p1.close()
+        try:
+            shared_memory.SharedMemory(name=shm_name, create=False)
+            raise AssertionError("owned ring shared memory still exists after owner platform close")
+        except FileNotFoundError:
+            pass
+
+
 def run_tests():
     tests = [
         ("delete_persistent_feed_removes_all_state_and_allows_recreate", test_delete_persistent_feed_removes_all_state_and_allows_recreate),
         ("delete_ring_feed_unlinks_shared_memory_and_registry_entry", test_delete_ring_feed_unlinks_shared_memory_and_registry_entry),
+        ("platform_close_unlinks_ring_shared_memory_with_exported_view", test_platform_close_unlinks_ring_shared_memory_with_exported_view),
+        ("read_only_platform_close_does_not_unlink_ring_shared_memory", test_read_only_platform_close_does_not_unlink_ring_shared_memory),
     ]
     print("Delete Feed Tests")
     print("=" * 60)

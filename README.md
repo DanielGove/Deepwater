@@ -106,19 +106,24 @@ Deepwater Networking v0 is a small remote reader path for machines on the same T
 
 Current scope:
 - remote reads: supported via `range()`, `latest()`, and `stream()`
+- large historical reads: supported via `range_batches()`
+- non-blocking event-loop reads: supported via `read_available()`
 - remote writes: not supported in v0; writers remain local to the data machine
 - transport: TCP, length-prefixed frames, JSON control header plus optional binary payload
 - payload: Deepwater raw record bytes where possible, decoded by the client into tuple/dict/numpy/raw formats
+- stream liveness: TCP keepalive plus lightweight idle heartbeats for live remote streams
 
 ### Start the Agent on the Data Machine
 
 ```bash
-PYTHONPATH=src python -m deepwater.network.agent \
+deepwater-agent \
   --root /deepwater/data \
   --bind 0.0.0.0:7447
 ```
 
 The agent accepts remote base paths under `--root` only. For example, with `--root /deepwater/data`, a client may open `/deepwater/data/hyperliquid-node`, but paths outside `/deepwater/data` are rejected.
+
+Deepwater does not manage Tailscale. MagicDNS hostnames work when the operator's network already routes them to the agent.
 
 ### Read from a Laptop
 
@@ -132,6 +137,8 @@ reader = dw.reader(
 
 recent = reader.latest(60)
 window = reader.range(start_us, end_us, format="dict")
+for batch in reader.range_batches(start_us, end_us, batch_records=50_000):
+    process(batch)
 reader.close()
 ```
 
@@ -143,7 +150,9 @@ reader = dw.reader("dw://deepwater-pioneer:7447/deepwater/data/hyperliquid-node"
 
 `dw.reader(local_path, stream="feed")` also works for local paths and returns a managed local reader. Use `Platform(...)` directly when you need local writer APIs.
 
-See `network.md` for the architecture and `examples/network_remote_read.py` for a runnable client script.
+`Platform("host:/base")` also works for read-side platform operations such as `create_reader`, `feed_exists`, `list_feeds`, `describe_feed`, `lifecycle`, `get_record_format`, `list_segments`, and `suggested_reader_range`.
+
+See `network.md` for the v0 architecture, `network_v1_plan.md` for the v1 roadmap, and `examples/network_remote_read.py` for a runnable client script.
 
 ---
 
@@ -262,11 +271,22 @@ Removes expired chunks based on retention policy.
 ## Feed Management CLI
 
 After installation (`pip install -e .`), these commands are available globally:
+- `deepwater-agent`
 - `deepwater-create-feed`
 - `deepwater-delete-feed`
 - `deepwater-feeds`
 - `deepwater-segments`
 - `deepwater-datasets`
+
+Read-only metadata commands accept the same local or remote base path syntax as the Python API:
+
+```bash
+deepwater-feeds --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node
+deepwater-segments --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --feed trades --status usable
+deepwater-datasets --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --feed trades --json
+```
+
+Mutating/admin commands (`deepwater-create-feed`, `deepwater-delete-feed`, repair, cleanup, health checks) remain local-side tools until the network protocol has explicit write/admin operations.
 
 ### Feed Config Format (JSON)
 

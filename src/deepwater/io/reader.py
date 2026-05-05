@@ -1,13 +1,20 @@
-from sys import byteorder
 import time
 import struct
 from typing import Optional, Iterator, Union, List, Tuple
 import numpy as np
 
 from .chunk import Chunk
+from .formatting import format_raw_batch as _format_raw_batch
 from .index import ChunkIndex
+from .range_scan import iter_chunk_raw_range as _iter_chunk_raw_range
+from .streaming import read_available as _read_available
+from .streaming import stream_dicts as _stream_dicts
+from .streaming import stream_numpy as _stream_numpy
+from .streaming import stream_raw as _stream_raw
+from .streaming import stream_tuples as _stream_tuples
+from .timestamps import key_id_for_offset as _key_id_for_offset
+from .timestamps import resolve_ts_key as _resolve_ts_key
 from ..metadata.feed_registry import FeedRegistry, IN_MEMORY, ON_DISK, EXPIRED, UINT64_MAX
-from ..utils.process import ProcessUtils
 
 # Try to import Cython-optimized hot paths
 try:
@@ -100,7 +107,11 @@ class ChunkReader:
                  'data_dir', 'registry', '_chunk', '_chunk_meta', '_chunk_id',
                  '_chunk_index', '_chunk_index_id',
                  '_unpack', '_rec_size', '_index_available', '_ts_fields',
-                 '_field_names', '_dtype', '_read_head')
+                 '_field_names', '_dtype', '_read_head', '_iter_chunk_raw_range',
+                 '_format_raw_batch', '_resolve_ts_key_impl',
+                 '_key_id_for_offset', '_stream_tuples_impl',
+                 '_stream_dicts_impl', '_stream_numpy_impl',
+                 '_stream_raw_impl', '_read_available_impl')
 
     def __init__(self, platform, feed_name: str):
         self.platform = platform
@@ -135,6 +146,17 @@ class ChunkReader:
         
         # Read head for non-blocking reads (read_available)
         self._read_head: Optional[int] = None
+
+        # Cache imported scanner on the instance so hot paths avoid module lookups.
+        self._iter_chunk_raw_range = _iter_chunk_raw_range
+        self._format_raw_batch = _format_raw_batch
+        self._resolve_ts_key_impl = _resolve_ts_key
+        self._key_id_for_offset = _key_id_for_offset
+        self._stream_tuples_impl = _stream_tuples
+        self._stream_dicts_impl = _stream_dicts
+        self._stream_numpy_impl = _stream_numpy
+        self._stream_raw_impl = _stream_raw
+        self._read_available_impl = _read_available
 
     # ================================================================ METADATA
     
@@ -186,12 +208,7 @@ class ChunkReader:
 
     def _resolve_ts_key(self, ts_key: Optional[str]) -> Tuple[int, str, int]:
         """Resolve ts_key to (offset, byteorder, key_id). Returns primary if ts_key is None."""
-        if ts_key is None:
-            return self._ts_fields[0]["offset"], "little", 0
-        field = [f for f in self._ts_fields if f["name"] == ts_key]
-        if not field:
-            raise ValueError(f"Timestamp key '{ts_key}' not found, options are: {[f['name'] for f in self._ts_fields]}")
-        return field[0]["offset"], "little", self._ts_fields.index(field[0])
+        return self._resolve_ts_key_impl(self._ts_fields, ts_key)
 
     def _close_chunk(self) -> None:
         if self._chunk is not None:
@@ -368,99 +385,12 @@ class ChunkReader:
                     if ts < start_us:
                         pos += rec_size
                         continue
-                    if end_us is not None and ts > end_us:
+                    if end_us is not None and ts >= end_us:
                         break
                     result.append(unpack(buf, pos))
                     pos += rec_size
         
         return result
-
-    def _stream_tuples(self, start_us: Optional[int], ts_off: Optional[int] = None, playback: bool = False) -> Iterator[tuple]:
-        """Stream tuples (historical replay → live)"""
-        unpack = self._unpack
-        rec_size = self._rec_size
-        
-        # Historical replay if start_us provided
-        if start_us is not None:            
-            if playback:
-                start_us = self._playback_start(start_us, 0 if ts_off == self._ts_fields[0]["offset"] else self._ts_fields.index(next(f for f in self._ts_fields if f["offset"] == ts_off)))
-            # Get latest chunk ID to know when to stop historical replay
-            latest_chunk_id = self.registry.get_latest_chunk_idx()
-            
-            for chunk_id in self._iter_chunks_in_range(start_us, None, ts_off=ts_off):
-                try:
-                    self._open_chunk(chunk_id)
-                except FileNotFoundError:
-                    continue
-                buf = self._chunk.buffer
-                write_pos = self._chunk_meta.write_pos
-                pos = self._binary_search_start(start_us, ts_off, "little")
-                
-                while pos + rec_size <= write_pos:
-                    yield unpack(buf, pos)
-                    pos += rec_size
-                
-                # Stop after processing the latest (active) chunk
-                if chunk_id >= latest_chunk_id:
-                    break
-            
-            # After historical replay, we're already on the latest chunk
-            # Just set read_head to current write position
-            if self._chunk is not None:
-                read_head = self._chunk_meta.write_pos
-            else:
-                self._ensure_latest_chunk()
-                read_head = self._chunk_meta.write_pos
-        else:
-            # Live streaming from current write head
-            self._ensure_latest_chunk()
-            # Initialize read_head to current write position immediately
-            # Don't defer this - it causes iteration through entire chunk!
-            read_head = self._chunk_meta.write_pos
-        
-        # Continue with live polling
-        
-        while True:
-            if self._chunk_meta is None:
-                self._ensure_latest_chunk()
-                read_head = self._chunk_meta.write_pos
-            
-            # Refresh write position on each iteration
-            buf = self._chunk.buffer
-            write_pos = self._chunk_meta.write_pos
-            
-            # Read new records
-            while read_head + rec_size <= write_pos:
-                yield unpack(buf, read_head)
-                read_head += rec_size
-            
-            # Check for chunk rotation (status changes to ON_DISK when sealed)
-            # But only rotate if we're not already on the latest chunk
-            if self._chunk_meta.status == ON_DISK:
-                latest_chunk_id = self.registry.get_latest_chunk_idx()
-                if self._chunk_id < latest_chunk_id:
-                    # There's a newer chunk available
-                    next_id = self._chunk_id + 1
-                    next_meta = self.registry.get_chunk_metadata(next_id)
-                    if next_meta is not None:
-                        # Check if next chunk file actually exists before rotating
-                        try:
-                            self._open_chunk(next_id)
-                            read_head = 0
-                            next_meta.release()
-                            continue
-                        except FileNotFoundError:
-                            next_meta.release()
-                            try:
-                                self._ensure_latest_chunk()
-                                read_head = self._chunk_meta.write_pos
-                                continue
-                            except Exception:
-                                return
-                        next_meta.release()
-                # else: we're on the latest chunk, even though it's sealed
-            
-            # Spin-wait for new data (no sleep - burn cycles for minimal latency)
 
     # ================================================================ DICT FORMAT
 
@@ -469,13 +399,6 @@ class ChunkReader:
         names = self._field_names
         # Dict comprehension faster than zip - use len(rec) not len(names) due to unpacking
         return [{names[i]: rec[i] for i in range(len(names))} for rec in self._range_tuples(start_us, end_us, playback=playback, ts_off=ts_off, key_id=key_id)]
-    def _stream_dicts(self, start_us: Optional[int], ts_off: Optional[int] = None, playback: bool = False) -> Iterator[dict]:
-        """Stream dicts"""
-        names = self._field_names
-        # Dict comprehension faster than zip
-        for rec in self._stream_tuples(start_us, ts_off=ts_off, playback=playback):
-            yield {names[i]: rec[i] for i in range(len(names))}
-
     # ================================================================ NUMPY FORMAT
 
     def _range_numpy(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None, key_id: int = 0):
@@ -506,7 +429,7 @@ class ChunkReader:
                     end_pos += rec_size
                     pos = end_pos
                     continue
-                if end_us is not None and ts > end_us:
+                if end_us is not None and ts >= end_us:
                     break
                 end_pos += rec_size
             
@@ -520,50 +443,28 @@ class ChunkReader:
         combined = b''.join(blocks)
         return np.frombuffer(combined, dtype=self.dtype)
 
-    def _stream_numpy(self, start_us: Optional[int], ts_off: Optional[int] = None, playback: bool = False) -> Iterator:
-        """Stream numpy arrays (yields array per chunk)"""
-        import numpy as np
-        
-        for rec in self._stream_tuples(start_us, ts_off=ts_off, playback=playback):
-            # For streaming, yield individual records as 1-element arrays
-            arr = np.array([rec], dtype=self.dtype)
-            yield arr[0]
-
     # ================================================================ RAW FORMAT
+
+    def _range_scan_chunk_state(self):
+        return self._chunk.buffer, self._chunk_meta.write_pos
 
     def _range_raw(self, start_us: int, end_us: Optional[int], playback: bool = False, ts_off: Optional[int] = None, key_id: int = 0) -> memoryview:
         """Read range as single contiguous memoryview (zero-copy if single chunk)"""        
         # If caller requests playback and index is available, start from latest snapshot before start_us
         if playback:
             start_us = self._playback_start(start_us, key_id)
-        
-        blocks = []
-        rec_size = self._rec_size
-        from_bytes = int.from_bytes
-        
-        for chunk_id in self._iter_chunks_in_range(start_us, end_us, ts_off=ts_off):
-            try:
-                self._open_chunk(chunk_id)
-            except FileNotFoundError:
-                continue
-            buf = self._chunk.buffer
-            write_pos = self._chunk_meta.write_pos
-            pos = self._binary_search_start(start_us, ts_off, "little")
-            
-            # Find end position
-            end_pos = pos
-            while end_pos + rec_size <= write_pos:
-                ts = from_bytes(buf[end_pos + ts_off:end_pos + ts_off + 8], "little")
-                if ts < start_us:
-                    end_pos += rec_size
-                    pos = end_pos
-                    continue
-                if end_us is not None and ts > end_us:
-                    break
-                end_pos += rec_size
-            
-            if end_pos > pos:
-                blocks.append(bytes(buf[pos:end_pos]))
+
+        blocks = list(self._iter_chunk_raw_range(
+            self._iter_chunks_in_range(start_us, end_us, ts_off=ts_off),
+            open_chunk=self._open_chunk,
+            chunk_state=self._range_scan_chunk_state,
+            binary_search_start=self._binary_search_start,
+            start_us=start_us,
+            end_us=end_us,
+            rec_size=self._rec_size,
+            ts_off=ts_off,
+            batch_records=None,
+        ))
         
         # Return contiguous memoryview
         if not blocks:
@@ -572,56 +473,33 @@ class ChunkReader:
             return memoryview(blocks[0])
         return memoryview(b''.join(blocks))
 
-    def _stream_raw(self, start_us: Optional[int], ts_off: Optional[int] = None, playback: bool = False) -> Iterator[memoryview]:
-        """Stream raw memoryview slices (64 bytes each)"""
-        rec_size = self._rec_size
-        
-        # Historical replay
-        if start_us is not None:
-            if playback:
-                start_us = self._playback_start(start_us, 0 if ts_off == self._ts_fields[0]["offset"] else self._ts_fields.index(next(f for f in self._ts_fields if f["offset"] == ts_off)))
-            # Resolve ts_offset if ts_key provided
-            for chunk_id in self._iter_chunks_in_range(start_us, None, ts_off=ts_off):
-                try:
-                    self._open_chunk(chunk_id)
-                except FileNotFoundError:
-                    continue
-                buf = self._chunk.buffer
-                write_pos = self._chunk_meta.write_pos
-                pos = self._binary_search_start(start_us, ts_off, "little")
-                
-                while pos + rec_size <= write_pos:
-                    yield buf[pos:pos + rec_size]
-                    pos += rec_size
-        
-        # Live streaming
-        self._ensure_latest_chunk()
-        read_head = self._chunk_meta.write_pos
-        
-        while True:
-            if self._chunk_meta is None:
-                self._ensure_latest_chunk()
-                read_head = 0
-            
-            buf = self._chunk.buffer
-            write_pos = self._chunk_meta.write_pos
-            
-            while read_head + rec_size <= write_pos:
-                yield buf[read_head:read_head + rec_size]
-                read_head += rec_size
-            
-            if self._chunk_meta.status == ON_DISK:
-                next_id = self._chunk_id + 1
-                try:
-                    if self.registry.get_chunk_metadata(next_id) is not None:
-                        self._open_chunk(next_id)
-                        read_head = 0
-                        continue
-                except FileNotFoundError:
-                    # Next chunk not ready yet, wait
-                    pass
-            
-            time.sleep(0.0001)
+    def _range_raw_batches(
+        self,
+        start_us: int,
+        end_us: Optional[int],
+        *,
+        playback: bool = False,
+        ts_off: Optional[int] = None,
+        key_id: int = 0,
+        batch_records: int = 50_000,
+    ) -> Iterator[memoryview]:
+        """Yield bounded raw batches for [start_us, end_us) without materializing the full range."""
+        if batch_records <= 0:
+            raise ValueError("batch_records must be positive")
+        if playback:
+            start_us = self._playback_start(start_us, key_id)
+
+        yield from self._iter_chunk_raw_range(
+            self._iter_chunks_in_range(start_us, end_us, ts_off=ts_off),
+            open_chunk=self._open_chunk,
+            chunk_state=self._range_scan_chunk_state,
+            binary_search_start=self._binary_search_start,
+            start_us=start_us,
+            end_us=end_us,
+            rec_size=self._rec_size,
+            ts_off=ts_off,
+            batch_records=batch_records,
+        )
 
     # ================================================================ PUBLIC API
 
@@ -674,13 +552,13 @@ class ChunkReader:
         """
         ts_off, ts_bo, key_id = self._resolve_ts_key(ts_key)
         if format == 'tuple':
-            return self._stream_tuples(start, ts_off=ts_off, playback=playback)
+            return self._stream_tuples_impl(self, start, ts_off=ts_off, playback=playback)
         elif format == 'dict':
-            return self._stream_dicts(start, ts_off=ts_off, playback=playback)
+            return self._stream_dicts_impl(self, start, ts_off=ts_off, playback=playback)
         elif format == 'numpy':
-            return self._stream_numpy(start, ts_off=ts_off, playback=playback)
+            return self._stream_numpy_impl(self, start, ts_off=ts_off, playback=playback)
         elif format == 'raw':
-            return self._stream_raw(start, ts_off=ts_off, playback=playback)
+            return self._stream_raw_impl(self, start, ts_off=ts_off, playback=playback)
         else:
             raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
 
@@ -737,6 +615,69 @@ class ChunkReader:
             return self._range_raw(start, end, playback=playback, ts_off=ts_off, key_id=key_id)
         else:
             raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
+
+    def iter_raw_range(
+        self,
+        start: int,
+        end: int,
+        *,
+        playback: bool = False,
+        ts_key: Optional[str] = None,
+        batch_records: int = 50_000,
+    ) -> Iterator[memoryview]:
+        """Yield historical raw record batches using the reader's public range semantics."""
+        if batch_records <= 0:
+            raise ValueError("batch_records must be positive")
+        ts_off, _ts_bo, key_id = self._resolve_ts_key(ts_key)
+        yield from self._range_raw_batches(
+            start,
+            end,
+            playback=playback,
+            ts_off=ts_off,
+            key_id=key_id,
+            batch_records=int(batch_records),
+        )
+
+    def range_batches(
+        self,
+        start: int,
+        end: int,
+        format: str = 'tuple',
+        playback: bool = False,
+        ts_key: Optional[str] = None,
+        batch_records: int = 50_000,
+    ) -> Iterator:
+        """
+        Read a historical range as bounded batches.
+
+        This is the non-materializing counterpart to range(). It preserves the
+        same timestamp semantics, [start, end), but yields chunks of up to
+        batch_records records so callers can handle large windows explicitly.
+        """
+        if format not in {'tuple', 'dict', 'numpy', 'raw'}:
+            raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
+        if batch_records <= 0:
+            raise ValueError("batch_records must be positive")
+        format_raw_batch = self._format_raw_batch
+        unpack = self._unpack
+        rec_size = self._rec_size
+        field_names = self._field_names
+        dtype = self.dtype if format == 'numpy' else None
+        for raw in self.iter_raw_range(
+            start,
+            end,
+            playback=playback,
+            ts_key=ts_key,
+            batch_records=int(batch_records),
+        ):
+            yield format_raw_batch(
+                raw,
+                format,
+                unpack,
+                rec_size,
+                field_names,
+                dtype,
+            )
 
     def latest(self, seconds: float = 60.0, format: str = 'tuple', ts_key: Optional[str] = None) -> Union[List, memoryview]:
         """
@@ -822,46 +763,7 @@ class ChunkReader:
             - Use stream() if you want blocking/spin-wait behavior
             - Returns empty list if no data (check length before processing)
         """
-        # Initialize read head on first call
-        if self._read_head is None:
-            self._ensure_latest_chunk()
-            self._read_head = self._chunk_meta.write_pos
-        
-        # Ensure we're on the latest chunk
-        if self._chunk_meta is None:
-            self._ensure_latest_chunk()
-            self._read_head = self._chunk_meta.write_pos
-        
-        # Check for chunk rotation
-        latest_chunk_id = self.registry.get_latest_chunk_idx()
-        if self._chunk_id < latest_chunk_id:
-            # Move to newer chunk
-            self._open_chunk(latest_chunk_id)
-            self._read_head = 0
-        
-        # Read available records (non-blocking)
-        result = []
-        buf = self._chunk.buffer
-        write_pos = self._chunk_meta.write_pos
-        rec_size = self._rec_size
-        
-        while self._read_head + rec_size <= write_pos:
-            if format == 'tuple':
-                result.append(self._unpack(buf, self._read_head))
-            elif format == 'dict':
-                rec = self._unpack(buf, self._read_head)
-                result.append({self._field_names[i]: rec[i] for i in range(len(self._field_names))})
-            elif format == 'raw':
-                result.append(buf[self._read_head:self._read_head + rec_size])
-            else:
-                raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', or 'raw'")
-            
-            self._read_head += rec_size
-            
-            if max_records and len(result) >= max_records:
-                break
-        
-        return result    
+        return self._read_available_impl(self, max_records=max_records, format=format)
 
     def _get_snapshot_before(self, start_us: int, key_id: int = 0):
         """

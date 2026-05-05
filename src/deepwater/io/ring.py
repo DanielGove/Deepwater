@@ -6,8 +6,11 @@ import time
 from multiprocessing import resource_tracker, shared_memory
 from typing import Iterator, Optional
 
+import numpy as np
+
 from ..metadata.feed_registry import FeedRegistry, UINT64_MAX
 from ..metadata.segments import SegmentStore
+from .formatting import format_raw_batch
 
 _DRAIN_REQUEST_FLAG = 1 << 63
 _COUNT_MASK = _DRAIN_REQUEST_FLAG - 1
@@ -63,7 +66,7 @@ class RingBuffer:
     Layout:
       write_pos, start_pos, generation, last_ts, record_count,
       durable_record_count, durable_last_ts, overrun_count, lost_records,
-      followed by the data region.
+    followed by the data region.
     """
 
     _OFF_WRITE_POS = 0
@@ -228,6 +231,11 @@ class RingBuffer:
         self._overrun_count[0] = int(self._overrun_count[0]) & _COUNT_MASK
 
     def close(self, unlink: bool = False) -> None:
+        if unlink:
+            try:
+                self.shm.unlink()
+            except FileNotFoundError:
+                pass
         try:
             self.data.release()
         except Exception:
@@ -252,11 +260,6 @@ class RingBuffer:
         except Exception:
             pass
         self.shm.close()
-        if unlink:
-            try:
-                self.shm.unlink()
-            except FileNotFoundError:
-                pass
 
 
 class RingWriter:
@@ -323,6 +326,7 @@ class RingWriter:
         self._bootstrap_persisted_ring()
         if self._persist:
             self._repair_persisted_chunks_for_recovery()
+            self._bootstrap_persisted_ring()
         if self.segment_store is not None:
             last_ts = int(self._ring_last_ts[0])
             self.segment_store.recover_open_segment(last_ts if last_ts > 0 else None)
@@ -617,6 +621,10 @@ class RingWriter:
         try:
             if self.platform._writers.get(self.feed_name) is self:
                 self.platform._writers.pop(self.feed_name, None)
+            try:
+                self.platform._active_writer_closed(self.feed_name)
+            except Exception:
+                pass
             if self._persist and not any(
                 not bool(getattr(writer, "closed", False))
                 and bool((self.platform.lifecycle(name) or {}).get("persist", True))
@@ -634,6 +642,12 @@ class RingWriter:
 
 class RingReader:
     """Reader that tails a shared-memory ring."""
+    __slots__ = (
+        "platform", "feed_name", "record_format", "_S", "_u64", "_rec_size",
+        "ring_bytes", "_ring_capacity", "_usable_bytes", "ring",
+        "_field_names", "_primary_ts_off", "read_pos", "records_read",
+        "_read_head_seq", "_dtype",
+    )
 
     def __init__(self, platform, feed_name: str):
         self.platform = platform
@@ -667,6 +681,7 @@ class RingReader:
         self.read_pos = 0
         self.records_read = 0
         self._read_head_seq: Optional[int] = None
+        self._dtype = None
 
         state = self.state()
         self.read_pos = state["start_pos"]
@@ -679,6 +694,38 @@ class RingReader:
     @property
     def field_names(self) -> tuple:
         return self._field_names
+
+    @property
+    def record_size(self) -> int:
+        return self._rec_size
+
+    @property
+    def dtype(self):
+        if self._dtype is None:
+            dtype_spec = self.record_format["dtype"].copy()
+            names = dtype_spec["names"]
+            seen = {}
+            unique_names = []
+            for name in names:
+                if name in seen:
+                    seen[name] += 1
+                    unique_names.append(f"{name}_{seen[name]}")
+                else:
+                    seen[name] = 0
+                    unique_names.append(name)
+            dtype_spec["names"] = unique_names
+            self._dtype = np.dtype(dtype_spec)
+        return self._dtype
+
+    def _resolve_ts_key(self, ts_key: Optional[str]) -> int:
+        clock_level = self.record_format.get("clock_level") or 1
+        ts_fields = self.record_format.get("fields", [])[:clock_level]
+        if ts_key is None:
+            return self._primary_ts_off
+        for field in ts_fields:
+            if field["name"] == ts_key:
+                return field["offset"]
+        raise ValueError(f"Timestamp key '{ts_key}' not found, options are: {[f['name'] for f in ts_fields]}")
 
     def state(self) -> dict:
         write_pos, start_pos, generation, last_ts, record_count, durable_record_count, durable_last_ts, overrun_count, lost_records = self.ring.header()
@@ -702,6 +749,22 @@ class RingReader:
         delta = seq - state["earliest_live_seq"]
         return (state["start_pos"] + (delta * self._rec_size)) % self._usable_bytes
 
+    def _timestamp_at_seq(self, state: dict, seq: int, ts_off: int) -> int:
+        pos = self._seq_to_pos(state, seq)
+        return self._u64.unpack_from(self.ring.data, pos + ts_off)[0]
+
+    def _lower_bound_time(self, state: dict, start_seq: int, end_seq: int, ts: int, ts_off: int) -> int:
+        left = int(start_seq)
+        right = int(end_seq)
+        ts_at = self._timestamp_at_seq
+        while left < right:
+            mid = (left + right) // 2
+            if ts_at(state, mid, ts_off) < ts:
+                left = mid + 1
+            else:
+                right = mid
+        return left
+
     def _set_cursor_from_seq(self, seq: int) -> int:
         state = self.state()
         seq = max(int(seq), state["earliest_live_seq"])
@@ -720,6 +783,82 @@ class RingReader:
             return False
         return True
 
+    def _raw_seq_range(
+        self,
+        state: dict,
+        start_seq: int,
+        end_seq: int,
+        *,
+        ts_off: int = 0,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> memoryview:
+        if end_seq <= start_seq:
+            return memoryview(b"")
+
+        if start_time is not None:
+            start_seq = self._lower_bound_time(state, start_seq, end_seq, int(start_time), ts_off)
+        if end_time is not None:
+            end_seq = self._lower_bound_time(state, start_seq, end_seq, int(end_time), ts_off)
+        if end_seq <= start_seq:
+            return memoryview(b"")
+
+        data = self.ring.data
+        rec_sz = self._rec_size
+        usable = self._usable_bytes
+        pos = self._seq_to_pos(state, start_seq)
+
+        nbytes = (end_seq - start_seq) * rec_sz
+        end_pos = pos + nbytes
+        if end_pos <= usable:
+            return memoryview(bytes(data[pos:end_pos]))
+        first = usable - pos
+        raw = bytearray(nbytes)
+        raw[:first] = data[pos:usable]
+        raw[first:] = data[0:end_pos - usable]
+        return memoryview(raw)
+
+    def _raw_seq_batches(
+        self,
+        state: dict,
+        start_seq: int,
+        end_seq: int,
+        *,
+        ts_off: int = 0,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        batch_records: int = 50_000,
+    ):
+        if batch_records <= 0:
+            raise ValueError("batch_records must be positive")
+        if end_seq <= start_seq:
+            return
+
+        if start_time is not None:
+            start_seq = self._lower_bound_time(state, start_seq, end_seq, int(start_time), ts_off)
+        if end_time is not None:
+            end_seq = self._lower_bound_time(state, start_seq, end_seq, int(end_time), ts_off)
+        if end_seq <= start_seq:
+            return
+
+        data = self.ring.data
+        rec_sz = self._rec_size
+        usable = self._usable_bytes
+        pos = self._seq_to_pos(state, start_seq)
+
+        seq = start_seq
+        batch_records_i = int(batch_records)
+        while seq < end_seq:
+            records_until_wrap = (usable - pos) // rec_sz
+            n = min(batch_records_i, end_seq - seq, records_until_wrap)
+            if n <= 0:
+                pos = 0
+                continue
+            end_pos = pos + n * rec_sz
+            yield memoryview(bytes(data[pos:end_pos]))
+            seq += n
+            pos = 0 if end_pos >= usable else end_pos
+
     def _pack_raw(self, records: list[tuple]) -> memoryview:
         if not records:
             return memoryview(b"")
@@ -736,7 +875,7 @@ class RingReader:
         if format == "raw":
             return self._pack_raw(records)
         if format == "numpy":
-            raise NotImplementedError("Ring feeds don't support numpy format (use 'tuple', 'dict', or 'raw')")
+            return np.array(records, dtype=self.dtype) if records else np.array([], dtype=self.dtype)
         raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
 
     def read_seq_range(
@@ -754,6 +893,15 @@ class RingReader:
         end_seq = min(int(end_seq), state["record_count"])
         if end_seq <= start_seq:
             return [] if format != "raw" else memoryview(b"")
+        if format == "raw":
+            return self._raw_seq_range(
+                state,
+                start_seq,
+                end_seq,
+                ts_off=ts_off,
+                start_time=start_time,
+                end_time=end_time,
+            )
 
         data = self.ring.data
         rec_sz = self._rec_size
@@ -766,6 +914,64 @@ class RingReader:
                 records.append(self._S.unpack_from(data, pos))
             pos += rec_sz
         return self._format_records(records, format)
+
+    def read_seq_batches(
+        self,
+        start_seq: int,
+        end_seq: int,
+        *,
+        format: str = "tuple",
+        ts_off: int = 0,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        batch_records: int = 50_000,
+    ):
+        if batch_records <= 0:
+            raise ValueError("batch_records must be positive")
+        state = self.state()
+        start_seq = max(int(start_seq), state["earliest_live_seq"])
+        end_seq = min(int(end_seq), state["record_count"])
+        if end_seq <= start_seq:
+            return
+        if format == "numpy":
+            for raw in self._raw_seq_batches(
+                state,
+                start_seq,
+                end_seq,
+                ts_off=ts_off,
+                start_time=start_time,
+                end_time=end_time,
+                batch_records=batch_records,
+            ):
+                yield format_raw_batch(raw, "numpy", self._S.unpack_from, self._rec_size, self._field_names, self.dtype)
+            return
+        if format == "raw":
+            yield from self._raw_seq_batches(
+                state,
+                start_seq,
+                end_seq,
+                ts_off=ts_off,
+                start_time=start_time,
+                end_time=end_time,
+                batch_records=batch_records,
+            )
+            return
+
+        data = self.ring.data
+        rec_sz = self._rec_size
+        records: list[tuple] = []
+        pos = self._seq_to_pos(state, start_seq)
+        for _seq in range(start_seq, end_seq):
+            if pos + rec_sz > self._usable_bytes:
+                pos = 0
+            if self._record_matches(pos, ts_off, start_time, end_time):
+                records.append(self._S.unpack_from(data, pos))
+                if len(records) >= batch_records:
+                    yield self._format_records(records, format)
+                    records = []
+            pos += rec_sz
+        if records:
+            yield self._format_records(records, format)
 
     def stream_from_seq(
         self,
@@ -786,6 +992,41 @@ class RingReader:
         unpack = self._S.unpack_from
         unpack_u64 = self._u64.unpack_from
         field_names = self._field_names
+
+        if format == "raw":
+            while True:
+                write_pos, start_pos, _generation, _last_ts, record_count, _durable_count, _durable_last_ts, _overrun_count, _lost_records = header()
+                earliest_live_seq = max(0, record_count - ring_capacity)
+                if records_read < earliest_live_seq:
+                    records_read = earliest_live_seq
+                    read_pos = start_pos
+
+                if records_read >= record_count:
+                    _yield_cpu()
+                    continue
+
+                if read_pos >= ring_bytes:
+                    read_pos = 0
+
+                if start_time is not None and unpack_u64(data, read_pos + ts_off)[0] < start_time:
+                    read_pos += rec_sz
+                    records_read += 1
+                    self.read_pos = read_pos
+                    self.records_read = records_read
+                    continue
+
+                end_pos = read_pos + rec_sz
+                record = data[read_pos:end_pos]
+                read_pos = end_pos
+                records_read += 1
+
+                self.read_pos = read_pos
+                self.records_read = records_read
+                yield record
+
+        if format not in {"tuple", "dict", "numpy"}:
+            raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
+        dtype = self.dtype if format == "numpy" else None
 
         while True:
             write_pos, start_pos, _generation, _last_ts, record_count, _durable_count, _durable_last_ts, _overrun_count, _lost_records = header()
@@ -816,30 +1057,89 @@ class RingReader:
                 yield record
             elif format == "dict":
                 yield {field_names[i]: record[i] for i in range(len(field_names))}
-            elif format == "raw":
-                raw = bytearray(self._rec_size)
-                self._S.pack_into(raw, 0, *record)
-                yield memoryview(raw)
-            elif format == "numpy":
-                raise NotImplementedError("Ring feeds don't support numpy format (use 'tuple', 'dict', or 'raw')")
             else:
-                raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
+                yield np.array([record], dtype=dtype)[0]
 
-    def stream(self, start: Optional[int] = None, format: str = "tuple"):
-        if start is not None:
-            raise ValueError("Ring feeds don't support historical start times (start must be None)")
+    def stream(
+        self,
+        start: Optional[int] = None,
+        format: str = "tuple",
+        ts_key: Optional[str] = None,
+        playback: bool = False,
+    ):
+        _ = playback
         state = self.state()
-        return self.stream_from_seq(state["record_count"], format=format, ts_off=self._primary_ts_off)
+        ts_off = self._resolve_ts_key(ts_key)
+        start_seq = state["record_count"]
+        if start is not None:
+            start_seq = self._lower_bound_time(
+                state,
+                state["earliest_live_seq"],
+                state["record_count"],
+                int(start),
+                ts_off,
+            )
+        return self.stream_from_seq(start_seq, format=format, ts_off=ts_off, start_time=start)
 
-    def range(self, start: int, end: int, format: str = "tuple"):
+    def range(
+        self,
+        start: int,
+        end: int,
+        format: str = "tuple",
+        playback: bool = False,
+        ts_key: Optional[str] = None,
+    ):
+        _ = playback
         state = self.state()
         return self.read_seq_range(
             state["earliest_live_seq"],
             state["record_count"],
             format=format,
-            ts_off=self._primary_ts_off,
+            ts_off=self._resolve_ts_key(ts_key),
             start_time=start,
             end_time=end,
+        )
+
+    def iter_raw_range(
+        self,
+        start: int,
+        end: int,
+        *,
+        playback: bool = False,
+        ts_key: Optional[str] = None,
+        batch_records: int = 50_000,
+    ):
+        _ = playback
+        state = self.state()
+        yield from self.read_seq_batches(
+            state["earliest_live_seq"],
+            state["record_count"],
+            format="raw",
+            ts_off=self._resolve_ts_key(ts_key),
+            start_time=start,
+            end_time=end,
+            batch_records=batch_records,
+        )
+
+    def range_batches(
+        self,
+        start: int,
+        end: int,
+        format: str = "tuple",
+        playback: bool = False,
+        ts_key: Optional[str] = None,
+        batch_records: int = 50_000,
+    ):
+        _ = playback
+        state = self.state()
+        yield from self.read_seq_batches(
+            state["earliest_live_seq"],
+            state["record_count"],
+            format=format,
+            ts_off=self._resolve_ts_key(ts_key),
+            start_time=start,
+            end_time=end,
+            batch_records=batch_records,
         )
 
     def _latest_end_us(self, ts_off: int) -> int:
@@ -849,11 +1149,11 @@ class RingReader:
         pos = self._seq_to_pos(state, state["record_count"] - 1)
         return int(self._u64.unpack_from(self.ring.data, pos + ts_off)[0])
 
-    def latest(self, seconds: float = 60.0, format: str = "tuple"):
+    def latest(self, seconds: float = 60.0, format: str = "tuple", ts_key: Optional[str] = None):
         state = self.state()
         if state["record_count"] == 0:
             return [] if format != "raw" else memoryview(b"")
-        end_us = self._latest_end_us(self._primary_ts_off)
+        end_us = self._latest_end_us(self._resolve_ts_key(ts_key))
         if end_us == 0:
             return [] if format != "raw" else memoryview(b"")
         start_us = end_us - int(seconds * 1_000_000)

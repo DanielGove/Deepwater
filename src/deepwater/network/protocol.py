@@ -9,6 +9,26 @@ from typing import Any
 
 MAX_FRAME_BYTES = 512 * 1024 * 1024
 MAX_HEADER_BYTES = 1024 * 1024
+PROTOCOL_VERSION = 1
+DEFAULT_MAX_BATCH_RECORDS = 50_000
+DEFAULT_HEARTBEAT_INTERVAL_S = 5.0
+DEFAULT_STREAM_POLL_INTERVAL_S = 0.01
+DEFAULT_IDLE_TIMEOUT_S = 300.0
+
+SERVER_CAPABILITIES = {
+    "paged_range": True,
+    "heartbeat": True,
+    "resume_stream": False,
+    "multi_reader_session": False,
+}
+
+SERVER_LIMITS = {
+    "max_frame_bytes": MAX_FRAME_BYTES,
+    "max_header_bytes": MAX_HEADER_BYTES,
+    "max_batch_records": DEFAULT_MAX_BATCH_RECORDS,
+    "heartbeat_interval_s": DEFAULT_HEARTBEAT_INTERVAL_S,
+    "idle_timeout_s": DEFAULT_IDLE_TIMEOUT_S,
+}
 
 _FRAME_LEN = struct.Struct("!Q")
 _HEADER_LEN = struct.Struct("!I")

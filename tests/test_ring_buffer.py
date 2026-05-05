@@ -2,6 +2,7 @@
 """Ring (persist=False) path smoke tests with wrap-around."""
 import sys
 import tempfile
+import struct
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -48,8 +49,52 @@ def test_ring_wrap_and_range():
         r.close(); p.close()
 
 
+def test_ring_reader_api_matches_reader_shape():
+    with tempfile.TemporaryDirectory(prefix="dw-ring-api-") as td:
+        base = Path(td)
+        p = Platform(str(base))
+        spec = {
+            "feed_name": "ringapi",
+            "mode": "UF",
+            "fields": [
+                {"name": "ts", "type": "uint64"},
+                {"name": "v", "type": "uint64"},
+            ],
+            "clock_level": 1,
+            "persist": False,
+            "chunk_size_mb": 0.01,
+        }
+        p.create_feed(spec)
+        w = p.create_writer("ringapi")
+        base_ts = 2_000_000
+        for i in range(6):
+            w.write_values(base_ts + i * 10, i)
+        w.close()
+
+        r = p.create_reader("ringapi")
+        try:
+            assert r.range(base_ts + 10, base_ts + 40, playback=True, ts_key="ts") == [
+                (base_ts + 10, 1),
+                (base_ts + 20, 2),
+                (base_ts + 30, 3),
+            ]
+            assert [row["v"] for row in r.range(base_ts + 10, base_ts + 40, format="dict", ts_key="ts")] == [1, 2, 3]
+            assert list(r.range(base_ts + 10, base_ts + 40, format="numpy", ts_key="ts")["v"]) == [1, 2, 3]
+            expected = b"".join(struct.pack("<QQ", base_ts + i * 10, i) for i in range(1, 4))
+            assert bytes(r.range(base_ts + 10, base_ts + 40, format="raw", ts_key="ts")) == expected
+            assert b"".join(bytes(b) for b in r.iter_raw_range(base_ts + 10, base_ts + 40, ts_key="ts", batch_records=2)) == expected
+            assert b"".join(bytes(b) for b in r.range_batches(base_ts + 10, base_ts + 40, format="raw", ts_key="ts", batch_records=2)) == expected
+            stream = r.stream(start=base_ts + 20, ts_key="ts")
+            assert next(stream) == (base_ts + 20, 2)
+        finally:
+            r.close(); p.close()
+
+
 def run_tests():
-    tests = [("ring_wrap_and_range", test_ring_wrap_and_range)]
+    tests = [
+        ("ring_wrap_and_range", test_ring_wrap_and_range),
+        ("ring_reader_api_matches_reader_shape", test_ring_reader_api_matches_reader_shape),
+    ]
     print("Ring Buffer Tests")
     print("=" * 60)
     passed = 0

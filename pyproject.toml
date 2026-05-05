@@ -30,6 +30,7 @@ dev = [
 
 [project.scripts]
 deepwater = "deepwater.cli.bootstrap:main"
+deepwater-agent = "deepwater.network.agent:main"
 deepwater-cleanup = "deepwater.ops.cleanup:main"
 deepwater-health = "deepwater.ops.health_check:main"
 deepwater-repair = "deepwater.ops.repair:main"

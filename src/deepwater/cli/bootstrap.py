@@ -80,7 +80,7 @@ deepwater-datasets \
 On the data machine:
 
 ```bash
-python -m deepwater.network.agent --root /deepwater/data --bind 0.0.0.0:7447
+deepwater-agent --root /deepwater/data --bind 0.0.0.0:7447
 ```
 
 From a laptop on the same tailnet:
@@ -161,6 +161,9 @@ deepwater-feeds --base-path ./data --feed trades
 
 # describe all feeds as JSON (good for tooling/agents)
 deepwater-feeds --base-path ./data --all --json
+
+# same CLI over a remote reader agent
+deepwater-feeds --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --all --json
 ```
 
 ## Automatic Segmentation
@@ -175,6 +178,7 @@ Query it with:
 
 ```bash
 deepwater-segments --base-path ./data --feed trades --status usable --suggest-range
+deepwater-segments --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --feed trades --status usable --suggest-range
 ```
 
 Disconnect/reconnect boundary pattern:
@@ -192,6 +196,7 @@ Use `deepwater-datasets` to avoid manual interval intersection when you have man
 ```bash
 deepwater-datasets --base-path ./data --feeds f1,f2,f3 --json
 deepwater-datasets --base-path ./data --feeds f1,f2,f3 --out ./datasets/train_val.json
+deepwater-datasets --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --feeds f1,f2,f3 --json
 
 # multi-source / multi-base-path
 deepwater-datasets --source A=./data_a --source B=./data_b --feed-ref A:f1 --feed-ref B:f2 --json
@@ -218,6 +223,7 @@ What v0 supports:
 - remote `range(start, end)`
 - remote `latest(seconds)`
 - remote `stream(...)`
+- remote read-side metadata CLI queries
 - tuple/dict/numpy/raw output formats
 
 What v0 does not support:
@@ -229,7 +235,7 @@ What v0 does not support:
 Run the agent on the data machine:
 
 ```bash
-python -m deepwater.network.agent --root /deepwater/data --bind 0.0.0.0:7447
+deepwater-agent --root /deepwater/data --bind 0.0.0.0:7447
 ```
 
 Then read from another tailnet machine:
@@ -330,13 +336,13 @@ Use this only on trusted Tailscale networks. Deepwater Networking v0 is read-onl
 Start agent:
 
 ```bash
-python -m deepwater.network.agent --root "$DEEPWATER_BASE" --bind 0.0.0.0:7447
+deepwater-agent --root "$DEEPWATER_BASE" --bind 0.0.0.0:7447
 ```
 
 If your data root contains multiple Deepwater base paths, point `--root` at their common parent. For example:
 
 ```bash
-python -m deepwater.network.agent --root /deepwater/data --bind 0.0.0.0:7447
+deepwater-agent --root /deepwater/data --bind 0.0.0.0:7447
 ```
 
 Client smoke test from another tailnet machine:

@@ -12,6 +12,7 @@ from typing import Iterator, Optional
 
 import numpy as np
 
+from .formatting import format_raw_batch
 from .reader import ChunkReader
 from .ring import RingBuffer, RingReader, RingWriter, _yield_cpu, ring_buffer_shm_names
 from .writer import ChunkWriter
@@ -430,6 +431,11 @@ def persistent_ring_persister_main(base_path: str) -> None:
         log.info("persister stop base_path=%s pid=%d", base_path, pid)
 
 class PersistentRingReader:
+    __slots__ = (
+        "platform", "feed_name", "record_format", "_ring_reader",
+        "_durable_reader", "_S", "_tail_read_seq", "_dtype",
+    )
+
     def __init__(self, platform, feed_name: str):
         self.platform = platform
         self.feed_name = feed_name
@@ -447,6 +453,8 @@ class PersistentRingReader:
 
     @staticmethod
     def _durable_not_ready(exc: Exception) -> bool:
+        if isinstance(exc, ValueError) and "Timestamp key" in str(exc):
+            return False
         return isinstance(exc, (FileNotFoundError, ValueError, RuntimeError))
 
     def _get_ring_reader(self) -> RingReader:
@@ -492,6 +500,36 @@ class PersistentRingReader:
             if not self._durable_not_ready(exc):
                 raise
             return []
+
+    def _durable_raw_batches(
+        self,
+        start: int,
+        end: int,
+        *,
+        playback: bool = False,
+        ts_key: Optional[str] = None,
+        batch_records: int = 50_000,
+    ):
+        if end <= start:
+            return
+        durable = self._get_durable_reader()
+        if hasattr(durable, "iter_raw_range"):
+            yield from durable.iter_raw_range(
+                start,
+                end,
+                playback=playback,
+                ts_key=ts_key,
+                batch_records=batch_records,
+            )
+            return
+        yield from durable.range_batches(
+            start,
+            end,
+            format="raw",
+            playback=playback,
+            ts_key=ts_key,
+            batch_records=batch_records,
+        )
 
     def _format_records(self, records: list[tuple], format: str):
         if format == "tuple":
@@ -578,6 +616,25 @@ class PersistentRingReader:
         durable_seq = int(ring_state["durable_record_count"])
         durable_last_ts = int(ring_state["durable_last_ts"])
         if start is not None and durable_seq > 0 and durable_last_ts and start <= durable_last_ts:
+            if format == "raw":
+                for batch in self._durable_raw_batches(
+                    start,
+                    durable_last_ts + 1,
+                    playback=playback,
+                    ts_key=ts_key,
+                ):
+                    data = memoryview(batch).cast("B")
+                    rec_size = self.record_size
+                    for pos in range(0, data.nbytes, rec_size):
+                        yield data[pos:pos + rec_size]
+                yield from self._get_ring_reader().stream_from_seq(
+                    durable_seq,
+                    format=format,
+                    ts_off=ts_off,
+                    start_time=start,
+                )
+                return
+
             historical = self._read_durable_tuples(
                 start,
                 durable_last_ts + 1,
@@ -593,11 +650,6 @@ class PersistentRingReader:
             elif format == "numpy":
                 for record in self._format_records(historical, "numpy"):
                     yield record
-            elif format == "raw":
-                for record in historical:
-                    raw = bytearray(self.record_size)
-                    self._S.pack_into(raw, 0, *record)
-                    yield memoryview(raw)
             else:
                 raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
 
@@ -616,30 +668,117 @@ class PersistentRingReader:
         playback: bool = False,
         ts_key: Optional[str] = None,
     ):
-        ring_state = self._ring_state()
-        ts_off = self._resolve_ts_key(ts_key)
-        durable_records: list[tuple] = []
-        ring_records: list[tuple] = []
-
-        if ring_state is None:
-            return self._format_records(
-                self._read_durable_tuples(start, end, playback=playback, ts_key=ts_key),
-                format,
+        if format not in {"tuple", "dict", "numpy", "raw"}:
+            raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
+        raw = memoryview(b"".join(
+            bytes(batch)
+            for batch in self.iter_raw_range(
+                start,
+                end,
+                playback=playback,
+                ts_key=ts_key,
             )
+        ))
+        return format_raw_batch(
+            raw,
+            format,
+            self._S.unpack_from,
+            self.record_size,
+            self.field_names,
+            self.dtype if format == "numpy" else None,
+        )
+
+    def iter_raw_range(
+        self,
+        start: int,
+        end: int,
+        *,
+        playback: bool = False,
+        ts_key: Optional[str] = None,
+        batch_records: int = 50_000,
+    ):
+        if batch_records <= 0:
+            raise ValueError("batch_records must be positive")
+
+        ring_state = self._ring_state()
+        if ring_state is None:
+            try:
+                yield from self._durable_raw_batches(
+                    start,
+                    end,
+                    playback=playback,
+                    ts_key=ts_key,
+                    batch_records=batch_records,
+                )
+            except Exception as exc:
+                if not self._durable_not_ready(exc):
+                    raise
+            return
 
         durable_seq = int(ring_state["durable_record_count"])
         if durable_seq > 0:
-            durable_records = self._read_durable_tuples(start, end, playback=playback, ts_key=ts_key)
-        if ring_state["record_count"] > durable_seq:
-            ring_records = self._get_ring_reader().read_seq_range(
-                durable_seq,
-                ring_state["record_count"],
-                format="tuple",
-                ts_off=ts_off,
-                start_time=start,
-                end_time=end,
+            try:
+                yield from self._durable_raw_batches(
+                    start,
+                    end,
+                    playback=playback,
+                    ts_key=ts_key,
+                    batch_records=batch_records,
+                )
+            except Exception as exc:
+                if not self._durable_not_ready(exc):
+                    raise
+
+        if ring_state["record_count"] <= durable_seq:
+            return
+
+        yield from self._get_ring_reader().read_seq_batches(
+            durable_seq,
+            ring_state["record_count"],
+            format="raw",
+            ts_off=self._resolve_ts_key(ts_key),
+            start_time=start,
+            end_time=end,
+            batch_records=batch_records,
+        )
+
+    def range_batches(
+        self,
+        start: int,
+        end: int,
+        format: str = "tuple",
+        playback: bool = False,
+        ts_key: Optional[str] = None,
+        batch_records: int = 50_000,
+    ):
+        if batch_records <= 0:
+            raise ValueError("batch_records must be positive")
+        if format not in {"tuple", "dict", "numpy", "raw"}:
+            raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
+        if format == "raw":
+            yield from self.iter_raw_range(
+                start,
+                end,
+                playback=playback,
+                ts_key=ts_key,
+                batch_records=batch_records,
             )
-        return self._format_records(durable_records + ring_records, format)
+            return
+        for raw in self.iter_raw_range(
+            start,
+            end,
+            playback=playback,
+            ts_key=ts_key,
+            batch_records=batch_records,
+        ):
+            yield format_raw_batch(
+                raw,
+                format,
+                self._S.unpack_from,
+                self.record_size,
+                self.field_names,
+                self.dtype if format == "numpy" else None,
+            )
 
     def latest(self, seconds: float = 60.0, format: str = "tuple", ts_key: Optional[str] = None):
         ring_state = self._ring_state()
@@ -677,10 +816,12 @@ class PersistentRingReader:
         records = self._get_ring_reader().read_seq_range(
             self._tail_read_seq,
             end_seq,
-            format="tuple",
+            format="raw" if format == "raw" else "tuple",
             ts_off=self._resolve_ts_key(None),
         )
         self._tail_read_seq = end_seq
+        if format == "raw":
+            return records
         return self._format_records(records, format)
 
     def close(self) -> None:

@@ -2,14 +2,21 @@
 
 Deepwater Networking v0 is a Tailscale-first remote reader and agent system. It is intentionally small: a TCP agent runs next to the local Deepwater data directory, and a client on another tailnet machine asks that agent to open a local reader and return records.
 
+For the production-oriented roadmap, see `network_v1_plan.md`.
+
+Deepwater does not manage Tailscale or any other network substrate. MagicDNS names such as `deepwater-pioneer` work because they resolve to an address the client can reach; the protocol only requires TCP connectivity to the configured port.
+
 ## What Works
 
 - Remote `range(start, end)`
+- Remote `range_batches(start, end)` for incremental historical reads
 - Remote `latest(seconds)`
+- Remote `read_available(...)`
 - Remote `stream(...)`
 - Tuple, dict, numpy, and raw formats on the client side
 - Local fallback through `dw.reader(local_path, stream="feed")`
 - Path guard on the agent so clients cannot open data outside `--root`
+- Protocol handshake with advertised server capabilities and limits
 
 ## What Does Not Exist in v0
 
@@ -74,7 +81,7 @@ Plain paths are local:
 Run this on the data machine:
 
 ```bash
-PYTHONPATH=src python -m deepwater.network.agent \
+deepwater-agent \
   --root /deepwater/data \
   --bind 0.0.0.0:7447
 ```
@@ -86,6 +93,19 @@ Binding notes:
 - `0.0.0.0:7447` is convenient when host firewall/Tailscale policy limits reachability.
 - Binding directly to a Tailscale IP is also fine if you want the process reachable only on that interface.
 - Deepwater does not create firewall rules or Tailscale ACLs.
+
+## CLI Metadata Over Remote Paths
+
+Read-only metadata CLIs use `Platform(...)`, so they accept the same remote locator syntax as application code:
+
+```bash
+deepwater-feeds --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node
+deepwater-feeds --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --feed trades --json
+deepwater-segments --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --feed trades --status usable --suggest-range
+deepwater-datasets --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --feed trades --json
+```
+
+These commands request metadata from the agent; they do not copy files. Mutating/admin CLIs remain local-only in v0 because the protocol does not yet define remote write, delete, repair, cleanup, or health-check operations.
 
 ## Client
 
@@ -101,6 +121,29 @@ records = reader.latest(60)
 window = reader.range(start_us, end_us, format="dict")
 
 reader.close()
+```
+
+Platform facade form:
+
+```python
+from deepwater import Platform
+
+p = Platform("deepwater-pioneer:/deepwater/data/hyperliquid-node")
+assert p.feed_exists("trades")
+print(p.describe_feed("trades"))
+
+reader = p.create_reader("trades")
+records = reader.latest(60)
+reader.close()
+p.close()
+```
+
+Paged historical read:
+
+```python
+with dw.reader("deepwater-pioneer:/deepwater/data/hyperliquid-node", stream="trades") as reader:
+    for batch in reader.range_batches(start_us, end_us, batch_records=50_000):
+        process(batch)
 ```
 
 Context manager form:
@@ -134,23 +177,43 @@ Control metadata is JSON. Data payloads are binary raw Deepwater record bytes. T
 
 Operations:
 
+- `HELLO`
 - `PING`
 - `OPEN_READER`
+- `LIST_FEEDS`
+- `FEED_EXISTS`
+- `DESCRIBE_FEED`
+- `LIFECYCLE`
+- `RECORD_FORMAT`
+- `LIST_SEGMENTS`
+- `SUGGESTED_READER_RANGE`
 - `READ_RANGE`
+- `READ_RANGE_PAGE`
 - `LATEST`
+- `READ_AVAILABLE`
 - `SUBSCRIBE_LIVE`
+- `HEARTBEAT`
 - `CLOSE`
 - `ERROR`
 - `DATA`
+- `RANGE_END`
+
+Live-only remote streams emit lightweight `HEARTBEAT` frames while idle. Clients ignore them for normal iteration but emit status callbacks, and failed heartbeat writes let the agent clean up dead peers instead of keeping silent stream handlers alive.
 
 ## Status Events
 
 The client/agent use structured event names in logs and callbacks:
 
 - `DW_REMOTE_LINK_OPEN`
+- `DW_REMOTE_LINK_CLOSED`
 - `DW_REMOTE_LINK_DOWN`
+- `DW_REMOTE_HEARTBEAT`
 - `DW_REMOTE_READ_ERROR`
+- `DW_REMOTE_STREAM_SUBSCRIBED`
 - `DW_REMOTE_AGENT_STARTED`
+- `DW_REMOTE_AGENT_CONNECTED`
+- `DW_REMOTE_AGENT_DISCONNECTED`
+- `DW_REMOTE_AGENT_HEARTBEAT`
 - `DW_REMOTE_AGENT_REJECTED_PATH`
 
 Pass `status_callback=` to `dw.reader(...)` or `RemoteReader(...)` when a process wants to route these into its own telemetry.
