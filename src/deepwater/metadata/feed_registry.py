@@ -2,6 +2,7 @@ import os
 import struct
 import mmap
 import fcntl
+import time
 from typing import Iterator, Optional
 
 # Only keep struct for initial setup - eliminate from hot paths
@@ -195,10 +196,15 @@ class FeedRegistry:
                 )
 
             if self.is_writer:
-                try:
-                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError as exc:
-                    raise RuntimeError("Feed registry locked by another writer") from exc
+                deadline = time.monotonic() + 2.0
+                while True:
+                    try:
+                        fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError as exc:
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("Feed registry locked by another writer") from exc
+                        time.sleep(0.01)
 
                 if current_size < desired_size:
                     os.posix_fallocate(self.fd, 0, desired_size)

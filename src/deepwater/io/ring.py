@@ -271,6 +271,7 @@ class RingWriter:
         self._segment_tracking = bool(self.feed_config.get("segment_tracking", True))
         self._prefault_ring = bool(self.feed_config.get("prefault_ring", True))
         self._writer_lock_fd = None
+        self._closed = False
 
         self._S = struct.Struct(self.record_format["fmt"])
         self._u64 = struct.Struct("<Q")
@@ -320,6 +321,8 @@ class RingWriter:
         self._usable_bytes = self._ring_capacity * self._rec_size
         self.segment_store = SegmentStore(platform.base_path / "data" / feed_name, feed_name) if self._segment_tracking else None
         self._bootstrap_persisted_ring()
+        if self._persist:
+            self._repair_persisted_chunks_for_recovery()
         if self.segment_store is not None:
             last_ts = int(self._ring_last_ts[0])
             self.segment_store.recover_open_segment(last_ts if last_ts > 0 else None)
@@ -328,6 +331,14 @@ class RingWriter:
         else:
             self._segment_note_write = lambda *_a, **_k: None
             self._segment_note_batch = lambda *_a, **_k: None
+
+    @property
+    def closed(self) -> bool:
+        return bool(self._closed)
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError(f"ring writer is closed for feed '{self.feed_name}'")
 
     def _prefault_ring_pages(self) -> None:
         try:
@@ -372,6 +383,33 @@ class RingWriter:
                     durable_count,
                 )
 
+    def _repair_persisted_chunks_for_recovery(self) -> None:
+        reg_path = self.platform.feed_dir(self.feed_name) / f"{self.feed_name}.reg"
+        if not reg_path.exists():
+            return
+        try:
+            from ..ops import repair
+
+            registry = FeedRegistry(reg_path, mode="w")
+        except Exception:
+            return
+        try:
+            latest_idx = registry.get_latest_chunk_idx() or 0
+            for chunk_id in range(1, int(latest_idx) + 1):
+                meta = registry.get_chunk_metadata(chunk_id)
+                try:
+                    repair.validate_and_repair_chunk(
+                        chunk_id=chunk_id,
+                        meta=meta,
+                        feed_name=self.feed_name,
+                        feed_dir=self.platform.feed_dir(self.feed_name),
+                        record_format=self.record_format,
+                    )
+                finally:
+                    meta.release()
+        finally:
+            registry.close()
+
     def _wait_for_persisted_space(self, needed_records: int) -> None:
         while (
             self._persist
@@ -397,6 +435,7 @@ class RingWriter:
         return write_pos, next_write_pos, start_pos, generation, new_record_count
 
     def _write_bytes(self, payload: bytes, last_ts: int) -> int:
+        self._ensure_open()
         if len(payload) != self._rec_size:
             raise ValueError(f"record length {len(payload)} != expected {self._rec_size}")
         while self._persist and int(self._ring_record_count[0]) - int(self._ring_durable_record_count[0]) >= self._ring_capacity:
@@ -418,6 +457,7 @@ class RingWriter:
         return next_write_pos
 
     def write(self, timestamp: int, record_data: bytes, create_index: bool = False) -> int:
+        self._ensure_open()
         _ = create_index
         while self._persist and int(self._ring_record_count[0]) - int(self._ring_durable_record_count[0]) >= self._ring_capacity:
             _yield_cpu()
@@ -440,6 +480,7 @@ class RingWriter:
     write_fast = write
 
     def write_values(self, *vals, create_index: bool = False) -> int:
+        self._ensure_open()
         _ = create_index
         last_ts = vals[self._ts_idx] if self._ts_idx is not None else 0
         while self._persist and int(self._ring_record_count[0]) - int(self._ring_durable_record_count[0]) >= self._ring_capacity:
@@ -470,6 +511,7 @@ class RingWriter:
         return self.write_values(*vals, create_index=create_index)
 
     def write_batch_bytes(self, data: bytes) -> int:
+        self._ensure_open()
         rec_sz = self._rec_size
         n = len(data)
         if n == 0 or n % rec_sz != 0:
@@ -514,6 +556,7 @@ class RingWriter:
         return end_pos
 
     def resize(self, new_size_bytes: int):
+        self._ensure_open()
         if new_size_bytes <= 0:
             raise ValueError("new ring size must be > 0")
         try:
@@ -540,6 +583,9 @@ class RingWriter:
         self._bootstrap_persisted_ring()
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         if self._persist:
             if int(self._ring_durable_record_count[0]) < int(self._ring_record_count[0]):
                 self.ring.request_drain()
@@ -568,6 +614,17 @@ class RingWriter:
             except Exception:
                 pass
             self._writer_lock_fd = None
+        try:
+            if self.platform._writers.get(self.feed_name) is self:
+                self.platform._writers.pop(self.feed_name, None)
+            if self._persist and not any(
+                not bool(getattr(writer, "closed", False))
+                and bool((self.platform.lifecycle(name) or {}).get("persist", True))
+                for name, writer in self.platform._writers.items()
+            ):
+                self.platform._stop_persistent_ring_persister()
+        except Exception:
+            pass
 
     def mark_segment_boundary(self, reason: str = "disconnect") -> bool:
         if self.segment_store is None:

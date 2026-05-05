@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from deepwater import Platform
+from deepwater.io.ring import ring_buffer_shm_names
 
 
 def test_delete_persistent_feed_removes_all_state_and_allows_recreate():
@@ -84,7 +85,8 @@ def test_delete_ring_feed_unlinks_shared_memory_and_registry_entry():
         w = p.create_writer("live")
         w.write_values(1_000_000, 1)
 
-        shm = shared_memory.SharedMemory(name="live", create=False)
+        shm_name = ring_buffer_shm_names(base, "live")[0]
+        shm = shared_memory.SharedMemory(name=shm_name, create=False)
         shm.close()
 
         removed = p.delete_feed("live")
@@ -94,7 +96,7 @@ def test_delete_ring_feed_unlinks_shared_memory_and_registry_entry():
         assert not (base / "data" / "live").exists()
 
         try:
-            shared_memory.SharedMemory(name="live", create=False)
+            shared_memory.SharedMemory(name=shm_name, create=False)
             raise AssertionError("ring shared memory still exists after delete")
         except FileNotFoundError:
             pass

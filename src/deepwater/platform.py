@@ -25,6 +25,13 @@ from .metadata.datasets import common_intervals, with_duration, recommend_train_
 from . import __version__
 
 
+def _mb_to_bytes(value, *, default: float) -> int:
+    mb = float(default if value is None else value)
+    if mb <= 0:
+        raise ValueError("size in MB must be > 0")
+    return max(1, int(mb * 1024 * 1024))
+
+
 class Platform:
     """
     Deepwater platform - zero-copy market data substrate.
@@ -284,10 +291,15 @@ class Platform:
         fdir.mkdir(parents=True, exist_ok=False)
 
         persist = bool(spec.get("persist", True))
-        chunk_size_mb = int(spec.get("chunk_size_mb", 64))
-        chunk_size_bytes = chunk_size_mb * 1024 * 1024
-        ring_size_mb = int(spec.get("ring_size_mb", max(8, chunk_size_mb * 8)))
-        ring_size_bytes = ring_size_mb * 1024 * 1024
+        chunk_size_mb = float(spec.get("chunk_size_mb", 64))
+        chunk_size_bytes = _mb_to_bytes(chunk_size_mb, default=64)
+        if "ring_size_mb" in spec:
+            ring_size_mb = float(spec["ring_size_mb"])
+        elif persist:
+            ring_size_mb = max(8.0, chunk_size_mb * 8.0)
+        else:
+            ring_size_mb = chunk_size_mb
+        ring_size_bytes = _mb_to_bytes(ring_size_mb, default=ring_size_mb)
 
         # 2) build & persist layout.json atomically
         # Let layout builder perform schema validation (clock_level, field ordering, etc.)
@@ -354,15 +366,26 @@ class Platform:
             >>> writer.close()
         """
         w = self._writers.get(feed_name)
+        if w is not None and bool(getattr(w, "closed", False)):
+            self._writers.pop(feed_name, None)
+            w = None
         if w is None:
             lifecycle = self.lifecycle(feed_name)
             if lifecycle is None:
                 raise KeyError(feed_name)
-            if lifecycle.get("persist", True):
-                if not self._ensure_persistent_ring_persister():
-                    raise RuntimeError(f"persistent ring persister unavailable for feed '{feed_name}'")
             w = RingWriter(self, feed_name)
             self._writers[feed_name] = w
+            if lifecycle.get("persist", True):
+                if (
+                    not self._ensure_persistent_ring_persister()
+                    or not self._wait_persistent_feed_ready(feed_name)
+                ):
+                    self._writers.pop(feed_name, None)
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"persistent ring persister unavailable for feed '{feed_name}'")
         return w
     
     def create_reader(self, feed_name: str):
@@ -471,6 +494,11 @@ class Platform:
         self.close_writer(feed_name)
         self.close_reader(feed_name)
 
+        lifecycle = self.lifecycle(feed_name) or {}
+        stopped_local_persister = False
+        if lifecycle.get("persist", True):
+            stopped_local_persister = self._stop_persistent_ring_persister()
+
         # Protect against deleting a feed while another process is actively writing.
         self._assert_no_external_writer(feed_name)
 
@@ -483,6 +511,11 @@ class Platform:
         removed_from_registry = self.registry.unregister_feed(feed_name)
         self._lifecycle_cache.pop(feed_name, None)
         self._record_format_cache.pop(feed_name, None)
+        if stopped_local_persister and any(
+            (self.lifecycle(name) or {}).get("persist", True)
+            for name in self._writers
+        ):
+            self._ensure_persistent_ring_persister()
         return bool(on_disk or removed_from_registry)
 
     # -------------------------------------------------------------------------
@@ -809,7 +842,44 @@ class Platform:
             return True
         log.error("persistent ring persister failed to start for %s", self.base_path)
         return False
-    
+
+    def _stop_persistent_ring_persister(self) -> bool:
+        if self._persister_process is None:
+            return False
+        proc = self._persister_process
+        self._persister_process = None
+        if proc.poll() is not None:
+            return True
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        return True
+
+    def _wait_persistent_feed_ready(self, feed_name: str, timeout: float = 2.0) -> bool:
+        from .metadata.feed_registry import FeedRegistry
+
+        reg_path = self.feed_dir(feed_name) / f"{feed_name}.reg"
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            try:
+                if reg_path.exists() and reg_path.stat().st_size > 0:
+                    reg = FeedRegistry(str(reg_path), mode="r")
+                    try:
+                        if reg.get_latest_chunk_idx() is not None:
+                            return True
+                    finally:
+                        reg.close()
+            except Exception:
+                pass
+            time.sleep(0.01)
+        return False
+
     def close(self):
         """
         Close all writers, readers, and registries.
@@ -840,16 +910,7 @@ class Platform:
                 pass
         self._readers = dict()
 
-        if self._persister_process is not None:
-            try:
-                self._persister_process.terminate()
-                self._persister_process.wait(timeout=5)
-            except Exception:
-                try:
-                    self._persister_process.kill()
-                except Exception:
-                    pass
-            self._persister_process = None
+        self._stop_persistent_ring_persister()
 
         try:
             self.registry.close()

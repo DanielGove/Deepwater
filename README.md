@@ -36,6 +36,7 @@ This creates a local `./deepwater-starter` folder with:
 Also includes segmentation guidance so you can quickly answer:
 - what segments exist?
 - what timestamp range should be passed to readers/backtests?
+- how to run a Tailscale-scoped remote read agent and connect to it from another machine?
 
 Optional:
 
@@ -96,6 +97,53 @@ help(Platform)
 help(reader.stream)
 help(reader.range)
 ```
+
+---
+
+## Remote Reading (Tailscale-First)
+
+Deepwater Networking v0 is a small remote reader path for machines on the same Tailscale tailnet. It does not manage Tailscale, VPN routing, public TLS, NAT, Mullvad, or port forwarding. Access control for v0 is the network boundary: bind the agent only where trusted tailnet clients can reach it.
+
+Current scope:
+- remote reads: supported via `range()`, `latest()`, and `stream()`
+- remote writes: not supported in v0; writers remain local to the data machine
+- transport: TCP, length-prefixed frames, JSON control header plus optional binary payload
+- payload: Deepwater raw record bytes where possible, decoded by the client into tuple/dict/numpy/raw formats
+
+### Start the Agent on the Data Machine
+
+```bash
+PYTHONPATH=src python -m deepwater.network.agent \
+  --root /deepwater/data \
+  --bind 0.0.0.0:7447
+```
+
+The agent accepts remote base paths under `--root` only. For example, with `--root /deepwater/data`, a client may open `/deepwater/data/hyperliquid-node`, but paths outside `/deepwater/data` are rejected.
+
+### Read from a Laptop
+
+```python
+import deepwater as dw
+
+reader = dw.reader(
+    "deepwater-pioneer:/deepwater/data/hyperliquid-node",
+    stream="hl.status.events",
+)
+
+recent = reader.latest(60)
+window = reader.range(start_us, end_us, format="dict")
+reader.close()
+```
+
+Custom port form:
+
+```python
+reader = dw.reader("dw://deepwater-pioneer:7447/deepwater/data/hyperliquid-node", stream="trades")
+```
+
+`dw.reader(local_path, stream="feed")` also works for local paths and returns a managed local reader. Use `Platform(...)` directly when you need local writer APIs.
+
+See `network.md` for the architecture and `examples/network_remote_read.py` for a runnable client script.
 
 ---
 

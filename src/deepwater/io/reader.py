@@ -908,24 +908,35 @@ class ChunkReader:
                 idx_obj = self._chunk_index
             else:
                 idx_path = self.data_dir / f"chunk_{cid:08d}.idx"
-                if not idx_path.exists():
-                    continue
-                try:
-                    idx_obj = ChunkIndex.open_file(str(idx_path))
-                    close_after = True
-                except FileNotFoundError:
-                    continue
+                if idx_path.exists():
+                    try:
+                        idx_obj = ChunkIndex.open_file(str(idx_path))
+                        close_after = True
+                    except FileNotFoundError:
+                        idx_obj = None
 
-            rec = idx_obj.get_latest_at_or_before(start_us, ts_idx=key_id)
-            if rec is None:
+            if idx_obj is not None:
+                rec = idx_obj.get_latest_at_or_before(start_us, ts_idx=key_id)
+                if rec is not None:
+                    ts = (rec.ts0, rec.ts1, rec.ts2)[key_id]
+                    rec.release()
+                    if close_after:
+                        idx_obj.close_file()
+                    return ts
                 if close_after:
                     idx_obj.close_file()
+
+            try:
+                self._open_chunk(cid)
+            except FileNotFoundError:
                 continue
-            ts = (rec.ts0, rec.ts1, rec.ts2)[key_id]
-            rec.release()
-            if close_after:
-                idx_obj.close_file()
-            return ts
+            ts_off = self._ts_fields[key_id]["offset"]
+            pos = self._binary_search_start(start_us + 1, ts_off) - self._rec_size
+            if pos < 0:
+                continue
+            ts = int.from_bytes(self._chunk.buffer[pos + ts_off:pos + ts_off + 8], "little")
+            if ts <= start_us:
+                return ts
         return None
 
     def close(self) -> None:

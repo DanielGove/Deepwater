@@ -73,12 +73,13 @@ def _reader_state(reader) -> Optional[dict]:
     return None
 
 
-def check_feeds(base_path: Path) -> Tuple[bool, str, list[dict]]:
+def check_feeds(base_path: Path, *, include_details: bool = False):
     """Verify feed registries/readers are readable and rings are not dropping data."""
     from deepwater import Platform
 
     if not (base_path / "data").exists():
-        return True, "no feeds yet", []
+        result = (True, "no feeds yet", [])
+        return result if include_details else result[:2]
 
     platform = Platform(str(base_path))
     issues = []
@@ -104,10 +105,9 @@ def check_feeds(base_path: Path) -> Tuple[bool, str, list[dict]]:
             }
 
             if persist and not reg_file.exists():
-                detail["healthy"] = False
-                detail["error"] = "registry missing"
+                detail["healthy"] = True
+                detail["ring_present"] = False
                 details.append(detail)
-                issues.append(f"{feed_name}: registry missing")
                 continue
 
             try:
@@ -144,24 +144,26 @@ def check_feeds(base_path: Path) -> Tuple[bool, str, list[dict]]:
             details.append(detail)
 
         owner = platform.registry.get_persistent_ring_owner()
-        if persistent_feed_count and (not owner.get("healthy") or owner.get("stale")):
+        if live_ring_count and persistent_feed_count and (not owner.get("healthy") or owner.get("stale")):
             issues.append(
                 "persistent ring owner unhealthy"
                 f" (pid={owner.get('pid')} alive={owner.get('alive')} stale={owner.get('stale')})"
             )
 
         if issues:
-            return (
+            result = (
                 False,
                 f"{len(feed_names)} feeds checked, {len(issues)} issues, {live_ring_count} live rings",
                 details,
             )
+            return result if include_details else result[:2]
 
-        return (
+        result = (
             True,
             f"{len(feed_names)} feeds checked, 0 issues, {live_ring_count} live rings",
             details,
         )
+        return result if include_details else result[:2]
     finally:
         platform.close()
 
@@ -246,7 +248,7 @@ def main():
     
     # Optional checks
     if args.check_feeds:
-        feeds_healthy, feeds_message, feed_details = check_feeds(base_path)
+        feeds_healthy, feeds_message, feed_details = check_feeds(base_path, include_details=True)
         checks.append(("Feeds", (feeds_healthy, feeds_message)))
     else:
         feed_details = []

@@ -75,6 +75,25 @@ deepwater-datasets \
   --json
 ```
 
+8) Optional remote read over Tailscale:
+
+On the data machine:
+
+```bash
+python -m deepwater.network.agent --root /deepwater/data --bind 0.0.0.0:7447
+```
+
+From a laptop on the same tailnet:
+
+```python
+import deepwater as dw
+
+with dw.reader("deepwater-pioneer:/deepwater/data/hyperliquid-node", stream="trades") as reader:
+    print(reader.latest(60))
+```
+
+Networking v0 is read-only. Writers still run locally on the data machine.
+
 ## If You Need a Hard Reset
 
 ```bash
@@ -190,6 +209,62 @@ Use `apps/quickstart_app.py` as your baseline:
 3) Write tuples in feed schema order.
 4) Read with `latest()` or `range()`.
 5) Close readers/writers/platform.
+
+## Remote Reads over Tailscale
+
+Deepwater Networking v0 lets a laptop or another tailnet machine read from a Deepwater base path on a server. It assumes both machines are already on the same Tailscale tailnet.
+
+What v0 supports:
+- remote `range(start, end)`
+- remote `latest(seconds)`
+- remote `stream(...)`
+- tuple/dict/numpy/raw output formats
+
+What v0 does not support:
+- remote writes
+- public internet mode
+- TLS/auth/user management inside Deepwater
+- Tailscale CLI, Mullvad, NAT, or port forwarding management
+
+Run the agent on the data machine:
+
+```bash
+python -m deepwater.network.agent --root /deepwater/data --bind 0.0.0.0:7447
+```
+
+Then read from another tailnet machine:
+
+```python
+import deepwater as dw
+
+reader = dw.reader(
+    "deepwater-pioneer:/deepwater/data/hyperliquid-node",
+    stream="trades",
+)
+
+recent = reader.latest(60)
+window = reader.range(start_us, end_us, format="dict")
+reader.close()
+```
+
+Custom port form:
+
+```python
+reader = dw.reader("dw://deepwater-pioneer:7447/deepwater/data/hyperliquid-node", stream="trades")
+```
+
+Architecture summary:
+
+```text
+client dw.reader("host:/base", stream="feed")
+  -> TCP 7447 over Tailscale
+  -> deepwater.network.agent
+  -> Platform("/base").create_reader("feed")
+  -> raw Deepwater record bytes
+  -> client decodes tuple/dict/numpy/raw
+```
+
+The agent rejects paths outside `--root`. Keep writes and ingestion on the machine that owns the Deepwater data directory.
 """
 
 
@@ -247,6 +322,39 @@ deepwater-create-feed --base-path "$DEEPWATER_BASE" --config-dir ./configs
 2) Validate process status in your supervisor/systemd.
 3) If safe and in dev/test, perform feed reset using commands above.
 4) Re-run integration script: `python ./apps/quickstart_app.py`.
+
+## Remote Read Agent
+
+Use this only on trusted Tailscale networks. Deepwater Networking v0 is read-only and does not implement public TLS or app-level authentication.
+
+Start agent:
+
+```bash
+python -m deepwater.network.agent --root "$DEEPWATER_BASE" --bind 0.0.0.0:7447
+```
+
+If your data root contains multiple Deepwater base paths, point `--root` at their common parent. For example:
+
+```bash
+python -m deepwater.network.agent --root /deepwater/data --bind 0.0.0.0:7447
+```
+
+Client smoke test from another tailnet machine:
+
+```bash
+python - <<'PY'
+import deepwater as dw
+
+with dw.reader("deepwater-pioneer:/deepwater/data/hyperliquid-node", stream="trades") as r:
+    print(r.latest(60)[:3])
+PY
+```
+
+Troubleshooting:
+- `connection refused`: agent is not running, wrong host, wrong port, or firewall/Tailscale ACL blocks it.
+- `remote path rejected outside agent root`: requested base path is not under `--root`.
+- `feed not found`: agent reached the base path, but that feed is not registered there.
+- `DW_REMOTE_READ_ERROR`: check agent logs and local feed health.
 """
 
 

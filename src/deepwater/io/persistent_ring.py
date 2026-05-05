@@ -6,6 +6,7 @@ import signal
 import struct
 import sys
 import time
+import fcntl
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -149,6 +150,26 @@ def _target_flush_records(ring: RingBuffer, writer: ChunkWriter, record_size: in
     max_batch_records = min(chunk_records, capacity_records)
     target_records = min(max_batch_records, max(1, capacity_records // 2))
     return target_records, max_batch_records
+
+
+def _feed_writer_lock_active(platform, feed_name: str) -> bool:
+    lock_path = platform.feed_dir(feed_name) / f"{feed_name}.writer.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        fd = os.open(lock_path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+    finally:
+        os.close(fd)
 
 
 def _persist_feed(
@@ -302,11 +323,16 @@ def persistent_ring_persister_main(base_path: str) -> None:
                 last_heartbeat = now
 
             did_work = False
+            saw_active_writer = False
+            saw_pending_records = False
             for feed_name in platform.list_feeds():
                 try:
                     lifecycle = platform.lifecycle(feed_name) or {}
                     if not lifecycle.get("persist", False):
                         continue
+                    writer_active = _feed_writer_lock_active(platform, feed_name)
+                    if writer_active:
+                        saw_active_writer = True
                     record_format = platform.get_record_format(feed_name)
 
                     ring = rings.get(feed_name)
@@ -347,13 +373,15 @@ def persistent_ring_persister_main(base_path: str) -> None:
                         record_sizes[feed_name],
                     )
                     pending_records = snapshot_count - durable_count
+                    if pending_records > 0:
+                        saw_pending_records = True
                     if pending_records <= 0:
                         if ring.drain_requested():
                             ring.clear_drain_request()
                         continue
 
                     target_records, _ = _target_flush_records(ring, writer, record_sizes[feed_name])
-                    if pending_records < target_records and not ring.drain_requested():
+                    if pending_records < target_records and not ring.drain_requested() and writer_active:
                         continue
 
                     if _persist_feed(
@@ -371,6 +399,8 @@ def persistent_ring_persister_main(base_path: str) -> None:
                             ring.clear_drain_request()
                 except Exception:
                     log.exception("persistent ring persister failed for %s", feed_name)
+            if rings and not saw_active_writer and not saw_pending_records:
+                break
             if not did_work:
                 _yield_cpu()
     finally:
@@ -598,10 +628,8 @@ class PersistentRingReader:
             )
 
         durable_seq = int(ring_state["durable_record_count"])
-        durable_last_ts = int(ring_state["durable_last_ts"])
         if durable_seq > 0:
-            durable_end = end if not durable_last_ts else min(end, durable_last_ts + 1)
-            durable_records = self._read_durable_tuples(start, durable_end, playback=playback, ts_key=ts_key)
+            durable_records = self._read_durable_tuples(start, end, playback=playback, ts_key=ts_key)
         if ring_state["record_count"] > durable_seq:
             ring_records = self._get_ring_reader().read_seq_range(
                 durable_seq,

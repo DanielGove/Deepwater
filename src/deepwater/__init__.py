@@ -48,6 +48,7 @@ __version__ = "0.0.1"
 # Export public API
 from .platform import Platform
 from .io import Writer, Reader, ChunkWriter, ChunkReader, RingWriter, RingReader
+from .network import RemoteReader, reader
 
 __all__ = [
     "Platform",
@@ -57,5 +58,7 @@ __all__ = [
     "ChunkReader",
     "RingWriter",
     "RingReader",
+    "RemoteReader",
+    "reader",
     "__version__",
 ]

@@ -72,7 +72,7 @@ if __name__ == '__main__':
 
 1. **Fast**: Tests should run in <5 seconds each
 2. **Isolated**: Use unique data directories (`./data/test-{name}`)
-3. **Deterministic**: No flaky tests, no network dependencies
+3. **Deterministic**: No flaky tests, no external network dependencies. Loopback-only socket tests are acceptable for networking code.
 4. **Clean**: Each test should clean up after itself (or use temp dirs)
 5. **Documented**: Add docstrings explaining what's being tested
 
