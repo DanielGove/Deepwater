@@ -451,6 +451,10 @@ class RemoteReader:
             except Exception:
                 pass
             try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
                 sock.close()
             except Exception:
                 pass
@@ -642,6 +646,10 @@ class RemotePlatform:
         if sock is not None:
             try:
                 write_frame(sock, {"op": "CLOSE", "id": next(self._ids)})
+            except Exception:
+                pass
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
             except Exception:
                 pass
             try:

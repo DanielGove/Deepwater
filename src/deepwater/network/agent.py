@@ -251,6 +251,7 @@ class DeepwaterAgentHandler(socketserver.BaseRequestHandler):
                     self._subscribe_live(request_id, header)
                     break
                 elif op == "CLOSE":
+                    self._close_reader()
                     self._send({"op": "CLOSED", "id": request_id})
                     break
                 else:
