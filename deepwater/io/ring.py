@@ -9,7 +9,7 @@ from typing import Optional
 _DRAIN_REQUEST_FLAG = 1 << 63
 _COUNT_MASK = _DRAIN_REQUEST_FLAG - 1
 PAGE_SIZE = int(os.sysconf("SC_PAGE_SIZE"))
-_HEADER_BYTES = 72
+_HEADER_BYTES = 80
 RING_HEADER_SIZE = ((_HEADER_BYTES + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
 
 
@@ -27,6 +27,10 @@ def ring_buffer_shm_names(base_path, feed_name: str) -> tuple[str, ...]:
     return (primary, feed_name, f"{feed_name}-ring")
 
 
+def ring_data_shm_name(control_shm_name: str) -> str:
+    return f"{control_shm_name}-data"
+
+
 def normalize_ring_data_size(requested_bytes: int, record_size: int) -> int:
     if requested_bytes <= 0:
         raise ValueError("ring data size must be > 0")
@@ -40,10 +44,13 @@ class RingBuffer:
     """
     Shared-memory ring buffer for fixed-size records.
 
-    Layout:
+    Control layout:
       write_pos, start_pos, generation, last_ts, record_count,
       durable_record_count, durable_last_ts, overrun_count, lost_records,
-    followed by the data region.
+      data_size.
+
+    Data lives in a sibling shared-memory object and is exposed as a doubled
+    virtual mapping so wrapped ranges are contiguous.
     """
 
     _OFF_WRITE_POS = 0
@@ -55,6 +62,7 @@ class RingBuffer:
     _OFF_DURABLE_LAST_TS = 48
     _OFF_OVERRUN_COUNT = 56
     _OFF_LOST_RECORDS = 64
+    _OFF_DATA_SIZE = 72
     HEADER_SIZE = RING_HEADER_SIZE
 
     @classmethod
@@ -63,7 +71,11 @@ class RingBuffer:
         if data_size is None:
             shm = shared_memory.SharedMemory(name=shm_name, create=False)
             try:
-                data_size = int(getattr(shm, "size", len(shm.buf))) - cls.HEADER_SIZE
+                view = shm.buf[cls._OFF_DATA_SIZE:cls._OFF_DATA_SIZE + 8].cast("Q")
+                try:
+                    data_size = view[0]
+                finally:
+                    view.release()
             finally:
                 shm.close()
         return cls(name, int(data_size), create=False, shm_name=shm_name)
@@ -83,6 +95,7 @@ class RingBuffer:
             raise ValueError(f"data_size must be a multiple of page size {PAGE_SIZE}")
         self.name = name
         self.shm_name = shm_name or name
+        self.data_shm_name = ring_data_shm_name(self.shm_name)
         self.data_size = data_size
         self.total_size = self.HEADER_SIZE + data_size
         self.created = False
@@ -90,29 +103,43 @@ class RingBuffer:
         self._resource_tracker_unregistered = False
         if create:
             try:
-                self.shm = shared_memory.SharedMemory(name=self.shm_name, create=True, size=self.total_size)
+                self.shm = shared_memory.SharedMemory(name=self.shm_name, create=True, size=self.HEADER_SIZE)
                 self.created = True
             except FileExistsError:
                 self.shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
+            from .ring_shadow import ensure_shm
+
+            ensure_shm(ring_data_shm_name(self.shm_name), data_size, True)
         else:
             last_error = None
             for candidate in (self.shm_name, *fallback_names):
+                shm = None
                 try:
-                    self.shm = shared_memory.SharedMemory(name=candidate, create=False)
+                    shm = shared_memory.SharedMemory(name=candidate, create=False)
+                    from .ring_shadow import ensure_shm
+
+                    ensure_shm(ring_data_shm_name(candidate), data_size, False)
+                    self.shm = shm
                     self.shm_name = candidate
+                    self.data_shm_name = ring_data_shm_name(candidate)
                     break
                 except FileNotFoundError as exc:
                     last_error = exc
+                    if shm is not None:
+                        try:
+                            shm.close()
+                        except Exception:
+                            pass
             else:
                 raise last_error or FileNotFoundError(self.shm_name)
         actual_size = getattr(self.shm, "size", len(self.shm.buf))
-        if actual_size != self.total_size:
+        if actual_size != self.HEADER_SIZE:
             try:
                 self.shm.close()
             finally:
                 raise RuntimeError(
-                    f"ring shared memory size mismatch for '{self.name}': "
-                    f"existing {actual_size} bytes != expected {self.total_size} bytes "
+                    f"ring control shared memory size mismatch for '{self.name}': "
+                    f"existing {actual_size} bytes != expected {self.HEADER_SIZE} bytes "
                     f"(shm_name={self.shm_name})"
                 )
         try:
@@ -128,6 +155,7 @@ class RingBuffer:
         self.buf = self.shm.buf
         if self.created:
             self.buf[:self.HEADER_SIZE] = b"\x00" * self.HEADER_SIZE
+            self.buf[self._OFF_DATA_SIZE:self._OFF_DATA_SIZE + 8] = int(data_size).to_bytes(8, "little")
         self._write_pos = self.buf[self._OFF_WRITE_POS:self._OFF_START_POS].cast("Q")
         self._start_pos = self.buf[self._OFF_START_POS:self._OFF_GENERATION].cast("Q")
         self._generation = self.buf[self._OFF_GENERATION:self._OFF_LAST_TS].cast("Q")
@@ -137,9 +165,18 @@ class RingBuffer:
         self._durable_last_ts = self.buf[self._OFF_DURABLE_LAST_TS:self._OFF_OVERRUN_COUNT].cast("Q")
         self._overrun_count = self.buf[self._OFF_OVERRUN_COUNT:self._OFF_LOST_RECORDS].cast("Q")
         self._lost_records = self.buf[self._OFF_LOST_RECORDS:self._OFF_LOST_RECORDS + 8].cast("Q")
+        if int.from_bytes(self.buf[self._OFF_DATA_SIZE:self._OFF_DATA_SIZE + 8], "little") != self.data_size:
+            try:
+                self.shm.close()
+            finally:
+                raise RuntimeError(
+                    f"ring data size mismatch for '{self.name}': "
+                    f"header {int.from_bytes(self.buf[self._OFF_DATA_SIZE:self._OFF_DATA_SIZE + 8], 'little')} bytes "
+                    f"!= expected {self.data_size} bytes"
+                )
         from .ring_shadow import map_shadow
 
-        self._shadow_map = map_shadow(self.shm_name, self.HEADER_SIZE, self.data_size)
+        self._shadow_map = map_shadow(self.data_shm_name, 0, self.data_size)
         self.data = self._shadow_map.view
 
     @property
@@ -263,9 +300,17 @@ class RingBuffer:
         if unlink:
             try:
                 if self._resource_tracker_unregistered:
-                    shared_memory._posixshmem.shm_unlink(self._resource_name)
+                    from .ring_shadow import unlink_shm
+
+                    unlink_shm(self.shm_name)
                 else:
                     self.shm.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                from .ring_shadow import unlink_shm
+
+                unlink_shm(self.data_shm_name)
             except FileNotFoundError:
                 pass
         shadow_closed = False

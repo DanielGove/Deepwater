@@ -115,7 +115,8 @@ def delete_feed(base_path, feed_name: str, *, missing_ok: bool = False) -> bool:
     import shutil
     from multiprocessing import shared_memory
 
-    from ..io.ring import ring_buffer_shm_names
+    from ..io.ring import ring_buffer_shm_names, ring_data_shm_name
+    from ..io.ring_shadow import unlink_shm
 
     base = _base(base_path)
     registry = GlobalRegistry(base)
@@ -155,6 +156,12 @@ def delete_feed(base_path, feed_name: str, *, missing_ok: bool = False) -> bool:
                 pass
             finally:
                 shm.close()
+
+        for shm_name in (ring_data_shm_name(name) for name in ring_buffer_shm_names(base, feed_name)):
+            try:
+                unlink_shm(shm_name)
+            except FileNotFoundError:
+                continue
 
         removed = registry.unregister_feed(feed_name)
         return bool(on_disk or removed)

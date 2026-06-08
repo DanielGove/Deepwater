@@ -16,10 +16,23 @@ cdef extern from "Python.h":
 
 cdef extern from "fcntl.h" nogil:
     int O_RDWR
+    int O_CREAT
+    int O_EXCL
 
 
 cdef extern from "unistd.h" nogil:
     int close(int fd)
+    int ftruncate(int fd, off_t length)
+
+
+cdef extern from "errno.h" nogil:
+    int EEXIST
+
+
+cdef extern from "sys/stat.h" nogil:
+    cdef struct stat:
+        off_t st_size
+    int fstat(int fd, stat *buf)
 
 
 cdef extern from "sys/mman.h" nogil:
@@ -34,10 +47,15 @@ cdef extern from "sys/mman.h" nogil:
     void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     int munmap(void *addr, size_t length)
     int shm_open(const char *name, int oflag, unsigned int mode)
+    int shm_unlink(const char *name)
 
 
 cdef inline bint _mmap_failed(void *addr) noexcept:
     return <intptr_t>addr == -1
+
+
+cdef bytes _raw_shm_name(str shm_name):
+    return shm_name.encode("utf-8") if shm_name.startswith("/") else ("/" + shm_name).encode("utf-8")
 
 
 cdef class ShadowMap:
@@ -71,6 +89,50 @@ cdef class ShadowMap:
             self._size = 0
 
 
+def ensure_shm(str shm_name, Py_ssize_t size, bint create):
+    cdef bytes raw_name
+    cdef int fd
+    cdef int err
+    cdef bint created = False
+    cdef stat st
+
+    if size <= 0:
+        raise ValueError("shm size must be > 0")
+
+    raw_name = _raw_shm_name(shm_name)
+    if create:
+        fd = shm_open(raw_name, O_RDWR | O_CREAT | O_EXCL, 0o600)
+        if fd < 0 and errno == EEXIST:
+            fd = shm_open(raw_name, O_RDWR, 0)
+        elif fd >= 0:
+            created = True
+        if fd < 0:
+            raise OSError(errno, "shm_open failed")
+        if created and ftruncate(fd, <off_t>size) != 0:
+            err = errno
+            close(fd)
+            raise OSError(err, "ftruncate failed")
+    else:
+        fd = shm_open(raw_name, O_RDWR, 0)
+        if fd < 0:
+            raise FileNotFoundError(errno, "shm_open failed")
+
+    if fstat(fd, &st) != 0:
+        err = errno
+        close(fd)
+        raise OSError(err, "fstat failed")
+    if st.st_size != <off_t>size:
+        close(fd)
+        raise RuntimeError(f"shared memory size mismatch for {shm_name!r}: existing {st.st_size} bytes != expected {size} bytes")
+    close(fd)
+
+
+def unlink_shm(str shm_name):
+    cdef bytes raw_name = _raw_shm_name(shm_name)
+    if shm_unlink(raw_name) != 0:
+        raise FileNotFoundError(errno, "shm_unlink failed")
+
+
 def map_shadow(str shm_name, Py_ssize_t data_offset, Py_ssize_t data_size):
     cdef bytes raw_name
     cdef int fd
@@ -83,12 +145,12 @@ def map_shadow(str shm_name, Py_ssize_t data_offset, Py_ssize_t data_size):
     cdef void *second
     cdef ShadowMap shadow
 
-    if data_offset <= 0:
-        raise ValueError("data_offset must be > 0")
+    if data_offset < 0:
+        raise ValueError("data_offset must be >= 0")
     if data_size <= 0:
         raise ValueError("data_size must be > 0")
 
-    raw_name = shm_name.encode("utf-8") if shm_name.startswith("/") else ("/" + shm_name).encode("utf-8")
+    raw_name = _raw_shm_name(shm_name)
     fd = shm_open(raw_name, O_RDWR, 0)
     if fd < 0:
         raise OSError(errno, "shm_open failed")

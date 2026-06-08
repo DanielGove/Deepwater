@@ -9,8 +9,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed, delete_feed
-from deepwater.io.ring import ring_buffer_shm_names
+from deepwater.io.ring import ring_buffer_shm_names, ring_data_shm_name
 from deepwater.metadata.discovery import feed_exists, list_feeds
+
+
+def _shm_path(name: str) -> Path:
+    return Path("/dev/shm") / name.lstrip("/")
 
 
 def test_delete_persistent_feed_removes_all_state_and_allows_recreate():
@@ -85,8 +89,10 @@ def test_delete_ring_feed_unlinks_shared_memory_and_registry_entry():
         w.write_values(1_000_000, 1)
 
         shm_name = ring_buffer_shm_names(base, "live")[0]
+        data_shm_name = ring_data_shm_name(shm_name)
         shm = shared_memory.SharedMemory(name=shm_name, create=False)
         shm.close()
+        assert _shm_path(data_shm_name).exists()
 
         try:
             delete_feed(base, "live")
@@ -106,6 +112,7 @@ def test_delete_ring_feed_unlinks_shared_memory_and_registry_entry():
             raise AssertionError("ring shared memory still exists after delete")
         except FileNotFoundError:
             pass
+        assert not _shm_path(data_shm_name).exists()
 
 
 def test_delete_ring_feed_unlinks_shared_memory_with_exported_view():
@@ -131,8 +138,10 @@ def test_delete_ring_feed_unlinks_shared_memory_with_exported_view():
         assert bytes(raw_record[:8]) != b""
 
         shm_name = ring_buffer_shm_names(base, "live")[0]
+        data_shm_name = ring_data_shm_name(shm_name)
         shm = shared_memory.SharedMemory(name=shm_name, create=False)
         shm.close()
+        assert _shm_path(data_shm_name).exists()
 
         w.close()
         delete_feed(base, "live")
@@ -142,6 +151,7 @@ def test_delete_ring_feed_unlinks_shared_memory_with_exported_view():
             raise AssertionError("ring shared memory still exists after delete")
         except FileNotFoundError:
             pass
+        assert not _shm_path(data_shm_name).exists()
         raw_record.release()
         r.close()
 
@@ -165,11 +175,13 @@ def test_reader_close_does_not_unlink_ring_shared_memory():
         w.write_values(1_000_000, 1)
 
         shm_name = ring_buffer_shm_names(base, "live")[0]
+        data_shm_name = ring_data_shm_name(shm_name)
         r2 = Reader(base, "live")
         r2.close()
 
         shm = shared_memory.SharedMemory(name=shm_name, create=False)
         shm.close()
+        assert _shm_path(data_shm_name).exists()
 
         w.close()
         delete_feed(base, "live")
@@ -178,6 +190,7 @@ def test_reader_close_does_not_unlink_ring_shared_memory():
             raise AssertionError("ring shared memory still exists after delete")
         except FileNotFoundError:
             pass
+        assert not _shm_path(data_shm_name).exists()
 
 
 def run_tests():
