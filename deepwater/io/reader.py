@@ -142,6 +142,7 @@ class Reader:
             try:
                 self._ring = RingBuffer.open(
                     ring_buffer_shm_names(self.base_path, self.feed_name)[0],
+                    data_size=int(self._metadata.ring_size_bytes),
                 )
             except FileNotFoundError:
                 pass

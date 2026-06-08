@@ -116,9 +116,6 @@ class RingBuffer:
                 shm = None
                 try:
                     shm = shared_memory.SharedMemory(name=candidate, create=False)
-                    from .ring_shadow import ensure_shm
-
-                    ensure_shm(ring_data_shm_name(candidate), data_size, False)
                     self.shm = shm
                     self.shm_name = candidate
                     self.data_shm_name = ring_data_shm_name(candidate)

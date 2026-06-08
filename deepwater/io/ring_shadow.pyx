@@ -137,6 +137,7 @@ def map_shadow(str shm_name, Py_ssize_t data_offset, Py_ssize_t data_size):
     cdef bytes raw_name
     cdef int fd
     cdef int err
+    cdef stat st
     cdef size_t size = <size_t>data_size
     cdef size_t total = <size_t>(data_size * 2)
     cdef void *base
@@ -154,6 +155,16 @@ def map_shadow(str shm_name, Py_ssize_t data_offset, Py_ssize_t data_size):
     fd = shm_open(raw_name, O_RDWR, 0)
     if fd < 0:
         raise OSError(errno, "shm_open failed")
+    if fstat(fd, &st) != 0:
+        err = errno
+        close(fd)
+        raise OSError(err, "fstat failed")
+    if st.st_size != <off_t>(data_offset + data_size):
+        close(fd)
+        raise RuntimeError(
+            f"shared memory size mismatch for {shm_name!r}: "
+            f"existing {st.st_size} bytes != expected {data_offset + data_size} bytes"
+        )
 
     base = mmap(NULL, total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
     if _mmap_failed(base):
