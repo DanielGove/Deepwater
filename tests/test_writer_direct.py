@@ -2,6 +2,7 @@
 """Direct Writer workflow without Platform."""
 import sys
 import tempfile
+import struct
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -75,10 +76,42 @@ def test_direct_ring_writer_roundtrip():
         w.close()
 
 
+def test_chunk_writer_rejects_wrong_raw_record_size():
+    with tempfile.TemporaryDirectory(prefix="dw-writer-direct-size-") as td:
+        base = Path(td)
+        create_feed(
+            base,
+            {
+                "feed_name": "events",
+                "mode": "UF",
+                "fields": [
+                    {"name": "ts", "type": "uint64"},
+                    {"name": "value", "type": "uint64"},
+                ],
+                "clock_level": 1,
+                "persist": True,
+                "storage": "chunk",
+                "chunk_size_mb": 0.01,
+            },
+        )
+
+        w = Writer(base, "events")
+        try:
+            try:
+                w.write(1_000, struct.pack("<Q", 1_000))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("short raw record write was not rejected")
+        finally:
+            w.close()
+
+
 def run_tests():
     tests = [
         ("direct_chunk_writer_roundtrip", test_direct_chunk_writer_roundtrip),
         ("direct_ring_writer_roundtrip", test_direct_ring_writer_roundtrip),
+        ("chunk_writer_rejects_wrong_raw_record_size", test_chunk_writer_rejects_wrong_raw_record_size),
     ]
     print("Direct Writer Tests")
     print("=" * 60)

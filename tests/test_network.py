@@ -367,6 +367,35 @@ def test_remote_reader_read_available_loopback():
             delete_feed(base, "events", missing_ok=True)
 
 
+def test_remote_stream_with_start_loopback():
+    with tempfile.TemporaryDirectory(prefix="dw-net-stream-start-") as td:
+        base = Path(td) / "node"
+        _create_events_feed(base, persist=True)
+        writer = Writer(base, "events")
+        start = 1_700_000_000_000_000
+        for i in range(3):
+            writer.write_values(start + i * 10, i)
+        writer.close()
+
+        server = make_server(Path(td), ("127.0.0.1", 0), heartbeat_interval=0.1)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = int(server.server_address[1])
+            rr = RemoteReader("127.0.0.1", str(base), "events", port=port, timeout=2.0)
+            stream = rr.stream(start=start + 10)
+            try:
+                assert next(stream) == (start + 10, 1)
+                assert next(stream) == (start + 20, 2)
+            finally:
+                stream.close()
+                rr.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2.0)
+
+
 def test_remote_stream_heartbeat_loopback():
     with tempfile.TemporaryDirectory(prefix="dw-net-heartbeat-") as td:
         base = Path(td) / "node"
@@ -548,6 +577,7 @@ def run_tests():
         ("remote_reader_ts_key_loopback", test_remote_reader_ts_key_loopback),
         ("remote_reader_range_batches_loopback", test_remote_reader_range_batches_loopback),
         ("remote_reader_read_available_loopback", test_remote_reader_read_available_loopback),
+        ("remote_stream_with_start_loopback", test_remote_stream_with_start_loopback),
         ("remote_stream_heartbeat_loopback", test_remote_stream_heartbeat_loopback),
         ("local_live_ring_range_batches_loopback", test_local_live_ring_range_batches_loopback),
         ("remote_metadata_and_reader_loopback", test_remote_metadata_and_reader_loopback),

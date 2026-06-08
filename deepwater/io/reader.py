@@ -535,7 +535,6 @@ class Reader:
         end: int,
         format: str = "tuple",
         ts_key: Optional[str] = None,
-        playback: bool = False,
     ) -> list | memoryview | np.ndarray:
         """Return all records in [start, end).
 
@@ -570,10 +569,9 @@ class Reader:
         end: int,
         columns: list[str] | tuple[str, ...],
         *,
-        playback: bool = False,
         ts_key: Optional[str] = None,
     ) -> dict[str, np.ndarray]:
-        arr = self.range(start, end, format="numpy", playback=playback, ts_key=ts_key)
+        arr = self.range(start, end, format="numpy", ts_key=ts_key)
         return {name: arr[name] for name in columns}
 
     def _iter_raw_range(
@@ -635,7 +633,6 @@ class Reader:
         format: str = "tuple",
         ts_key: Optional[str] = None,
         batch_records: int = 50_000,
-        playback: bool = False,
     ) -> Iterator:
         """Yield formatted batches for [start, end)."""
         if batch_records <= 0:

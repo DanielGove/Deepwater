@@ -9,7 +9,7 @@ import numpy as np
 from typing import Union
 
 from .chunk import Chunk
-from .ring import RingBuffer, _yield_cpu, normalize_ring_data_size, ring_buffer_shm_names
+from .ring import RingBuffer, _yield_cpu, ring_buffer_shm_names
 from ..metadata.feed_registry import FeedRegistry, ON_DISK, UINT64_MAX
 from ..metadata.feed_metadata import load_feed_metadata
 from ..metadata.feed_schema import load_record_schema_for_feed
@@ -210,7 +210,7 @@ class RingWriter:
             _yield_cpu()
 
     def _prepare_single_write(self):
-        while self._persist and self._ring_record_count - self._ring_durable_record_count >= self._ring_capacity:
+        while self._persist and int(self._ring_record_count[0]) - int(self._ring_durable_record_count[0]) >= self._ring_capacity:
             _yield_cpu()
         write_pos = int(self._ring_write_pos[0])
         start_pos = int(self._ring_start_pos[0])
@@ -321,56 +321,26 @@ class RingWriter:
         start_pos = int(self._ring_start_pos[0])
         record_count = int(self._ring_record_count[0])
         last_ts_prev = int(self._ring_last_ts[0])
-        if write_pos + n > self._usable_bytes:
-            write_pos = 0
-            generation += 1
 
         new_record_count = record_count + batch_records
-        if record_count >= self._ring_capacity:
-            start_pos = write_pos
-        elif new_record_count > self._ring_capacity:
-            overwritten = new_record_count - self._ring_capacity
-            start_pos = (start_pos + (overwritten * rec_sz)) % self._usable_bytes
+        old_earliest = max(0, record_count - self._ring_capacity)
+        new_earliest = max(0, new_record_count - self._ring_capacity)
+        advanced = new_earliest - old_earliest
+        if advanced > 0:
+            start_pos = (start_pos + (advanced * rec_sz)) % self._usable_bytes
 
         end = write_pos + n
         self._ring_data[write_pos:end] = data
+        if end > self._usable_bytes:
+            generation += 1
 
         unpack_from = self._u64.unpack_from
         first_ts = unpack_from(data, 0)[0]
         last_ts = unpack_from(data, n - rec_sz)[0]
-        end_pos = end if end < self._usable_bytes else 0
-        if record_count >= self._ring_capacity:
-            start_pos = end_pos
+        end_pos = end % self._usable_bytes
         self.ring.update_live_header(end_pos, start_pos, generation, last_ts if last_ts else last_ts_prev, new_record_count)
         self._segment_note_batch(first_ts, last_ts, batch_records)
         return end_pos
-
-    def resize(self, new_size_bytes: int):
-        self._ensure_open()
-        if new_size_bytes <= 0:
-            raise ValueError("new ring size must be > 0")
-        try:
-            self.ring.close(unlink=True)
-        except Exception:
-            pass
-        self.ring_bytes = normalize_ring_data_size(int(new_size_bytes), self._rec_size)
-        shm_names = ring_buffer_shm_names(self.base_path, self.feed_name)
-        self.ring = RingBuffer(
-            self.feed_name,
-            data_size=self.ring_bytes,
-            create=True,
-            shm_name=shm_names[0],
-        )
-        self._ring_write_pos = self.ring._write_pos
-        self._ring_start_pos = self.ring._start_pos
-        self._ring_generation = self.ring._generation
-        self._ring_last_ts = self.ring._last_ts
-        self._ring_record_count = self.ring._record_count
-        self._ring_durable_record_count = self.ring._durable_record_count
-        self._ring_data = self.ring.data
-        self._usable_bytes = int(self.ring.data_size)
-        self._ring_capacity = self._usable_bytes // self._rec_size
-        self._bootstrap_persisted_ring()
 
     def close(self):
         if self._closed:
@@ -605,17 +575,20 @@ class ChunkWriter:
 
         if isinstance(record_data, np.ndarray):
             record_data = record_data.tobytes()
+        view = memoryview(record_data).cast("B")
+        record_size = view.nbytes
+        if record_size != self._rec_size:
+            raise ValueError(f"record length {record_size} != expected {self._rec_size}")
 
         meta = self.current_chunk_metadata
         position = meta._wp[0]
-        record_size = len(record_data)
         if record_size > meta._size[0] - position:
             self._create_new_chunk()
             meta = self.current_chunk_metadata
             position = meta._wp[0]
 
         u64 = self._u64
-        self.current_chunk.buffer[position:position + record_size] = record_data
+        self.current_chunk.buffer[position:position + record_size] = view
         ts0 = int(timestamp)
 
         key_min_set = self._key_min_set

@@ -88,6 +88,37 @@ def test_ring_wrap_and_range():
         r.close()
 
 
+def test_ring_batch_wrap_preserves_logical_order():
+    with tempfile.TemporaryDirectory(prefix="dw-ring-batch-wrap-") as td:
+        base = Path(td)
+        spec = {
+            "feed_name": "batchwrap",
+            "mode": "UF",
+            "fields": [
+                {"name": "ts", "type": "uint64"},
+                {"name": "v", "type": "uint64"},
+            ],
+            "clock_level": 1,
+            "persist": False,
+            "ring_size_mb": 0.001,
+            "segment_tracking": False,
+        }
+        create_feed(base, spec)
+        w = Writer(base, "batchwrap")
+        cap = w._ring_capacity
+        for i in range(cap - 1):
+            w.write_values(i, i)
+        payload = b"".join(struct.pack("<QQ", cap - 1 + i, cap - 1 + i) for i in range(2))
+        w.write_batch_bytes(payload)
+
+        r = Reader(base, "batchwrap")
+        try:
+            assert r.range(0, cap + 10) == [(i, i) for i in range(1, cap + 1)]
+        finally:
+            r.close()
+            w.close()
+
+
 def test_live_ring_api_matches_reader_shape():
     with tempfile.TemporaryDirectory(prefix="dw-ring-api-") as td:
         base = Path(td)
@@ -132,6 +163,7 @@ def run_tests():
         ("ring_buffer_shm_name_normalizes_base_path", test_ring_buffer_shm_name_normalizes_base_path),
         ("ring_size_normalizes_to_page_and_record_multiple", test_ring_size_normalizes_to_page_and_record_multiple),
         ("ring_wrap_and_range", test_ring_wrap_and_range),
+        ("ring_batch_wrap_preserves_logical_order", test_ring_batch_wrap_preserves_logical_order),
         ("live_ring_api_matches_reader_shape", test_live_ring_api_matches_reader_shape),
     ]
     print("Ring Buffer Tests")

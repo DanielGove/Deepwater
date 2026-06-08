@@ -426,11 +426,12 @@ class DeepwaterAgentHandler(socketserver.BaseRequestHandler):
         values = _args(header, "READ_RANGE", 2)
         start = int(values[0])
         end = int(values[1])
-        playback = bool(values[2]) if len(values) > 2 else False
-        ts_key = values[3] if len(values) > 3 else None
+        ts_key = values[2] if len(values) > 2 else None
+        if isinstance(ts_key, bool):
+            ts_key = values[3] if len(values) > 3 else None
         if ts_key is not None and not isinstance(ts_key, str):
             raise ValueError("ts_key must be a string or null")
-        raw = reader.range(start, end, format="raw", playback=playback, ts_key=ts_key)
+        raw = reader.range(start, end, format="raw", ts_key=ts_key)
         payload = _raw_payload(raw)
         self._send_data(request_id, payload, self._record_size)
 
@@ -439,12 +440,15 @@ class DeepwaterAgentHandler(socketserver.BaseRequestHandler):
         values = _args(header, "READ_RANGE_PAGE", 2)
         start = int(values[0])
         end = int(values[1])
-        playback = bool(values[2]) if len(values) > 2 else False
-        ts_key = values[3] if len(values) > 3 else None
+        ts_key = values[2] if len(values) > 2 else None
+        batch_arg_index = 3
+        if isinstance(ts_key, bool):
+            ts_key = values[3] if len(values) > 3 else None
+            batch_arg_index = 4
         if ts_key is not None and not isinstance(ts_key, str):
             raise ValueError("ts_key must be a string or null")
 
-        batch_records = _bounded_batch_size(values[4] if len(values) > 4 else None)
+        batch_records = _bounded_batch_size(values[batch_arg_index] if len(values) > batch_arg_index else None)
         record_size = self._record_size
         max_records_by_frame = max(1, (MAX_FRAME_BYTES - 4096) // max(record_size, 1))
         batch_records = min(batch_records, max_records_by_frame)
@@ -453,7 +457,6 @@ class DeepwaterAgentHandler(socketserver.BaseRequestHandler):
             start,
             end,
             format="raw",
-            playback=playback,
             ts_key=ts_key,
             batch_records=batch_records,
         ):
@@ -509,8 +512,9 @@ class DeepwaterAgentHandler(socketserver.BaseRequestHandler):
         start = values[0] if values else None
         if start is not None:
             start = int(start)
-        playback = bool(values[1]) if len(values) > 1 else False
-        ts_key = values[2] if len(values) > 2 else None
+        ts_key = values[1] if len(values) > 1 else None
+        if isinstance(ts_key, bool):
+            ts_key = values[2] if len(values) > 2 else None
         if ts_key is not None and not isinstance(ts_key, str):
             raise ValueError("ts_key must be a string or null")
 
@@ -518,8 +522,8 @@ class DeepwaterAgentHandler(socketserver.BaseRequestHandler):
         heartbeat_interval = max(0.01, float(self.server.heartbeat_interval_s))
         self._send(Op.SUBSCRIBED, request_id, (record_size, self.session_id, heartbeat_interval))
 
-        if start is not None or playback:
-            for raw in reader.stream(start=start, format="raw", playback=playback, ts_key=ts_key):
+        if start is not None:
+            for raw in reader.stream(start=start, format="raw", ts_key=ts_key):
                 payload = _raw_payload(raw)
                 if payload:
                     self._send_data(request_id, payload, record_size)

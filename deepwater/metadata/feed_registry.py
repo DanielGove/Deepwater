@@ -215,8 +215,14 @@ class FeedRegistry:
                     os.pwrite(self.fd, header_data, 0)
                     current_size = desired_size
 
-            # For reader mode on empty/nonexistent files, ensure minimum size
-            if not self.is_writer and current_size == 0:
+            # Reader mode may be the first process to touch a persistent feed's
+            # registry. Initialize an empty registry instead of trying to mmap
+            # a zero-byte file.
+            if not self.is_writer and current_size < HEADER_SIZE:
+                if current_size < desired_size:
+                    os.posix_fallocate(self.fd, 0, desired_size)
+                    current_size = desired_size
+                os.pwrite(self.fd, HEADER_STRUCT.pack(0), 0)
                 current_size = desired_size
 
             self.mm = mmap.mmap(self.fd, current_size, mmap.MAP_SHARED,

@@ -86,12 +86,35 @@ def test_write_read_cycle():
     return True
 
 
+def test_empty_persistent_feed_reads_empty():
+    """A persistent feed can be opened for reads before the first write."""
+    with tempfile.TemporaryDirectory(prefix="dw-core-empty-read-") as td:
+        base = Path(td)
+        create_feed(base, {
+            'feed_name': 'empty',
+            'mode': 'UF',
+            'fields': [
+                {'name': 'timestamp_us', 'type': 'uint64'},
+                {'name': 'value', 'type': 'uint64'},
+            ],
+            'clock_level': 1,
+            'persist': True,
+        })
+
+        reader = Reader(base, 'empty')
+        assert reader.range(0, 10) == []
+        assert reader.read_available() == []
+        reader.close()
+    return True
+
+
 def run_tests():
     """Run all core tests"""
     tests = [
         ("Feed Root Init", test_feed_root_init),
         ("Feed Creation", test_feed_creation),
         ("Write/Read Cycle", test_write_read_cycle),
+        ("Empty Persistent Feed Reads Empty", test_empty_persistent_feed_reads_empty),
     ]
     
     print("Core Primitive Tests")

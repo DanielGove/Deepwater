@@ -293,26 +293,24 @@ class RemoteReader:
         self,
         start: int,
         end: int,
-        playback: bool = False,
         ts_key: Optional[str] = None,
     ) -> memoryview:
         return self._data_request(
             Op.READ_RANGE,
-            (int(start), int(end), bool(playback), ts_key, 0),
+            (int(start), int(end), ts_key, 0),
         )
 
     def _iter_raw_range(
         self,
         start: int,
         end: int,
-        playback: bool = False,
         ts_key: Optional[str] = None,
         batch_records: int = DEFAULT_MAX_BATCH_RECORDS,
     ) -> Iterator[memoryview]:
         if batch_records <= 0:
             raise ValueError("batch_records must be positive")
         if not self.capabilities.get("paged_range"):
-            raw = self._range_raw(start, end, playback=playback, ts_key=ts_key)
+            raw = self._range_raw(start, end, ts_key=ts_key)
             step = int(batch_records) * self.record_size
             for pos in range(0, raw.nbytes, step):
                 yield raw[pos:pos + step]
@@ -326,7 +324,7 @@ class RemoteReader:
             frame(
                 Op.READ_RANGE_PAGE,
                 request_id,
-                (int(start), int(end), bool(playback), ts_key, int(batch_records)),
+                (int(start), int(end), ts_key, int(batch_records)),
             ),
         )
         while True:
@@ -428,12 +426,11 @@ class RemoteReader:
         start: int,
         end: int,
         format: str = "tuple",
-        playback: bool = False,
         ts_key: Optional[str] = None,
     ):
         try:
             return self._format_raw_batch(
-                self._range_raw(start, end, playback=playback, ts_key=ts_key),
+                self._range_raw(start, end, ts_key=ts_key),
                 format,
             )
         except Exception as exc:
@@ -445,10 +442,9 @@ class RemoteReader:
         start: int,
         end: int,
         columns: list[str] | tuple[str, ...],
-        playback: bool = False,
         ts_key: Optional[str] = None,
     ) -> dict[str, np.ndarray]:
-        arr = self.range(start, end, format="numpy", playback=playback, ts_key=ts_key)
+        arr = self.range(start, end, format="numpy", ts_key=ts_key)
         return {name: arr[name] for name in columns}
 
     def range_batches(
@@ -456,7 +452,6 @@ class RemoteReader:
         start: int,
         end: int,
         format: str = "tuple",
-        playback: bool = False,
         ts_key: Optional[str] = None,
         batch_records: int = DEFAULT_MAX_BATCH_RECORDS,
     ) -> Iterator:
@@ -468,7 +463,6 @@ class RemoteReader:
             for raw in self._iter_raw_range(
                 start,
                 end,
-                playback=playback,
                 ts_key=ts_key,
                 batch_records=batch_records,
             ):
@@ -501,7 +495,6 @@ class RemoteReader:
         start: Optional[int] = None,
         format: str = "tuple",
         ts_key: Optional[str] = None,
-        playback: bool = False,
     ) -> Iterator:
         if format not in _VALID_FORMATS:
             raise ValueError(f"Invalid format: {format}. Use 'tuple', 'dict', 'numpy', or 'raw'")
@@ -511,7 +504,7 @@ class RemoteReader:
         request_id = next(self._ids)
         write_frame(
             self._sock,
-            frame(Op.SUBSCRIBE_LIVE, request_id, (start, bool(playback), ts_key)),
+            frame(Op.SUBSCRIBE_LIVE, request_id, (start, ts_key)),
         )
         header, _payload = read_frame(self._sock)
         if header.id != request_id:
