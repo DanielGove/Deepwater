@@ -27,7 +27,7 @@ def ring_buffer_shm_names(base_path, feed_name: str) -> tuple[str, ...]:
     return (primary, feed_name, f"{feed_name}-ring")
 
 
-def ring_data_shm_name(control_shm_name: str) -> str:
+def _ring_data_shm_name(control_shm_name: str) -> str:
     return f"{control_shm_name}-data"
 
 
@@ -66,6 +66,28 @@ class RingBuffer:
     HEADER_SIZE = RING_HEADER_SIZE
 
     @classmethod
+    def unlink_for_feed(cls, base_path, feed_name: str) -> None:
+        """Remove every shared-memory object owned by a feed ring."""
+        from .ring_shadow import unlink_shm
+
+        for shm_name in ring_buffer_shm_names(base_path, feed_name):
+            try:
+                shm = shared_memory.SharedMemory(name=shm_name, create=False)
+            except FileNotFoundError:
+                pass
+            else:
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+                finally:
+                    shm.close()
+            try:
+                unlink_shm(_ring_data_shm_name(shm_name))
+            except FileNotFoundError:
+                pass
+
+    @classmethod
     def open(cls, name: str, data_size: int | None = None, *, shm_name: str | None = None):
         shm_name = shm_name or name
         if data_size is None:
@@ -95,7 +117,7 @@ class RingBuffer:
             raise ValueError(f"data_size must be a multiple of page size {PAGE_SIZE}")
         self.name = name
         self.shm_name = shm_name or name
-        self.data_shm_name = ring_data_shm_name(self.shm_name)
+        self.data_shm_name = _ring_data_shm_name(self.shm_name)
         self.data_size = data_size
         self.total_size = self.HEADER_SIZE + data_size
         self.created = False
@@ -109,7 +131,7 @@ class RingBuffer:
                 self.shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
             from .ring_shadow import ensure_shm
 
-            ensure_shm(ring_data_shm_name(self.shm_name), data_size, True)
+            ensure_shm(_ring_data_shm_name(self.shm_name), data_size, True)
         else:
             last_error = None
             for candidate in (self.shm_name, *fallback_names):
@@ -118,7 +140,7 @@ class RingBuffer:
                     shm = shared_memory.SharedMemory(name=candidate, create=False)
                     self.shm = shm
                     self.shm_name = candidate
-                    self.data_shm_name = ring_data_shm_name(candidate)
+                    self.data_shm_name = _ring_data_shm_name(candidate)
                     break
                 except FileNotFoundError as exc:
                     last_error = exc
