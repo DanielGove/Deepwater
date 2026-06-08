@@ -4,9 +4,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import Reader, Writer, create_feed
 from deepwater.metadata.feed_registry import FeedRegistry
 
 
@@ -14,7 +14,6 @@ def test_range_spans_hundred_chunks():
     N = 200_000  # tuned to yield ~35-40 chunks with 0.25MB chunks
     with tempfile.TemporaryDirectory(prefix="dw-many-") as td:
         base = Path(td)
-        p = Platform(str(base))
         spec = {
             "feed_name": "rot100",
             "mode": "UF",
@@ -28,10 +27,9 @@ def test_range_spans_hundred_chunks():
             "clock_level": 3,
             "persist": True,
             "chunk_size_mb": 0.25,  # very small to force many chunks
-            "index_playback": False,
         }
-        p.create_feed(spec)
-        w = p.create_writer("rot100")
+        create_feed(base, spec)
+        w = Writer(base, "rot100")
         base_ts = 10_000_000
         for i in range(N):
             recv = base_ts + i * 10
@@ -46,7 +44,7 @@ def test_range_spans_hundred_chunks():
         latest = reg.get_latest_chunk_idx()
         assert latest and latest > 30, f"expected >30 chunks, got {latest}"
 
-        r = p.create_reader("rot100")
+        r = Reader(base, "rot100")
         # Span roughly middle 400k records on proc_us (should cross dozens of chunks)
         start_idx = 30_000
         end_idx = 70_000
@@ -67,7 +65,7 @@ def test_range_spans_hundred_chunks():
         full = r.range(base_ts - 10, base_ts + N * 10, ts_key="ev_us")
         assert len(full) == N, "ev_us full-span mismatch"
 
-        r.close(); reg.close(); p.close()
+        r.close(); reg.close()
 
 
 def run_tests():

@@ -19,11 +19,10 @@ import time
 import statistics
 from pathlib import Path
 
-from deepwater import Platform
+from deepwater import Reader, Writer, create_feed
 
 
-def make_platform(base: Path, chunk_mb: int) -> Platform:
-    p = Platform(str(base))
+def make_feed(base: Path, chunk_mb: int) -> None:
     spec = {
         "feed_name": "bench",
         "mode": "UF",
@@ -37,10 +36,8 @@ def make_platform(base: Path, chunk_mb: int) -> Platform:
         "clock_level": 3,
         "persist": True,
         "chunk_size_mb": chunk_mb,
-        "index_playback": False,
     }
-    p.create_feed(spec)
-    return p
+    create_feed(base, spec)
 
 
 def bench_write_values(writer, n_records: int) -> tuple[float, int, int]:
@@ -119,16 +116,16 @@ def main():
         write_values_ns = []
         read_values_ns = []
         for i in range(args.repeat):
-            p = make_platform(base / f"wv_{i}", chunk_mb=args.chunk_mb)
-            writer = p.create_writer("bench")
+            run_base = base / f"wv_{i}"
+            make_feed(run_base, chunk_mb=args.chunk_mb)
+            writer = Writer(run_base, "bench")
             elapsed, start_ts, end_ts = bench_write_values(writer, args.records)
             write_values_ns.append((elapsed / args.records) * 1e9)
 
-            reader = p.create_reader("bench")
+            reader = Reader(run_base, "bench")
             read_elapsed = bench_read_range(reader, start_ts, end_ts, args.records, args.read_format)
             read_values_ns.append((read_elapsed / args.records) * 1e9)
             reader.close()
-            p.close()
 
         print(f"write_values over {args.records} records (chunk {args.chunk_mb}MB)")
         summarize("  write_values", write_values_ns)
@@ -139,16 +136,16 @@ def main():
             write_batch_ns = []
             read_batch_ns = []
             for i in range(args.repeat):
-                p = make_platform(base / f"wb_{i}", chunk_mb=args.chunk_mb)
-                writer = p.create_writer("bench")
+                run_base = base / f"wb_{i}"
+                make_feed(run_base, chunk_mb=args.chunk_mb)
+                writer = Writer(run_base, "bench")
                 elapsed, start_ts, end_ts = bench_write_batch(writer, args.batch, args.records)
                 write_batch_ns.append((elapsed / args.records) * 1e9)
 
-                reader = p.create_reader("bench")
+                reader = Reader(run_base, "bench")
                 read_elapsed = bench_read_range(reader, start_ts, end_ts, args.records, args.read_format)
                 read_batch_ns.append((read_elapsed / args.records) * 1e9)
                 reader.close()
-                p.close()
 
             print(f"write_batch_bytes (batch={args.batch}) over {args.records} records")
             summarize("  write_batch_bytes", write_batch_ns)

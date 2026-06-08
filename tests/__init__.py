@@ -8,17 +8,35 @@ import sys
 import os
 from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Add repo root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+def _deepwater_shm_files() -> set[Path]:
+    shm_dir = Path("/dev/shm")
+    if not shm_dir.exists():
+        return set()
+    return set(shm_dir.glob("dw_*"))
+
+
+def _cleanup_new_shm(before: set[Path]) -> None:
+    for path in _deepwater_shm_files() - before:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
 
 def run_test_file(test_file: Path) -> tuple[bool, str]:
     """Run a single test file and return (success, output)"""
     import subprocess
-    
+
+    shm_before = set()
     try:
+        shm_before = _deepwater_shm_files()
         env = os.environ.copy()
-        src_path = str(Path(__file__).parent.parent / "src")
-        env["PYTHONPATH"] = src_path if not env.get("PYTHONPATH") else f"{src_path}:{env['PYTHONPATH']}"
+        root_path = str(Path(__file__).parent.parent)
+        env["PYTHONPATH"] = root_path if not env.get("PYTHONPATH") else f"{root_path}:{env['PYTHONPATH']}"
         result = subprocess.run(
             [sys.executable, str(test_file)],
             capture_output=True,
@@ -35,6 +53,8 @@ def run_test_file(test_file: Path) -> tuple[bool, str]:
         return False, "TIMEOUT (>30s)"
     except Exception as e:
         return False, f"ERROR: {e}"
+    finally:
+        _cleanup_new_shm(shm_before)
 
 
 def run_all_tests():

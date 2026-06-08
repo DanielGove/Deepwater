@@ -12,19 +12,62 @@ import time
 from contextlib import redirect_stdout
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import deepwater as dw
 import deepwater.network.protocol as protocol
 import orjson
-from deepwater import Platform
+import deepwater as dw
+from deepwater import Reader, Writer, create_feed, delete_feed
 from deepwater.cli.datasets_cli import main as datasets_cli_main
 from deepwater.cli.feeds_cli import main as feeds_cli_main
 from deepwater.cli.segments_cli import main as segments_cli_main
+from deepwater.metadata.feed_schema import FeedSchema
 from deepwater.network.agent import make_server
-from deepwater.network.client import RemoteReader, RemoteReaderError
+from deepwater.network.client import RemoteReader, RemoteReaderError, remote_metadata
 from deepwater.network.path import parse_target, resolve_agent_path
-from deepwater.network.protocol import ProtocolError, decode_frame, encode_frame, read_frame, write_frame
+from deepwater.network.protocol import (
+    Op,
+    ProtocolError,
+    decode_frame,
+    encode_frame,
+    frame,
+    read_frame,
+    write_frame,
+)
+
+
+def _create_events_feed(
+    base: Path,
+    *,
+    fields: list[dict] | None = None,
+    clock_level: int = 1,
+    persist: bool = True,
+    ring_size_mb: float | None = None,
+    chunk_size_mb: float = 1,
+) -> None:
+    spec = {
+        "feed_name": "events",
+        "mode": "UF",
+        "fields": fields or [
+            {"name": "ts", "type": "uint64"},
+            {"name": "value", "type": "uint64"},
+        ],
+        "clock_level": clock_level,
+        "persist": persist,
+        "chunk_size_mb": chunk_size_mb,
+    }
+    if ring_size_mb is not None:
+        spec["ring_size_mb"] = ring_size_mb
+    create_feed(base, spec)
+
+
+def _close_all(*objects) -> None:
+    for obj in objects:
+        try:
+            if obj is not None:
+                obj.close()
+        except Exception:
+            pass
 
 
 def test_path_parser():
@@ -77,17 +120,20 @@ def test_agent_path_guard():
 
 def test_protocol_round_trip():
     payload = b"\x00\x01payload"
-    frame = encode_frame({"op": "PING", "id": 7}, payload)
-    header, decoded_payload = decode_frame(frame)
-    assert header == {"op": "PING", "id": 7}
+    encoded = encode_frame(frame(Op.PING, 7), payload)
+    header, decoded_payload = decode_frame(encoded)
+    assert header.op == Op.PING
+    assert header.id == 7
+    assert header.args is None
     assert decoded_payload == payload
 
     left, right = socket.socketpair()
     try:
-        write_frame(left, {"op": "DATA", "id": 8, "count": 1}, payload)
+        write_frame(left, frame(Op.DATA, 8, (16, 1, 0, False)), payload)
         header, decoded_payload = read_frame(right)
-        assert header["op"] == "DATA"
-        assert header["id"] == 8
+        assert header.op == Op.DATA
+        assert header.id == 8
+        assert header.args[1] == 1
         assert decoded_payload == payload
     finally:
         left.close()
@@ -100,7 +146,7 @@ def test_protocol_rejects_oversized_frames_without_payload_alloc():
     try:
         protocol.MAX_FRAME_BYTES = 32
         try:
-            encode_frame({"op": "DATA"}, b"x" * 64)
+            encode_frame(frame(Op.DATA, 1, (1, 64, 0, False)), b"x" * 64)
             raise AssertionError("oversized encoded frame was not rejected")
         except ProtocolError:
             pass
@@ -115,7 +161,7 @@ def test_protocol_rejects_oversized_frames_without_payload_alloc():
         protocol.MAX_FRAME_BYTES = old_max_frame
         protocol.MAX_HEADER_BYTES = 8
         try:
-            encode_frame({"operation": "header-too-large"})
+            encode_frame(frame(Op.DATA, 1, (1, 1, 123456789, False)))
             raise AssertionError("oversized header was not rejected")
         except ProtocolError:
             pass
@@ -127,19 +173,8 @@ def test_protocol_rejects_oversized_frames_without_payload_alloc():
 def test_remote_reader_range_loopback():
     with tempfile.TemporaryDirectory(prefix="dw-net-") as td:
         base = Path(td) / "node"
-        p = Platform(str(base))
-        p.create_feed({
-            "feed_name": "events",
-            "mode": "UF",
-            "fields": [
-                {"name": "ts", "type": "uint64"},
-                {"name": "value", "type": "uint64"},
-            ],
-            "clock_level": 1,
-            "persist": False,
-            "ring_size_mb": 1,
-        })
-        writer = p.create_writer("events")
+        _create_events_feed(base, persist=False, ring_size_mb=1)
+        writer = Writer(base, "events")
         start = 1_700_000_000_000_000
         for i in range(5):
             writer.write_values(start + i * 10, i)
@@ -151,6 +186,25 @@ def test_remote_reader_range_loopback():
             port = int(server.server_address[1])
             rr = RemoteReader("127.0.0.1", str(base), "events", port=port, timeout=2.0)
             try:
+                assert isinstance(rr.layout, FeedSchema)
+                assert isinstance(rr.record_format, FeedSchema)
+                assert rr.layout.record_size == 16
+                description = rr.describe()
+                assert description["record_size"] == 16
+                assert description["record_fmt"] == "<QQ"
+                assert rr.fields == (
+                    {"name": "ts", "type": "uint64", "offset": 0, "size": 8},
+                    {"name": "value", "type": "uint64", "offset": 8, "size": 8},
+                )
+                assert rr.timestamp_fields == (
+                    {"name": "ts", "type": "uint64", "offset": 0, "size": 8},
+                )
+                assert rr.is_persistent is False
+                state = rr.state()
+                assert state["record_count"] >= 5
+                assert rr.first_after(start + 1) == (start + 10, 1)
+                assert rr.first_before(start + 25) == (start + 20, 2)
+                assert rr.first_before(start - 1) is None
                 records = rr.range(start, start + 50)
                 assert records == [(start + i * 10, i) for i in range(5)]
                 as_dict = rr.range(start, start + 20, format="dict")
@@ -161,36 +215,42 @@ def test_remote_reader_range_loopback():
                 raw = rr.range(start, start + 10, format="raw")
                 assert len(raw) == rr.record_size
                 expected_raw = struct.pack("<QQ", start, 0)
+                assert bytes(rr.range(start, start + 10, format="raw")) == expected_raw
+                arr = rr.range(start, start + 20, format="numpy")
+                assert arr.shape == (2,)
+                assert arr["value"].tolist() == [0, 1]
+                cols = rr.range_columns(start, start + 30, ["value"])
+                assert cols["value"].tolist() == [0, 1, 2]
             finally:
                 rr.close()
             assert bytes(raw) == expected_raw
 
-            with dw.reader(f"dw://127.0.0.1:{port}{base}", stream="events", timeout=2.0) as helper:
+            remote_url = f"dw://127.0.0.1:{port}{base}"
+            with Reader(remote_url, "events", timeout=2.0) as helper:
                 records = helper.range(start, start + 20)
                 assert records == [(start, 0), (start + 10, 1)]
         finally:
             server.shutdown()
             server.server_close()
-            p.close()
+            _close_all(writer)
+            delete_feed(base, "events", missing_ok=True)
 
 
 def test_remote_reader_ts_key_loopback():
     with tempfile.TemporaryDirectory(prefix="dw-net-ts-key-") as td:
         base = Path(td) / "node"
-        p = Platform(str(base))
-        p.create_feed({
-            "feed_name": "events",
-            "mode": "UF",
-            "fields": [
+        _create_events_feed(
+            base,
+            fields=[
                 {"name": "event_ts", "type": "uint64"},
                 {"name": "recv_ts", "type": "uint64"},
                 {"name": "value", "type": "uint64"},
             ],
-            "clock_level": 2,
-            "persist": True,
-            "chunk_size_mb": 1,
-        })
-        writer = p.create_writer("events")
+            clock_level=2,
+            persist=True,
+            chunk_size_mb=1,
+        )
+        writer = Writer(base, "events")
         start = int(time.time() * 1_000_000) - 10_000
         for i in range(5):
             writer.write_values(start + i * 10, start + 1_000 + i * 100, i)
@@ -212,8 +272,8 @@ def test_remote_reader_ts_key_loopback():
                 batches = list(rr.range_batches(start + 1_100, start + 1_500, ts_key="recv_ts", batch_records=2))
                 assert [len(batch) for batch in batches] == [2, 2]
                 assert [record[2] for batch in batches for record in batch] == [1, 2, 3, 4]
-                latest = rr.latest(1_000_000, ts_key="recv_ts")
-                assert latest[-1] == (start + 40, start + 1_400, 4)
+                tail = rr.range(start + 1_300, start + 1_500, ts_key="recv_ts")
+                assert tail[-1] == (start + 40, start + 1_400, 4)
                 try:
                     rr.range(start, start + 1, ts_key="missing_ts")
                     raise AssertionError("invalid remote ts_key was not rejected")
@@ -224,40 +284,32 @@ def test_remote_reader_ts_key_loopback():
         finally:
             server.shutdown()
             server.server_close()
-            p.close()
+            _close_all(writer)
+            delete_feed(base, "events", missing_ok=True)
 
 
 def test_remote_reader_range_batches_loopback():
     with tempfile.TemporaryDirectory(prefix="dw-net-paged-") as td:
         base = Path(td) / "node"
-        p = Platform(str(base))
-        p.create_feed({
-            "feed_name": "events",
-            "mode": "UF",
-            "fields": [
-                {"name": "ts", "type": "uint64"},
-                {"name": "value", "type": "uint64"},
-            ],
-            "clock_level": 1,
-            "persist": True,
-            "chunk_size_mb": 1,
-        })
-        writer = p.create_writer("events")
+        _create_events_feed(base, persist=True, chunk_size_mb=1)
+        writer = Writer(base, "events")
         start = 1_700_000_000_000_000
         for i in range(7):
             writer.write_values(start + i * 10, i)
         writer.close()
 
-        direct = p.create_reader("events")
+        direct = Reader(base, "events")
         direct_batches = list(direct.range_batches(start, start + 70, batch_records=4))
         assert [len(batch) for batch in direct_batches] == [4, 3]
         boundary_batches = list(direct.range_batches(start, start + 20, batch_records=10))
         assert boundary_batches == [[(start, 0), (start + 10, 1)]]
-        p.close_reader("events")
+        direct.close()
 
-        with dw.reader(str(base), stream="events") as local:
+        with Reader(str(base), "events") as local:
             local_batches = list(local.range_batches(start, start + 70, batch_records=4))
             assert [len(batch) for batch in local_batches] == [4, 3]
+            assert local.first_after(start + 1) == (start + 10, 1)
+            assert local.first_before(start + 25) == (start + 20, 2)
 
         server = make_server(Path(td), ("127.0.0.1", 0))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -266,11 +318,11 @@ def test_remote_reader_range_batches_loopback():
             port = int(server.server_address[1])
             rr = RemoteReader("127.0.0.1", str(base), "events", port=port, timeout=2.0)
             try:
-                assert rr.protocol_version == 1
+                assert rr.protocol_version == protocol.PROTOCOL_VERSION
                 assert rr.capabilities["paged_range"] is True
                 assert rr.format == "<QQ"
                 assert rr.field_names == ("ts", "value")
-                assert rr.record_format["record_size"] == rr.record_size
+                assert rr.record_format.record_size == rr.record_size
                 batches = list(rr.range_batches(start, start + 70, batch_records=3))
                 assert [len(batch) for batch in batches] == [3, 3, 1]
                 assert [record for batch in batches for record in batch] == [
@@ -283,25 +335,14 @@ def test_remote_reader_range_batches_loopback():
         finally:
             server.shutdown()
             server.server_close()
-            p.close()
+            delete_feed(base, "events", missing_ok=True)
 
 
 def test_remote_reader_read_available_loopback():
     with tempfile.TemporaryDirectory(prefix="dw-net-available-") as td:
         base = Path(td) / "node"
-        p = Platform(str(base))
-        p.create_feed({
-            "feed_name": "events",
-            "mode": "UF",
-            "fields": [
-                {"name": "ts", "type": "uint64"},
-                {"name": "value", "type": "uint64"},
-            ],
-            "clock_level": 1,
-            "persist": False,
-            "ring_size_mb": 1,
-        })
-        writer = p.create_writer("events")
+        _create_events_feed(base, persist=False, ring_size_mb=1)
+        writer = Writer(base, "events")
         start = 1_700_000_000_000_000
         writer.write_values(start, 0)
 
@@ -322,25 +363,15 @@ def test_remote_reader_read_available_loopback():
         finally:
             server.shutdown()
             server.server_close()
-            p.close()
+            _close_all(writer)
+            delete_feed(base, "events", missing_ok=True)
 
 
 def test_remote_stream_heartbeat_loopback():
     with tempfile.TemporaryDirectory(prefix="dw-net-heartbeat-") as td:
         base = Path(td) / "node"
-        p = Platform(str(base))
-        p.create_feed({
-            "feed_name": "events",
-            "mode": "UF",
-            "fields": [
-                {"name": "ts", "type": "uint64"},
-                {"name": "value", "type": "uint64"},
-            ],
-            "clock_level": 1,
-            "persist": False,
-            "ring_size_mb": 1,
-        })
-        writer = p.create_writer("events")
+        _create_events_feed(base, persist=False, ring_size_mb=1)
+        writer = Writer(base, "events")
         writer.write_values(1_700_000_000_000_000, 0)
 
         server = make_server(
@@ -357,65 +388,46 @@ def test_remote_stream_heartbeat_loopback():
             sock = socket.create_connection(("127.0.0.1", port), timeout=1.0)
             sock.settimeout(1.0)
             try:
-                write_frame(sock, {"op": "HELLO", "id": 1, "version": 1})
+                write_frame(sock, frame(Op.HELLO, 1, (1,)))
                 header, _payload = read_frame(sock)
-                assert header["op"] == "HELLO"
-                assert header["capabilities"]["heartbeat"] is True
+                assert header.op == Op.HELLO
+                assert header.args[1]["heartbeat"] is True
 
-                write_frame(sock, {
-                    "op": "OPEN_READER",
-                    "id": 2,
-                    "path": str(base),
-                    "feed_name": "events",
-                })
+                write_frame(sock, frame(Op.OPEN_READER, 2, (str(base), "events")))
                 header, _payload = read_frame(sock)
-                assert header["op"] == "READER_OPEN"
+                assert header.op == Op.READER_OPEN
 
-                write_frame(sock, {
-                    "op": "SUBSCRIBE_LIVE",
-                    "id": 3,
-                    "start": None,
-                    "playback": False,
-                })
+                write_frame(sock, frame(Op.SUBSCRIBE_LIVE, 3))
                 header, _payload = read_frame(sock)
-                assert header["op"] == "SUBSCRIBED"
-                assert header["heartbeat_interval_s"] == 0.05
+                assert header.op == Op.SUBSCRIBED
+                assert header.args[2] == 0.05
 
                 header, payload = read_frame(sock)
-                assert header["op"] == "HEARTBEAT"
-                assert header["id"] == 3
+                assert header.op == Op.HEARTBEAT
+                assert header.id == 3
                 assert payload == b""
-                assert "server_time_us" in header
+                assert header.args[1] > 0
             finally:
                 sock.close()
         finally:
             server.shutdown()
             server.server_close()
-            p.close()
+            _close_all(writer)
+            delete_feed(base, "events", missing_ok=True)
 
 
-def test_local_ring_reader_range_batches_loopback():
+def test_local_live_ring_range_batches_loopback():
     with tempfile.TemporaryDirectory(prefix="dw-net-ring-batches-") as td:
         base = Path(td) / "node"
-        p = Platform(str(base))
-        p.create_feed({
-            "feed_name": "events",
-            "mode": "UF",
-            "fields": [
-                {"name": "ts", "type": "uint64"},
-                {"name": "value", "type": "uint64"},
-            ],
-            "clock_level": 1,
-            "persist": False,
-            "ring_size_mb": 1,
-        })
-        writer = p.create_writer("events")
+        _create_events_feed(base, persist=False, ring_size_mb=1)
+        writer = Writer(base, "events")
         start = 1_700_000_000_000_000
         for i in range(5):
             writer.write_values(start + i * 10, i)
 
+        reader = None
         try:
-            reader = p.create_reader("events")
+            reader = Reader(base, "events")
             batches = list(reader.range_batches(start, start + 50, batch_records=2))
             assert [len(batch) for batch in batches] == [2, 2, 1]
             assert [record for batch in batches for record in batch] == [
@@ -431,25 +443,15 @@ def test_local_ring_reader_range_batches_loopback():
                 1,
             )
         finally:
-            p.close()
+            _close_all(reader, writer)
+            delete_feed(base, "events", missing_ok=True)
 
 
-def test_remote_platform_metadata_and_reader_loopback():
+def test_remote_metadata_and_reader_loopback():
     with tempfile.TemporaryDirectory(prefix="dw-net-platform-") as td:
         base = Path(td) / "node"
-        p = Platform(str(base))
-        p.create_feed({
-            "feed_name": "events",
-            "mode": "UF",
-            "fields": [
-                {"name": "ts", "type": "uint64"},
-                {"name": "value", "type": "uint64"},
-            ],
-            "clock_level": 1,
-            "persist": True,
-            "chunk_size_mb": 1,
-        })
-        writer = p.create_writer("events")
+        _create_events_feed(base, persist=True, chunk_size_mb=1)
+        writer = Writer(base, "events")
         start = 1_700_000_000_000_000
         for i in range(3):
             writer.write_values(start + i * 10, i)
@@ -460,88 +462,31 @@ def test_remote_platform_metadata_and_reader_loopback():
         thread.start()
         try:
             port = int(server.server_address[1])
-            remote = Platform(f"dw://127.0.0.1:{port}{base}")
-            try:
-                assert remote.feed_exists("events") is True
-                assert "events" in remote.list_feeds()
-                assert remote.lifecycle("events")["persist"] is True
-                assert remote.get_record_format("events")["fmt"] == "<QQ"
-                assert remote.describe_feed("events")["record_size"] == 16
-                assert isinstance(remote.list_segments("events"), list)
-                assert remote.suggested_reader_range("events") is not None
-                reader = remote.create_reader("events")
-                try:
-                    assert reader.range(start, start + 30) == [
-                        (start, 0),
-                        (start + 10, 1),
-                        (start + 20, 2),
-                    ]
-                finally:
-                    reader.close()
-            finally:
-                remote.close()
+            remote_base = f"dw://127.0.0.1:{port}{base}"
+            assert remote_metadata(remote_base, Op.FEED_EXISTS, "events") is True
+            assert "events" in dw.list_feeds(remote_base)
+            assert dw.feed_metadata(remote_base, "events")["persist"] is True
+            assert dw.get_record_format(remote_base, "events")["fmt"] == "<QQ"
+            assert dw.describe_feed(remote_base, "events")["record_size"] == 16
+            assert isinstance(dw.list_segments(remote_base, "events"), list)
+            assert dw.suggested_reader_range(remote_base, "events") is not None
+            with Reader(remote_base, "events", timeout=2.0) as reader:
+                assert reader.range(start, start + 30) == [
+                    (start, 0),
+                    (start + 10, 1),
+                    (start + 20, 2),
+                ]
         finally:
             server.shutdown()
             server.server_close()
-            p.close()
-
-
-def test_remote_platform_close_closes_created_readers():
-    with tempfile.TemporaryDirectory(prefix="dw-net-platform-close-") as td:
-        base = Path(td) / "node"
-        p = Platform(str(base))
-        p.create_feed({
-            "feed_name": "events",
-            "mode": "UF",
-            "fields": [
-                {"name": "ts", "type": "uint64"},
-                {"name": "value", "type": "uint64"},
-            ],
-            "clock_level": 1,
-            "persist": True,
-            "chunk_size_mb": 1,
-        })
-        writer = p.create_writer("events")
-        start = 1_700_000_000_000_000
-        writer.write_values(start, 1)
-        writer.close()
-
-        server = make_server(Path(td), ("127.0.0.1", 0))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            port = int(server.server_address[1])
-            remote = Platform(f"dw://127.0.0.1:{port}{base}")
-            reader = remote.create_reader("events")
-            assert reader.range(start, start + 10) == [(start, 1)]
-            remote.close()
-            try:
-                reader.range(start, start + 10)
-                raise AssertionError("reader should be closed by remote platform close")
-            except RemoteReaderError:
-                pass
-        finally:
-            server.shutdown()
-            server.server_close()
-            p.close()
+            delete_feed(base, "events", missing_ok=True)
 
 
 def test_remote_metadata_clis_loopback():
     with tempfile.TemporaryDirectory(prefix="dw-net-cli-") as td:
         base = Path(td) / "node"
-        p = Platform(str(base))
-        p.create_feed({
-            "feed_name": "events",
-            "mode": "UF",
-            "fields": [
-                {"name": "ts", "type": "uint64"},
-                {"name": "value", "type": "uint64"},
-            ],
-            "clock_level": 1,
-            "persist": True,
-            "chunk_size_mb": 1,
-        })
-        writer = p.create_writer("events")
+        _create_events_feed(base, persist=True, chunk_size_mb=1)
+        writer = Writer(base, "events")
         start = 1_700_000_000_000_000
         for i in range(5):
             writer.write_values(start + i * 10, i)
@@ -590,7 +535,7 @@ def test_remote_metadata_clis_loopback():
         finally:
             server.shutdown()
             server.server_close()
-            p.close()
+            delete_feed(base, "events", missing_ok=True)
 
 
 def run_tests():
@@ -604,9 +549,8 @@ def run_tests():
         ("remote_reader_range_batches_loopback", test_remote_reader_range_batches_loopback),
         ("remote_reader_read_available_loopback", test_remote_reader_read_available_loopback),
         ("remote_stream_heartbeat_loopback", test_remote_stream_heartbeat_loopback),
-        ("local_ring_reader_range_batches_loopback", test_local_ring_reader_range_batches_loopback),
-        ("remote_platform_metadata_and_reader_loopback", test_remote_platform_metadata_and_reader_loopback),
-        ("remote_platform_close_closes_created_readers", test_remote_platform_close_closes_created_readers),
+        ("local_live_ring_range_batches_loopback", test_local_live_ring_range_batches_loopback),
+        ("remote_metadata_and_reader_loopback", test_remote_metadata_and_reader_loopback),
         ("remote_metadata_clis_loopback", test_remote_metadata_clis_loopback),
     ]
     print("Network Tests")

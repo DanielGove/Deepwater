@@ -13,7 +13,7 @@ Run all tests:
 
 ```
 tests/
-├── test_core.py          # Core platform functionality
+├── test_core.py          # Core feed and I/O functionality
 ├── test_multikey.py      # Multi-key timestamp queries
 └── test_*.py             # Add more tests here
 
@@ -31,15 +31,28 @@ Create `tests/test_feature.py`:
 """Test: Feature Name"""
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import Reader, Writer, create_feed
 
 def test_something():
     """Test description"""
-    p = Platform('./data/test-feature')
-    # ... test code ...
-    p.close()
+    base = './data/test-feature'
+    create_feed(base, {
+        "feed_name": "events",
+        "mode": "UF",
+        "fields": [
+            {"name": "ts", "type": "uint64"},
+            {"name": "value", "type": "uint64"},
+        ],
+        "clock_level": 1,
+        "persist": True,
+    })
+    writer = Writer(base, "events")
+    writer.write_values(1_000, 7)
+    writer.close()
+    with Reader(base, "events") as reader:
+        assert reader.range(1_000, 1_001) == [(1_000, 7)]
     return True  # or raise exception
 
 def run_tests():
@@ -64,9 +77,9 @@ if __name__ == '__main__':
 
 ## Test Categories
 
-- **Core tests** (`test_core.py`) - Platform, feeds, basic I/O
+- **Core tests** (`test_core.py`) - feeds, Reader/Writer, basic I/O
 - **Feature tests** (`test_*.py`) - Specific features
-- **Integration tests** (`src/tests/`) - Full workflows (websocket, etc.)
+- **Examples** (`examples/`) - Manual workflow scripts, not regression tests
 
 ## Guidelines
 

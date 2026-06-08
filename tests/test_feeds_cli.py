@@ -8,9 +8,9 @@ from pathlib import Path
 
 import orjson
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import create_feed
 from deepwater.cli.feeds_cli import main as feeds_main
 
 
@@ -27,17 +27,14 @@ def _spec(name: str, persist: bool = True) -> dict:
         "persist": persist,
         "chunk_size_mb": 1,
         "retention_hours": 24,
-        "index_playback": False,
     }
 
 
 def test_list_feeds_text():
     with tempfile.TemporaryDirectory(prefix="dw-feeds-list-") as td:
         base = Path(td) / "platform"
-        p = Platform(str(base))
-        p.create_feed(_spec("trades"))
-        p.create_feed(_spec("quotes", persist=False))
-        p.close()
+        create_feed(base, _spec("trades"))
+        create_feed(base, _spec("quotes", persist=False))
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -53,9 +50,7 @@ def test_list_feeds_text():
 def test_describe_single_feed_json():
     with tempfile.TemporaryDirectory(prefix="dw-feeds-one-") as td:
         base = Path(td) / "platform"
-        p = Platform(str(base))
-        p.create_feed(_spec("trades"))
-        p.close()
+        create_feed(base, _spec("trades"))
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -68,7 +63,7 @@ def test_describe_single_feed_json():
 
         assert rc == 0
         assert payload["feed_name"] == "trades"
-        assert payload["lifecycle"]["persist"] is True
+        assert payload["metadata"]["persist"] is True
         assert isinstance(payload["record_fmt"], str) and payload["record_fmt"], "missing fmt"
         assert payload["record_size"] > 0
         assert payload["fields"][0]["name"] == "recv_us"
@@ -77,10 +72,8 @@ def test_describe_single_feed_json():
 def test_describe_all_json():
     with tempfile.TemporaryDirectory(prefix="dw-feeds-all-") as td:
         base = Path(td) / "platform"
-        p = Platform(str(base))
-        p.create_feed(_spec("a"))
-        p.create_feed(_spec("b", persist=False))
-        p.close()
+        create_feed(base, _spec("a"))
+        create_feed(base, _spec("b", persist=False))
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -96,8 +89,7 @@ def test_describe_all_json():
 def test_describe_missing_feed_fails():
     with tempfile.TemporaryDirectory(prefix="dw-feeds-missing-") as td:
         base = Path(td) / "platform"
-        p = Platform(str(base))
-        p.close()
+        (base / "data").mkdir(parents=True, exist_ok=True)
 
         err = io.StringIO()
         with redirect_stderr(err):
@@ -110,9 +102,7 @@ def test_describe_missing_feed_fails():
 def test_describe_single_feed_text_timestamp_formats():
     with tempfile.TemporaryDirectory(prefix="dw-feeds-text-ts-") as td:
         base = Path(td) / "platform"
-        p = Platform(str(base))
-        p.create_feed(_spec("trades"))
-        p.close()
+        create_feed(base, _spec("trades"))
 
         human_buf = io.StringIO()
         with redirect_stdout(human_buf):

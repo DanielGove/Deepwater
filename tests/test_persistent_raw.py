@@ -5,14 +5,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import Reader, Writer, create_feed
 
 
-def _make_platform(base: Path):
-    p = Platform(str(base))
-    p.create_feed({
+def _make_feed(base: Path):
+    create_feed(base, {
         "feed_name": "events",
         "mode": "UF",
         "fields": [
@@ -24,18 +23,18 @@ def _make_platform(base: Path):
         "chunk_size_mb": 1,
         "ring_size_mb": 1,
     })
-    return p
 
 
 def test_persistent_raw_range_and_batches_match_tuples():
     with tempfile.TemporaryDirectory(prefix="dw-persist-raw-") as td:
-        p = _make_platform(Path(td))
-        w = p.create_writer("events")
+        base = Path(td)
+        _make_feed(base)
+        w = Writer(base, "events")
         start = 1_800_000_000_000_000
         for i in range(8):
             w.write_values(start + i * 10, i)
 
-        r = p.create_reader("events")
+        r = Reader(base, "events")
         try:
             tuples = r.range(start + 10, start + 70)
             dicts = r.range(start + 10, start + 30, format="dict")
@@ -55,10 +54,6 @@ def test_persistent_raw_range_and_batches_match_tuples():
                 for batch in r.range_batches(start + 10, start + 50, format="numpy", batch_records=2)
                 for value in batch["value"]
             ]
-            raw_iter = b"".join(
-                bytes(batch)
-                for batch in r.iter_raw_range(start + 10, start + 70, batch_records=2)
-            )
             expected = b"".join(struct.pack("<QQ", start + i * 10, i) for i in range(1, 7))
 
             assert tuples == [(start + i * 10, i) for i in range(1, 7)]
@@ -69,21 +64,22 @@ def test_persistent_raw_range_and_batches_match_tuples():
             assert list(numpy_records["value"]) == [1, 2]
             assert raw == expected
             assert raw_batches == expected
-            assert raw_iter == expected
             assert [row["value"] for row in dict_batches] == [1, 2, 3, 4]
             assert numpy_values == [1, 2, 3, 4]
         finally:
-            p.close()
+            r.close()
+            w.close()
 
 
 def test_persistent_read_available_raw_matches_new_records():
     with tempfile.TemporaryDirectory(prefix="dw-persist-available-") as td:
-        p = _make_platform(Path(td))
-        w = p.create_writer("events")
+        base = Path(td)
+        _make_feed(base)
+        w = Writer(base, "events")
         start = 1_800_000_000_000_000
         w.write_values(start, 0)
 
-        r = p.create_reader("events")
+        r = Reader(base, "events")
         try:
             assert bytes(r.read_available(format="raw")) == b""
             w.write_values(start + 10, 1)
@@ -96,7 +92,8 @@ def test_persistent_read_available_raw_matches_new_records():
                 2,
             )
         finally:
-            p.close()
+            r.close()
+            w.close()
 
 
 def run_tests():

@@ -2,42 +2,54 @@
 Setup script for Deepwater with Cython extensions.
 Compiles hot paths to C for maximum performance.
 """
-from setuptools import setup, Extension
-from Cython.Build import cythonize
+from __future__ import annotations
+
 import sys
 
-# Compiler optimization flags
+from Cython.Build import cythonize
+from setuptools import Extension, setup
+
+
 extra_compile_args = [
-    "-O3",              # Maximum optimization
-    "-march=native",    # Use CPU-specific instructions
-    "-ffast-math",      # Aggressive floating-point optimizations
+    "-O3",
+    "-march=native",
+    "-ffast-math",
 ]
 
-# Platform-specific adjustments
 if sys.platform == "darwin":
-    extra_compile_args.remove("-march=native")  # macOS issues with this flag
+    extra_compile_args.remove("-march=native")
     extra_compile_args.append("-march=x86-64")
+
 
 extensions = [
     Extension(
-        "deepwater.io.reader_fast",
-        ["src/deepwater/io/reader_fast.pyx"],
+        "deepwater.io.reader",
+        ["deepwater/io/reader.py"],
         extra_compile_args=extra_compile_args,
         extra_link_args=["-O3"],
-    )
+    ),
+    Extension(
+        "deepwater.io.traversal",
+        ["deepwater/io/traversal.pyx"],
+        extra_compile_args=extra_compile_args,
+        extra_link_args=["-O3"],
+    ),
 ]
+
 
 setup(
     ext_modules=cythonize(
         extensions,
+        build_dir="build/cython",
         compiler_directives={
-            'language_level': "3",
-            'boundscheck': False,      # No bounds checking
-            'wraparound': False,        # No negative indexing
-            'cdivision': True,          # C-style division
-            'initializedcheck': False,  # No initialization checks
-            'embedsignature': True,     # Keep docstrings
+            "language_level": "3",
+            "boundscheck": False,
+            "wraparound": False,
+            "cdivision": True,
+            "initializedcheck": False,
+            "embedsignature": True,
         },
-        annotate=False,  # Set to True to generate HTML annotation files
+        annotate=False,
     ),
+    zip_safe=False,
 )

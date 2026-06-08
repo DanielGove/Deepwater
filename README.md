@@ -47,16 +47,16 @@ deepwater --path ./my-deepwater-guide --force
 
 ---
 
-## Platform Core
+## Primitive Core
 
 ```python
-from deepwater import Platform
+import time
+from deepwater import Reader, Writer, create_feed, delete_feed
 
-# Initialize
-p = Platform('./data')
+base = './data'
 
 # Create feed (define schema)
-p.create_feed({
+create_feed(base, {
     'feed_name': 'trades',
     'mode': 'UF',
     'fields': [
@@ -69,20 +69,22 @@ p.create_feed({
 })
 
 # Write
-writer = p.create_writer('trades')
+writer = Writer(base, 'trades')
 writer.write_values(int(time.time() * 1e6), 123.45, 100.0)
 writer.close()
 
 # Read
-reader = p.create_reader('trades')
+reader = Reader(base, 'trades')
 for record in reader.stream():  # Live streaming
     print(record)
     break
 records = reader.range(start_us, end_us)  # Historical range
+arrays = reader.range(start_us, end_us, format="numpy")  # Structured NumPy array
+columns = reader.range_columns(start_us, end_us, ["price", "size"])
 reader.close()
 
 # Delete feed (wipe data + registry entry)
-p.delete_feed('trades')  # Useful for development resets
+delete_feed(base, 'trades')  # Useful for development resets
 
 # Clock Levels
 # -------------
@@ -93,7 +95,8 @@ p.delete_feed('trades')  # Useful for development resets
 # Place those time fields first in `fields` (all uint64). They are all queryable via `ts_key`.
 
 # API docs
-help(Platform)
+help(Reader)
+help(Writer)
 help(reader.stream)
 help(reader.range)
 ```
@@ -105,7 +108,7 @@ help(reader.range)
 Deepwater Networking v0 is a small remote reader path for machines on the same Tailscale tailnet. It does not manage Tailscale, VPN routing, public TLS, NAT, Mullvad, or port forwarding. Access control for v0 is the network boundary: bind the agent only where trusted tailnet clients can reach it.
 
 Current scope:
-- remote reads: supported via `range()`, `latest()`, and `stream()`
+- remote reads: supported via `range()`, `range_batches()`, and `stream()`
 - large historical reads: supported via `range_batches()`
 - non-blocking event-loop reads: supported via `read_available()`
 - remote writes: not supported in v0; writers remain local to the data machine
@@ -128,31 +131,28 @@ Deepwater does not manage Tailscale. MagicDNS hostnames work when the operator's
 ### Read from a Laptop
 
 ```python
-import deepwater as dw
+from deepwater import Reader
 
-reader = dw.reader(
+remote = Reader(
     "deepwater-pioneer:/deepwater/data/hyperliquid-node",
-    stream="hl.status.events",
+    "hl.status.events",
 )
 
-recent = reader.latest(60)
-window = reader.range(start_us, end_us, format="dict")
-for batch in reader.range_batches(start_us, end_us, batch_records=50_000):
+window = remote.range(start_us, end_us, format="dict")
+for batch in remote.range_batches(start_us, end_us, batch_records=50_000):
     process(batch)
-reader.close()
+remote.close()
 ```
 
 Custom port form:
 
 ```python
-reader = dw.reader("dw://deepwater-pioneer:7447/deepwater/data/hyperliquid-node", stream="trades")
+remote = Reader("dw://deepwater-pioneer:7447/deepwater/data/hyperliquid-node", "trades")
 ```
 
-`dw.reader(local_path, stream="feed")` also works for local paths and returns a managed local reader. Use `Platform(...)` directly when you need local writer APIs.
+The same `Reader(base_path, feed)` constructor opens a local reader for local paths and a remote reader for `host:/path` or `dw://host/path` targets.
 
-`Platform("host:/base")` also works for read-side platform operations such as `create_reader`, `feed_exists`, `list_feeds`, `describe_feed`, `lifecycle`, `get_record_format`, `list_segments`, and `suggested_reader_range`.
-
-See `network.md` for the v0 architecture, `network_v1_plan.md` for the v1 roadmap, and `examples/network_remote_read.py` for a runnable client script.
+For remote metadata, use the explicit helpers in `deepwater.network.client` or the local metadata helpers against a mounted/local base path. The public local workflow is `Reader(base_path, feed)`, `Writer(base_path, feed)`, and standalone metadata functions.
 
 ---
 
@@ -173,13 +173,13 @@ Create `tests/test_yourfeature.py`:
 """Test: Your Feature"""
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import Reader, Writer, create_feed
 
 def test_your_feature():
-    p = Platform('./data/test-yourfeature')  # Unique test dir
-    p.create_feed({
+    base = './data/test-yourfeature'  # Unique test dir
+    create_feed(base, {
         'feed_name': 'test',
         'mode': 'UF',
         'fields': [
@@ -190,17 +190,16 @@ def test_your_feature():
         'persist': True,
     })
     
-    writer = p.create_writer('test')
-    writer.write_values(12345)
+    writer = Writer(base, 'test')
+    writer.write_values(12345, 7)
     writer.close()
     
-    reader = p.create_reader('test')
+    reader = Reader(base, 'test')
     data = reader.range(0, 99999)
     assert len(data) > 0, "Expected data"
     assert data[0][0] == 12345
     
     reader.close()
-    p.close()
     return True
 
 def run_tests():
@@ -242,7 +241,6 @@ deepwater-health --base-path ./data --check-feeds --max-age-seconds 300
 ```
 
 Validates:
-- Manifest exists and version matches
 - Global registry accessible
 - Feed registries readable
 - Recent write activity (if --check-feeds)
@@ -304,8 +302,7 @@ Single feed file:
   "clock_level": 1,
   "persist": true,
   "chunk_size_mb": 64,
-  "retention_hours": 0,
-  "index_playback": false
+  "retention_hours": 0
 }
 ```
 

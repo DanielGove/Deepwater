@@ -4,10 +4,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "tests"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "coinbase"))
 
-from deepwater import Platform
+from deepwater.metadata.discovery import list_segments
 import websocket_client as ws_client
 from websocket_client import MarketDataEngine
 
@@ -59,9 +59,8 @@ def test_disconnect_closes_segments_and_reopens_writers():
         engine = MarketDataEngine(sample_size=4)
         old_trade_spec = ws_client.trades_spec
         old_l2_spec = ws_client.l2_spec
-        # Replace default platform path and feed specs with test-local config.
-        engine.platform.close()
-        engine.platform = Platform(str(base))
+        # Replace default base path and feed specs with test-local config.
+        engine.base_path = base
         engine.trade_writers.clear()
         engine.book_writers.clear()
         engine.product_ids.clear()
@@ -76,7 +75,7 @@ def test_disconnect_closes_segments_and_reopens_writers():
             # Simulate websocket disconnect finalizer path.
             engine._close_all_writers()
 
-            segs = engine.platform.list_segments(feed_name)
+            segs = list_segments(base, feed_name)
             assert segs, "expected at least one segment after write"
             assert segs[-1]["status"] == "closed", f"expected closed segment, got {segs[-1]}"
 

@@ -6,10 +6,11 @@ from pathlib import Path
 
 import orjson
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import create_feed
 from deepwater.cli.feed_cli import create_main, delete_main
+from deepwater.metadata.discovery import feed_exists, list_feeds
 
 
 def _spec(name: str, persist: bool = True) -> dict:
@@ -38,10 +39,8 @@ def test_create_cli_idempotent_from_single_config():
         assert rc1 == 0
         assert rc2 == 0
 
-        p = Platform(str(base))
-        feeds = p.list_feeds()
+        feeds = list_feeds(base)
         assert feeds == ["trades"], f"expected one feed, got {feeds}"
-        p.close()
 
 
 def test_create_cli_supports_bundle_and_config_dir():
@@ -59,10 +58,8 @@ def test_create_cli_supports_bundle_and_config_dir():
         rc = create_main(["--base-path", str(base), "--config-dir", str(cfg_dir)])
         assert rc == 0
 
-        p = Platform(str(base))
-        feeds = set(p.list_feeds())
+        feeds = set(list_feeds(base))
         assert feeds == {"a", "b", "c"}, f"unexpected feeds: {feeds}"
-        p.close()
 
 
 def test_delete_cli_from_feed_names_and_config():
@@ -72,10 +69,8 @@ def test_delete_cli_from_feed_names_and_config():
         cfg = root / "delete.json"
         cfg.write_bytes(orjson.dumps(_spec("b")))
 
-        p = Platform(str(base))
-        p.create_feed(_spec("a"))
-        p.create_feed(_spec("b"))
-        p.close()
+        create_feed(base, _spec("a"))
+        create_feed(base, _spec("b"))
 
         rc = delete_main([
             "--base-path", str(base),
@@ -84,10 +79,8 @@ def test_delete_cli_from_feed_names_and_config():
         ])
         assert rc == 0
 
-        p = Platform(str(base))
-        assert not p.feed_exists("a")
-        assert not p.feed_exists("b")
-        p.close()
+        assert not feed_exists(base, "a")
+        assert not feed_exists(base, "b")
 
 
 def test_delete_cli_strict_missing_fails():

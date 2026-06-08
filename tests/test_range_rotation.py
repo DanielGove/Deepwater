@@ -7,14 +7,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import Reader, Writer, create_feed
 from deepwater.metadata.feed_registry import FeedRegistry
 
 
 def _make_feed(base: Path, chunk_mb: float = 1.0):
-    p = Platform(str(base))
     spec = {
         "feed_name": "rot_clock3",
         "mode": "UF",
@@ -28,18 +27,17 @@ def _make_feed(base: Path, chunk_mb: float = 1.0):
         "clock_level": 3,
         "persist": True,
         "chunk_size_mb": chunk_mb,
-        "index_playback": False,
     }
-    p.create_feed(spec)
-    return p, spec["feed_name"]
+    create_feed(base, spec)
+    return base, spec["feed_name"]
 
 
 def test_range_spans_multiple_chunks():
     N = 200_000  # large enough to force several rotations with 1MB chunks (~8 chunks)
     with tempfile.TemporaryDirectory(prefix="dw-rotation-") as td:
         base = Path(td)
-        p, feed = _make_feed(base, chunk_mb=1.0)
-        w = p.create_writer(feed)
+        base, feed = _make_feed(base, chunk_mb=1.0)
+        w = Writer(base, feed)
         base_ts = 1_000_000
         for i in range(N):
             recv = base_ts + i * 10
@@ -57,7 +55,7 @@ def test_range_spans_multiple_chunks():
         assert latest and latest > 2, f"expected >2 chunks, got {latest}"
 
         # Range spanning middle of data across chunk boundaries (proc_us axis)
-        r = p.create_reader(feed)
+        r = Reader(base, feed)
         start_idx = 50_000
         end_idx = 150_000
         start = base_ts + start_idx * 10 + 10  # proc_us = recv+10
@@ -77,7 +75,7 @@ def test_range_spans_multiple_chunks():
         full = r.range(base_ts - 10, base_ts + N * 10, ts_key="ev_us")
         assert len(full) == N, "ev_us full-span count mismatch"
 
-        r.close(); reg.close(); p.close()
+        r.close(); reg.close()
 
 
 def run_tests():

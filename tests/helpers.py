@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import Tuple
 
-from deepwater import Platform
+from deepwater import create_feed
 
 # Canonical feed templates (clock_level model: leading uint64 time axes)
 SPEC_TEMPLATES = {
@@ -50,22 +49,20 @@ SPEC_TEMPLATES = {
 }
 
 
-def make_platform(kind: str, base: Path | None = None) -> Tuple[Platform, str]:
-    """Create (or reuse) a Platform with a canonical feed.
+def make_feed(kind: str, base: Path | None = None) -> tuple[Path, str]:
+    """Create (or reuse) a canonical feed.
 
-    Returns platform and feed_name. Feed is created only once per base dir.
+    Returns base path and feed_name. Feed creation is idempotent.
     """
     if kind not in SPEC_TEMPLATES:
         raise ValueError(f"Unknown feed kind '{kind}'")
     if base is None:
         base = Path(tempfile.mkdtemp(prefix=f"dw-{kind}-"))
     base = Path(base)
-    p = Platform(str(base))
     spec = SPEC_TEMPLATES[kind].copy()
     fname = spec["feed_name"]
-    # Create feed if missing (idempotent as Platform.create_feed already is)
-    p.create_feed(spec)
-    return p, fname
+    create_feed(base, spec)
+    return base, fname
 
 
 def seed_records(writer, n: int, *, start_ts: int = 1_000_000):
@@ -74,7 +71,7 @@ def seed_records(writer, n: int, *, start_ts: int = 1_000_000):
     For clock1: (ts, value)
     For clock3: (recv, proc, ev, trade_id, price)
     """
-    if writer.record_format.get("clock_level", 1) >= 3:
+    if writer.record_format.clock_level >= 3:
         for i in range(n):
             recv = start_ts + i * 10
             proc = recv + 10

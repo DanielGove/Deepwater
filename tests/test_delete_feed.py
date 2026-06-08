@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Tests for Platform.delete_feed()."""
+"""Tests for primitive feed deletion."""
 import sys
 import tempfile
 import time
 from multiprocessing import shared_memory
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import Reader, Writer, create_feed, delete_feed
 from deepwater.io.ring import ring_buffer_shm_names
+from deepwater.metadata.discovery import feed_exists, list_feeds
 
 
 def test_delete_persistent_feed_removes_all_state_and_allows_recreate():
     with tempfile.TemporaryDirectory(prefix="dw-delete-persist-") as td:
         base = Path(td)
-        p = Platform(str(base))
 
         spec = {
             "feed_name": "trades",
@@ -28,46 +28,45 @@ def test_delete_persistent_feed_removes_all_state_and_allows_recreate():
             "persist": True,
             "chunk_size_mb": 1,
         }
-        p.create_feed(spec)
+        create_feed(base, spec)
 
-        w = p.create_writer("trades")
+        w = Writer(base, "trades")
         for i in range(16):
             w.write_values(1_000_000 + i, float(i))
+        w.close()
 
-        # Open reader too; delete_feed should close process-local handles.
-        _ = p.create_reader("trades")
+        r = Reader(base, "trades")
+        r.close()
 
-        removed = p.delete_feed("trades")
+        removed = delete_feed(base, "trades")
         assert removed is True
-        assert not p.feed_exists("trades")
-        assert "trades" not in p.list_feeds()
+        assert not feed_exists(base, "trades")
+        assert "trades" not in list_feeds(base)
         assert not (base / "data" / "trades").exists()
 
         try:
-            p.create_writer("trades")
+            Writer(base, "trades")
             raise AssertionError("expected KeyError for deleted feed")
         except KeyError:
             pass
 
         # Recreate same feed name and verify it works.
-        p.create_feed(spec)
-        w2 = p.create_writer("trades")
+        create_feed(base, spec)
+        w2 = Writer(base, "trades")
         ts_now = int(time.time() * 1e6)
         w2.write_values(ts_now, 42.0)
         w2.close()
 
-        r2 = p.create_reader("trades")
+        r2 = Reader(base, "trades")
         out = r2.range(ts_now - 1_000_000, ts_now + 1_000_000)
         assert len(out) >= 1
         assert out[-1][0] == ts_now
         r2.close()
-        p.close()
 
 
 def test_delete_ring_feed_unlinks_shared_memory_and_registry_entry():
     with tempfile.TemporaryDirectory(prefix="dw-delete-ring-") as td:
         base = Path(td)
-        p = Platform(str(base))
 
         spec = {
             "feed_name": "live",
@@ -80,19 +79,26 @@ def test_delete_ring_feed_unlinks_shared_memory_and_registry_entry():
             "persist": False,
             "chunk_size_mb": 0.01,
         }
-        p.create_feed(spec)
+        create_feed(base, spec)
 
-        w = p.create_writer("live")
+        w = Writer(base, "live")
         w.write_values(1_000_000, 1)
 
         shm_name = ring_buffer_shm_names(base, "live")[0]
         shm = shared_memory.SharedMemory(name=shm_name, create=False)
         shm.close()
 
-        removed = p.delete_feed("live")
+        try:
+            delete_feed(base, "live")
+            raise AssertionError("active writer should block delete")
+        except RuntimeError:
+            pass
+
+        w.close()
+        removed = delete_feed(base, "live")
         assert removed is True
-        assert not p.feed_exists("live")
-        assert "live" not in p.list_feeds()
+        assert not feed_exists(base, "live")
+        assert "live" not in list_feeds(base)
         assert not (base / "data" / "live").exists()
 
         try:
@@ -101,13 +107,10 @@ def test_delete_ring_feed_unlinks_shared_memory_and_registry_entry():
         except FileNotFoundError:
             pass
 
-        p.close()
 
-
-def test_platform_close_unlinks_ring_shared_memory_with_exported_view():
+def test_delete_ring_feed_unlinks_shared_memory_with_exported_view():
     with tempfile.TemporaryDirectory(prefix="dw-close-ring-") as td:
         base = Path(td)
-        p = Platform(str(base))
         spec = {
             "feed_name": "live",
             "mode": "UF",
@@ -119,33 +122,33 @@ def test_platform_close_unlinks_ring_shared_memory_with_exported_view():
             "persist": False,
             "chunk_size_mb": 0.01,
         }
-        p.create_feed(spec)
-        w = p.create_writer("live")
+        create_feed(base, spec)
+        w = Writer(base, "live")
         w.write_values(1_000_000, 1)
 
-        r = p.create_reader("live")
-        raw_record = next(r.stream_from_seq(0, format="raw"))
+        r = Reader(base, "live")
+        raw_record = next(r.stream(start=0, format="raw"))
         assert bytes(raw_record[:8]) != b""
 
         shm_name = ring_buffer_shm_names(base, "live")[0]
         shm = shared_memory.SharedMemory(name=shm_name, create=False)
         shm.close()
 
-        p.close()
+        w.close()
+        delete_feed(base, "live")
 
         try:
             shared_memory.SharedMemory(name=shm_name, create=False)
-            raise AssertionError("ring shared memory still exists after platform close")
+            raise AssertionError("ring shared memory still exists after delete")
         except FileNotFoundError:
             pass
         raw_record.release()
         r.close()
 
 
-def test_read_only_platform_close_does_not_unlink_ring_shared_memory():
+def test_reader_close_does_not_unlink_ring_shared_memory():
     with tempfile.TemporaryDirectory(prefix="dw-close-readonly-ring-") as td:
         base = Path(td)
-        p1 = Platform(str(base))
         spec = {
             "feed_name": "live",
             "mode": "UF",
@@ -157,23 +160,22 @@ def test_read_only_platform_close_does_not_unlink_ring_shared_memory():
             "persist": False,
             "chunk_size_mb": 0.01,
         }
-        p1.create_feed(spec)
-        w = p1.create_writer("live")
+        create_feed(base, spec)
+        w = Writer(base, "live")
         w.write_values(1_000_000, 1)
 
         shm_name = ring_buffer_shm_names(base, "live")[0]
-        p2 = Platform(str(base))
-        r2 = p2.create_reader("live")
+        r2 = Reader(base, "live")
         r2.close()
-        p2.close()
 
         shm = shared_memory.SharedMemory(name=shm_name, create=False)
         shm.close()
 
-        p1.close()
+        w.close()
+        delete_feed(base, "live")
         try:
             shared_memory.SharedMemory(name=shm_name, create=False)
-            raise AssertionError("owned ring shared memory still exists after owner platform close")
+            raise AssertionError("ring shared memory still exists after delete")
         except FileNotFoundError:
             pass
 
@@ -182,8 +184,8 @@ def run_tests():
     tests = [
         ("delete_persistent_feed_removes_all_state_and_allows_recreate", test_delete_persistent_feed_removes_all_state_and_allows_recreate),
         ("delete_ring_feed_unlinks_shared_memory_and_registry_entry", test_delete_ring_feed_unlinks_shared_memory_and_registry_entry),
-        ("platform_close_unlinks_ring_shared_memory_with_exported_view", test_platform_close_unlinks_ring_shared_memory_with_exported_view),
-        ("read_only_platform_close_does_not_unlink_ring_shared_memory", test_read_only_platform_close_does_not_unlink_ring_shared_memory),
+        ("delete_ring_feed_unlinks_shared_memory_with_exported_view", test_delete_ring_feed_unlinks_shared_memory_with_exported_view),
+        ("reader_close_does_not_unlink_ring_shared_memory", test_reader_close_does_not_unlink_ring_shared_memory),
     ]
     print("Delete Feed Tests")
     print("=" * 60)

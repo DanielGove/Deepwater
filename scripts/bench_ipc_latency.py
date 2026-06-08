@@ -15,33 +15,30 @@ import os
 from pathlib import Path
 from typing import List
 
-from deepwater import Platform
+from deepwater import Reader, Writer, create_feed
 from deepwater.metadata.feed_registry import HEADER_SIZE
 
 
-def make_platform(base: Path, chunk_mb: int) -> Platform:
-    p = Platform(str(base))
+def make_feed(base: Path, chunk_mb: int) -> None:
     spec = {
         "feed_name": "bench",
         "mode": "UF",
         "fields": [
+            {"name": "recv_ns", "type": "uint64"},
+            {"name": "proc_ns", "type": "uint64"},
+            {"name": "ev_ns", "type": "uint64"},
             {"name": "id", "type": "uint64"},
-            {"name": "recv_us", "type": "uint64"},
-            {"name": "proc_us", "type": "uint64"},
-            {"name": "ev_us", "type": "uint64"},
             {"name": "price", "type": "float64"},
         ],
         "clock_level": 3,
         "persist": True,
         "chunk_size_mb": chunk_mb,
-        "index_playback": False,
     }
-    p.create_feed(spec)
-    return p
+    create_feed(base, spec)
 
 
-def now_us() -> int:
-    return time.time_ns() // 1_000
+def now_ns() -> int:
+    return time.time_ns()
 
 
 def _pin_to_cpu(cpu_id: int) -> None:
@@ -70,8 +67,7 @@ def reader_proc(base_dir: str, total: int, sleep_us: int, conn, pin_cpu: int):
     if pin_cpu >= 0:
         _pin_to_cpu(pin_cpu)
     _wait_for_registry(base_dir)
-    p = Platform(base_dir)
-    reader = p.create_reader("bench")
+    reader = Reader(base_dir, "bench")
     conn.send("ready")
 
     start_ts = conn.recv()
@@ -85,9 +81,9 @@ def reader_proc(base_dir: str, total: int, sleep_us: int, conn, pin_cpu: int):
         records = reader.read_available()
         if records:
             for rec in records:
-                sent_us = rec[2]  # proc_us
-                if sent_us >= start_ts:
-                    latencies.append(now_us() - sent_us)
+                sent_ns = rec[1]  # proc_ns
+                if sent_ns >= start_ts:
+                    latencies.append(now_ns() - sent_ns)
                     read_count += 1
                     if read_count >= total:
                         done = True
@@ -107,7 +103,6 @@ def reader_proc(base_dir: str, total: int, sleep_us: int, conn, pin_cpu: int):
                 break
 
     reader.close()
-    p.close()
     conn.send(latencies)
     conn.close()
 
@@ -125,8 +120,8 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="dw-ipc-") as td:
         base = Path(td)
-        p = make_platform(base, chunk_mb=args.chunk_mb)
-        writer = p.create_writer("bench")
+        make_feed(base, chunk_mb=args.chunk_mb)
+        writer = Writer(base, "bench")
 
         parent_conn, child_conn = mp.Pipe()
         proc = mp.Process(
@@ -141,13 +136,13 @@ def main():
         if args.pin_writer >= 0:
             _pin_to_cpu(args.pin_writer)
 
-        base_ts = now_us()
+        base_ts = now_ns()
         parent_conn.send(base_ts)
         if parent_conn.recv() != "spinning":
             raise RuntimeError("reader not spinning")
         for i in range(args.records):
-            ts = now_us()
-            writer.write_values(i, ts - 5, ts, ts - 10, 100.0)
+            ts = now_ns()
+            writer.write_values(ts - 5, ts, ts - 10, i, 100.0)
             if args.publish_us > 0:
                 time.sleep(args.publish_us / 1_000_000)
         writer.close()
@@ -155,7 +150,6 @@ def main():
 
         latencies = parent_conn.recv()
         proc.join(timeout=5)
-        p.close()
 
         # Drop warmup records (first N by insertion order, before sorting)
         warmup = min(args.warmup, len(latencies) // 2)
@@ -168,8 +162,8 @@ def main():
         p999 = latencies[min(int(n * 0.999), n - 1)]
         print(
             f"IPC latency over {n} records (warmup={warmup}): "
-            f"p50={p50}us p90={p90}us p99={p99}us p99.9={p999}us "
-            f"min={latencies[0]}us max={latencies[-1]}us"
+            f"p50={p50}ns p90={p90}ns p99={p99}ns p99.9={p999}ns "
+            f"min={latencies[0]}ns max={latencies[-1]}ns"
         )
 
 

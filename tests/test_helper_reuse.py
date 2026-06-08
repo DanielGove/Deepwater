@@ -8,28 +8,29 @@ import time
 from pathlib import Path
 import tempfile
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from helpers import make_platform, seed_records, close_all
+from helpers import make_feed, seed_records, close_all
+from deepwater import Reader, Writer
 from deepwater.metadata.feed_registry import FeedRegistry
+from deepwater.metadata.discovery import feed_exists
 
 
 def test_reuse_single_creation():
     with tempfile.TemporaryDirectory(prefix="dw-helper-") as td:
         base = Path(td)
-        p1, feed = make_platform("clock1", base)
-        p2, _ = make_platform("clock1", base)
+        _base1, feed = make_feed("clock1", base)
+        _base2, _ = make_feed("clock1", base)
         # Registry should have exactly one feed; create_feed is idempotent
-        assert p1.feed_exists(feed)
-        assert p2.feed_exists(feed)
-        close_all(p1, p2)
+        assert feed_exists(base, feed)
+        assert feed_exists(base, feed)
 
 
 def test_clock3_bounds_and_ranges():
     with tempfile.TemporaryDirectory(prefix="dw-helper-") as td:
         base = Path(td)
-        p, feed = make_platform("clock3", base)
-        w = p.create_writer(feed)
+        base, feed = make_feed("clock3", base)
+        w = Writer(base, feed)
         seed_records(w, 5, start_ts=1_000_000)
 
         # Verify registry metadata bounds per axis
@@ -44,7 +45,7 @@ def test_clock3_bounds_and_ranges():
         assert meta.get_qmax(2) == 1_000_030, "ev_us qmax wrong"
         meta.release(); reg.close()
 
-        r = p.create_reader(feed)
+        r = Reader(base, feed)
         # Range on proc_us
         out_proc = r.range(1_000_010, 1_000_051, ts_key="proc_us")
         assert len(out_proc) == 5, "range on proc_us should return all rows"
@@ -54,7 +55,7 @@ def test_clock3_bounds_and_ranges():
         # Range on ev_us (earlier timeline)
         out_ev = r.range(999_990, 1_000_031, ts_key="ev_us")
         assert len(out_ev) == 5, "range on ev_us should return all rows"
-        close_all(r, p)
+        close_all(r)
 
 
 def run_tests():

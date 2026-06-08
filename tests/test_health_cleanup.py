@@ -5,15 +5,14 @@ import tempfile
 from pathlib import Path
 import time
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
-from deepwater.ops.health_check import check_manifest, check_global_registry, check_feeds
+from deepwater import Writer, create_feed
+from deepwater.ops.health_check import check_global_registry, check_feeds
 from deepwater.ops.cleanup import cleanup_all_feeds
 
 
 def _make_feed(base: Path, name: str, retention_hours: int = 0, clock_level: int = 1, persist=True):
-    p = Platform(str(base))
     spec = {
         "feed_name": name,
         "mode": "UF",
@@ -26,28 +25,24 @@ def _make_feed(base: Path, name: str, retention_hours: int = 0, clock_level: int
         "chunk_size_mb": 0.5,
         "retention_hours": retention_hours,
     }
-    p.create_feed(spec)
-    return p
+    create_feed(base, spec)
 
 
 def test_health_checks_pass_on_fresh_platform():
     with tempfile.TemporaryDirectory(prefix="dw-health-") as td:
         base = Path(td)
-        p = _make_feed(base, "hfeed", retention_hours=0)
-        ok, msg = check_manifest(base)
-        assert ok, msg
+        _make_feed(base, "hfeed", retention_hours=0)
         ok, msg = check_global_registry(base)
         assert ok, msg
         ok, msg = check_feeds(base)
         assert ok, msg
-        p.close()
 
 
 def test_cleanup_deletes_expired_chunks():
     with tempfile.TemporaryDirectory(prefix="dw-clean-") as td:
         base = Path(td)
-        p = _make_feed(base, "cfeed", retention_hours=1)
-        w = p.create_writer("cfeed")
+        _make_feed(base, "cfeed", retention_hours=1)
+        w = Writer(base, "cfeed")
         base_ts = int(time.time() * 1e6) - 3_600_000_000  # 1 hour ago
         # Write a couple records to ensure chunk sealed
         for i in range(10):
@@ -74,7 +69,6 @@ def test_cleanup_deletes_expired_chunks():
         cleanup_all_feeds(base, dry_run=False)
 
         assert not chunk_file.exists(), "cleanup did not delete expired chunk"
-        p.close()
 
 
 def run_tests():

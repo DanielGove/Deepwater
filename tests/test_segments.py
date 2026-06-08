@@ -8,11 +8,12 @@ import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import Writer, create_feed
 from deepwater.cli.segments_cli import main as segments_cli_main
 from deepwater.metadata.feed_registry import FeedRegistry, UINT64_MAX
+from deepwater.metadata.discovery import list_segments, suggested_reader_range
 from deepwater.ops import repair
 from deepwater.metadata.segments import SegmentStore
 
@@ -27,6 +28,7 @@ def _spec(name: str) -> dict:
         ],
         "clock_level": 1,
         "persist": True,
+        "storage": "chunk",
         "chunk_size_mb": 1,
     }
 
@@ -34,42 +36,39 @@ def _spec(name: str) -> dict:
 def test_writer_auto_segment_closed_and_suggested_range():
     with tempfile.TemporaryDirectory(prefix="dw-seg-basic-") as td:
         base = Path(td)
-        p = Platform(str(base))
-        p.create_feed(_spec("segfeed"))
+        create_feed(base, _spec("segfeed"))
 
-        w = p.create_writer("segfeed")
+        w = Writer(base, "segfeed")
         for i in range(5):
             w.write_values(1_000_000 + i, i)
         w.close()
 
-        segs = p.list_segments("segfeed")
+        segs = list_segments(base, "segfeed")
         assert len(segs) == 1, f"expected one segment, got {len(segs)}"
         seg = segs[0]
         assert seg["status"] == "closed"
         assert seg["start_us"] == 1_000_000
         assert seg["end_us"] == 1_000_004
 
-        suggested = p.suggested_reader_range("segfeed")
+        suggested = suggested_reader_range(base, "segfeed")
         assert suggested == (1_000_000, 1_000_004)
-        p.close()
 
 
 def test_writer_recovery_crash_closes_previous_open_segment_at_last_ts():
     with tempfile.TemporaryDirectory(prefix="dw-seg-crash-") as td:
         base = Path(td)
-        src = Path(__file__).parent.parent / "src"
+        repo_root = Path(__file__).parent.parent
 
         # Crashy writer process: writes records and exits abruptly without close().
         child_code = f"""
 import os
 import sys
-sys.path.insert(0, {str(src)!r})
-from deepwater import Platform
+sys.path.insert(0, {str(repo_root)!r})
+from deepwater import Writer, create_feed
 
 base = {str(base)!r}
-p = Platform(base)
-p.create_feed({{'feed_name':'segfeed','mode':'UF','fields':[{{'name':'ts','type':'uint64'}},{{'name':'v','type':'uint64'}}],'clock_level':1,'persist':True,'chunk_size_mb':1}})
-w = p.create_writer('segfeed')
+create_feed(base, {{'feed_name':'segfeed','mode':'UF','fields':[{{'name':'ts','type':'uint64'}},{{'name':'v','type':'uint64'}}],'clock_level':1,'persist':True,'storage':'chunk','chunk_size_mb':1}})
+w = Writer(base, 'segfeed')
 for i in range(4):
     w.write_values(2_000_000 + i, i)
 os._exit(0)
@@ -78,12 +77,11 @@ os._exit(0)
         assert proc.returncode == 0, proc.stderr
 
         # Restart writer in parent. This should crash-close previous open segment.
-        p = Platform(str(base))
-        w = p.create_writer("segfeed")
+        w = Writer(base, "segfeed")
         w.write_values(3_000_000, 999)
         w.close()
 
-        segs = p.list_segments("segfeed")
+        segs = list_segments(base, "segfeed")
         assert len(segs) >= 2, f"expected at least two segments, got {len(segs)}"
 
         first = segs[0]
@@ -96,24 +94,22 @@ os._exit(0)
         assert last["status"] == "closed"
         assert last["start_us"] == 3_000_000
         assert last["end_us"] == 3_000_000
-        p.close()
 
 
 def test_writer_recovery_repairs_chunk_metadata_before_segment_close():
     with tempfile.TemporaryDirectory(prefix="dw-seg-repair-meta-") as td:
         base = Path(td)
-        src = Path(__file__).parent.parent / "src"
+        repo_root = Path(__file__).parent.parent
 
         child_code = f"""
 import os
 import sys
-sys.path.insert(0, {str(src)!r})
-from deepwater import Platform
+sys.path.insert(0, {str(repo_root)!r})
+from deepwater import Writer, create_feed
 
 base = {str(base)!r}
-p = Platform(base)
-p.create_feed({{'feed_name':'segfeed','mode':'UF','fields':[{{'name':'ts','type':'uint64'}},{{'name':'v','type':'uint64'}}],'clock_level':1,'persist':True,'chunk_size_mb':1}})
-w = p.create_writer('segfeed')
+create_feed(base, {{'feed_name':'segfeed','mode':'UF','fields':[{{'name':'ts','type':'uint64'}},{{'name':'v','type':'uint64'}}],'clock_level':1,'persist':True,'storage':'chunk','chunk_size_mb':1}})
+w = Writer(base, 'segfeed')
 for i in range(5):
     w.write_values(2_100_000 + i, i)
 os._exit(0)
@@ -136,31 +132,27 @@ os._exit(0)
         finally:
             reg.close()
 
-        p = Platform(str(base))
-        w = p.create_writer("segfeed")
+        w = Writer(base, "segfeed")
         w.write_values(3_100_000, 999)
         w.close()
 
-        segs = p.list_segments("segfeed")
+        segs = list_segments(base, "segfeed")
         assert len(segs) >= 2, f"expected at least two segments, got {len(segs)}"
         first = segs[0]
         assert first["status"] == "crash_closed", f"unexpected first status: {first}"
         assert first["start_us"] == 2_100_000
         assert first["end_us"] == 2_100_004
         assert first["records"] == 5
-        p.close()
 
 
 def test_repair_utility_backfills_legacy_segment_zero_records():
     with tempfile.TemporaryDirectory(prefix="dw-seg-repair-utility-") as td:
         base = Path(td)
-        p = Platform(str(base))
-        p.create_feed(_spec("segfeed"))
-        w = p.create_writer("segfeed")
+        create_feed(base, _spec("segfeed"))
+        w = Writer(base, "segfeed")
         for i in range(5):
             w.write_values(7_000_000 + i, i)
         w.close()
-        p.close()
 
         store = SegmentStore(base / "data" / "segfeed", "segfeed")
         fd, mm = store._open_mmap()
@@ -179,28 +171,25 @@ def test_repair_utility_backfills_legacy_segment_zero_records():
         assert checked >= 2  # at least one chunk + one segment checked
         assert repaired >= 1
 
-        p = Platform(str(base))
-        segs = p.list_segments("segfeed")
+        segs = list_segments(base, "segfeed")
         assert segs[0]["status"] == "closed"
         assert segs[0]["records"] == 5
-        p.close()
 
 
 def test_repair_utility_crash_closes_open_segment():
     with tempfile.TemporaryDirectory(prefix="dw-seg-repair-open-") as td:
         base = Path(td)
-        src = Path(__file__).parent.parent / "src"
+        repo_root = Path(__file__).parent.parent
 
         child_code = f"""
 import os
 import sys
-sys.path.insert(0, {str(src)!r})
-from deepwater import Platform
+sys.path.insert(0, {str(repo_root)!r})
+from deepwater import Writer, create_feed
 
 base = {str(base)!r}
-p = Platform(base)
-p.create_feed({{'feed_name':'segfeed','mode':'UF','fields':[{{'name':'ts','type':'uint64'}},{{'name':'v','type':'uint64'}}],'clock_level':1,'persist':True,'chunk_size_mb':1}})
-w = p.create_writer('segfeed')
+create_feed(base, {{'feed_name':'segfeed','mode':'UF','fields':[{{'name':'ts','type':'uint64'}},{{'name':'v','type':'uint64'}}],'clock_level':1,'persist':True,'storage':'chunk','chunk_size_mb':1}})
+w = Writer(base, 'segfeed')
 for i in range(3):
     w.write_values(8_000_000 + i, i)
 os._exit(0)
@@ -212,27 +201,23 @@ os._exit(0)
         assert checked >= 2  # at least one chunk + one segment checked
         assert repaired >= 1
 
-        p = Platform(str(base))
-        segs = p.list_segments("segfeed")
+        segs = list_segments(base, "segfeed")
         assert len(segs) >= 1
         seg = segs[0]
         assert seg["status"] == "crash_closed"
         assert seg["start_us"] == 8_000_000
         assert seg["end_us"] == 8_000_002
         assert seg["records"] == 3
-        p.close()
 
 
 def test_segments_cli_lists_and_suggests_range():
     with tempfile.TemporaryDirectory(prefix="dw-seg-cli-") as td:
         base = Path(td)
-        p = Platform(str(base))
-        p.create_feed(_spec("segfeed"))
-        w = p.create_writer("segfeed")
+        create_feed(base, _spec("segfeed"))
+        w = Writer(base, "segfeed")
         for i in range(3):
             w.write_values(4_000_000 + i, i)
         w.close()
-        p.close()
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -254,13 +239,11 @@ def test_segments_cli_lists_and_suggests_range():
 def test_segments_cli_timestamp_format_us():
     with tempfile.TemporaryDirectory(prefix="dw-seg-cli-us-") as td:
         base = Path(td)
-        p = Platform(str(base))
-        p.create_feed(_spec("segfeed"))
-        w = p.create_writer("segfeed")
+        create_feed(base, _spec("segfeed"))
+        w = Writer(base, "segfeed")
         for i in range(3):
             w.write_values(4_000_000 + i, i)
         w.close()
-        p.close()
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -281,13 +264,11 @@ def test_segments_cli_timestamp_format_us():
 def test_segments_cli_timestamp_format_timezone_name():
     with tempfile.TemporaryDirectory(prefix="dw-seg-cli-tzname-") as td:
         base = Path(td)
-        p = Platform(str(base))
-        p.create_feed(_spec("segfeed"))
-        w = p.create_writer("segfeed")
+        create_feed(base, _spec("segfeed"))
+        w = Writer(base, "segfeed")
         for i in range(3):
             w.write_values(4_000_000 + i, i)
         w.close()
-        p.close()
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -308,8 +289,7 @@ def test_segments_cli_timestamp_format_timezone_name():
 def test_ring_writer_auto_segments_closed():
     with tempfile.TemporaryDirectory(prefix="dw-seg-ring-") as td:
         base = Path(td)
-        p = Platform(str(base))
-        p.create_feed({
+        create_feed(base, {
             "feed_name": "ringseg",
             "mode": "UF",
             "fields": [
@@ -320,26 +300,24 @@ def test_ring_writer_auto_segments_closed():
             "persist": False,
             "chunk_size_mb": 0.01,
         })
-        w = p.create_writer("ringseg")
+        w = Writer(base, "ringseg")
         w.write_values(5_000_000, 1)
         w.write_values(5_000_010, 2)
         w.close()
 
-        segs = p.list_segments("ringseg")
+        segs = list_segments(base, "ringseg")
         assert len(segs) == 1
         seg = segs[0]
         assert seg["status"] == "closed"
         assert seg["start_us"] == 5_000_000
         assert seg["end_us"] == 5_000_010
-        p.close()
 
 
 def test_writer_manual_segment_boundary_without_close():
     with tempfile.TemporaryDirectory(prefix="dw-seg-boundary-") as td:
         base = Path(td)
-        p = Platform(str(base))
-        p.create_feed(_spec("segmanual"))
-        w = p.create_writer("segmanual")
+        create_feed(base, _spec("segmanual"))
+        w = Writer(base, "segmanual")
         w.write_values(6_000_000, 1)
         w.write_values(6_000_001, 2)
         assert w.mark_segment_boundary("disconnect") is True
@@ -347,7 +325,7 @@ def test_writer_manual_segment_boundary_without_close():
         w.write_values(6_000_101, 4)
         w.close()
 
-        segs = p.list_segments("segmanual")
+        segs = list_segments(base, "segmanual")
         assert len(segs) == 2, f"expected two segments, got {len(segs)}"
 
         first = segs[0]
@@ -363,7 +341,6 @@ def test_writer_manual_segment_boundary_without_close():
         assert second["start_us"] == 6_000_100
         assert second["end_us"] == 6_000_101
         assert second["records"] == 2
-        p.close()
 
 
 def run_tests():

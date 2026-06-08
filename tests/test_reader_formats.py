@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Exercise reader formats (tuple/dict/numpy/raw), latest, stream, read_available, playback."""
+"""Exercise reader formats (tuple/dict/numpy/raw), latest, stream, read_available."""
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import Reader, Writer, create_feed
 
 
-def _make_index_feed(base: Path):
-    p = Platform(str(base))
+def _make_feed(base: Path):
     spec = {
         "feed_name": "fmt",
         "mode": "UF",
@@ -22,14 +21,12 @@ def _make_index_feed(base: Path):
         "clock_level": 1,
         "persist": True,
         "chunk_size_mb": 1,
-        "index_playback": True,
     }
-    p.create_feed(spec)
-    return p
+    create_feed(base, spec)
 
 
-def _seed(p: Platform, n=10):
-    w = p.create_writer("fmt")
+def _seed(base: Path, n=10):
+    w = Writer(base, "fmt")
     import time
     base = int(time.time() * 1e6)
     for i in range(n):
@@ -40,9 +37,10 @@ def _seed(p: Platform, n=10):
 
 def test_range_formats():
     with tempfile.TemporaryDirectory(prefix="dw-fmt-") as td:
-        p = _make_index_feed(Path(td))
-        base = _seed(p, 20)
-        r = p.create_reader("fmt")
+        root = Path(td)
+        _make_feed(root)
+        base = _seed(root, 20)
+        r = Reader(root, "fmt")
         # tuple
         out_t = r.range(base, base + 200, format="tuple")
         assert len(out_t) == 20
@@ -52,30 +50,41 @@ def test_range_formats():
         # numpy
         out_n = r.range(base, base + 200, format="numpy")
         assert out_n["v"][0] == 0
+        out_a = r.range(base, base + 200, format="numpy")
+        assert out_a.shape == (20,)
+        assert out_a.dtype.names == ("ts", "v")
+        assert list(out_a["v"][:3]) == [0, 1, 2]
+        cols = r.range_columns(base, base + 200, ["v", "ts"])
+        assert set(cols) == {"ts", "v"}
+        assert list(cols["v"][:3]) == [0, 1, 2]
+        assert list(cols["ts"][:2]) == [base, base + 10]
         # raw
         out_raw = r.range(base, base + 200, format="raw")
         assert len(out_raw) == len(out_t) * r.record_size
-        r.close(); p.close()
+        assert bytes(r.range(base, base + 20, format="raw")) == bytes(out_raw[: 2 * r.record_size])
+        r.close()
 
 
-def test_latest_and_read_available():
-    with tempfile.TemporaryDirectory(prefix="dw-latest-") as td:
-        p = _make_index_feed(Path(td))
-        base = _seed(p, 5)
-        r = p.create_reader("fmt")
-        latest = r.latest(1000)  # large window; should include seeded data
-        assert len(latest) >= 1
+def test_range_and_read_available():
+    with tempfile.TemporaryDirectory(prefix="dw-range-") as td:
+        root = Path(td)
+        _make_feed(root)
+        base = _seed(root, 5)
+        r = Reader(root, "fmt")
+        window = r.range(base, base + 1_000)
+        assert len(window) >= 1
         # read_available should return immediately with existing data
         avail = r.read_available(max_records=3)
         assert len(avail) <= 3
-        r.close(); p.close()
+        r.close()
 
 
 def test_stream_modes():
     with tempfile.TemporaryDirectory(prefix="dw-stream-") as td:
-        p = _make_index_feed(Path(td))
-        base = _seed(p, 5)
-        r1 = p.create_reader("fmt")
+        root = Path(td)
+        _make_feed(root)
+        base = _seed(root, 5)
+        r1 = Reader(root, "fmt")
         # historical stream (start provided)
         out_hist = []
         for rec in r1.stream(start=base):
@@ -86,40 +95,26 @@ def test_stream_modes():
         r1.close()
 
         # Live-like check on a fresh platform to avoid cached closed reader
-        p2 = _make_index_feed(Path(td))
-        base2 = _seed(p2, 5)
-        w = p2.create_writer("fmt")
+        _make_feed(root)
+        base2 = _seed(root, 5)
+        w = Writer(root, "fmt")
         for i in range(2):
             ts = base2 + 5*10 + i * 10
             w.write_values(ts, 200 + i)
         w.close()
-        r2 = p2.create_reader("fmt")
+        r2 = Reader(root, "fmt")
         out_after = r2.range(base2 + 5*10, base2 + 5*10 + 50)
         vals = [rec[1] for rec in out_after if rec[1] >= 200]
         # Allow empty if range caught earlier writes only; ensure no crash and optional detection
         assert vals in ([200, 201], [], [200], [201]), f"live-like range values {vals}"
-        r2.close(); p.close(); p2.close()
-
-
-def test_playback_with_index():
-    with tempfile.TemporaryDirectory(prefix="dw-play-") as td:
-        p = _make_index_feed(Path(td))
-        base = _seed(p, 30)
-        r = p.create_reader("fmt")
-        # playback=True should honor index and include snapshot before start
-        start = base + 50
-        end = base + 120
-        out = r.range(start, end, playback=True)
-        assert len(out) >= 7, "playback range too small (index not used?)"
-        r.close(); p.close()
+        r2.close()
 
 
 def run_tests():
     tests = [
         ("range_formats", test_range_formats),
-        ("latest_read_available", test_latest_and_read_available),
+        ("range_read_available", test_range_and_read_available),
         ("stream_modes", test_stream_modes),
-        ("playback_with_index", test_playback_with_index),
     ]
     print("Reader Format & Stream Tests")
     print("=" * 60)

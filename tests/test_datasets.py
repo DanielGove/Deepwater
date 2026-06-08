@@ -7,10 +7,11 @@ import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepwater import Platform
+from deepwater import Writer, create_feed
 from deepwater.cli.datasets_cli import _format_duration_us, main as datasets_cli_main
+from deepwater.metadata.discovery import common_time_windows, recommended_train_validation
 
 
 def _spec(name: str) -> dict:
@@ -27,34 +28,33 @@ def _spec(name: str) -> dict:
     }
 
 
-def _write_segment(p: Platform, feed: str, start_us: int, end_us: int) -> None:
-    w = p.create_writer(feed)
+def _write_segment(base: Path, feed: str, start_us: int, end_us: int) -> None:
+    w = Writer(base, feed)
     if end_us < start_us:
         raise ValueError("end_us must be >= start_us")
     w.write_values(start_us, 1)
     if end_us != start_us:
         w.write_values(end_us, 2)
-    p.close_writer(feed)
+    w.close()
 
 
 def test_common_windows_across_two_feeds():
     with tempfile.TemporaryDirectory(prefix="dw-datasets-") as td:
         base = Path(td)
-        p = Platform(str(base))
-        p.create_feed(_spec("f1"))
-        p.create_feed(_spec("f2"))
+        create_feed(base, _spec("f1"))
+        create_feed(base, _spec("f2"))
 
-        _write_segment(p, "f1", 100, 200)
-        _write_segment(p, "f1", 300, 500)
+        _write_segment(base, "f1", 100, 200)
+        _write_segment(base, "f1", 300, 500)
 
-        _write_segment(p, "f2", 150, 250)
-        _write_segment(p, "f2", 260, 480)
+        _write_segment(base, "f2", 150, 250)
+        _write_segment(base, "f2", 260, 480)
 
-        windows = p.common_time_windows(["f1", "f2"], status="usable")
+        windows = common_time_windows(base, ["f1", "f2"], status="usable")
         got = [(w["start_us"], w["end_us"]) for w in windows]
         assert got == [(150, 200), (300, 480)], f"unexpected windows: {got}"
 
-        manifest = p.recommended_train_validation(["f1", "f2"], train_ratio=0.8)
+        manifest = recommended_train_validation(base, ["f1", "f2"], train_ratio=0.8)
         rec = manifest["recommended"]
         assert rec is not None
         assert rec["interval"]["start_us"] == 300
@@ -64,7 +64,6 @@ def test_common_windows_across_two_feeds():
         assert rec["train"]["end_us"] == 443
         assert rec["validation"]["start_us"] == 444
         assert rec["validation"]["end_us"] == 480
-        p.close()
 
 
 def test_datasets_cli_json_and_manifest_output():
@@ -72,12 +71,10 @@ def test_datasets_cli_json_and_manifest_output():
         base = Path(td) / "base"
         out_file = Path(td) / "manifest.json"
 
-        p = Platform(str(base))
-        p.create_feed(_spec("f1"))
-        p.create_feed(_spec("f2"))
-        _write_segment(p, "f1", 1_000_000, 1_000_200)
-        _write_segment(p, "f2", 1_000_100, 1_000_300)
-        p.close()
+        create_feed(base, _spec("f1"))
+        create_feed(base, _spec("f2"))
+        _write_segment(base, "f1", 1_000_000, 1_000_200)
+        _write_segment(base, "f2", 1_000_100, 1_000_300)
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -104,15 +101,11 @@ def test_datasets_cli_multi_source_two_base_paths():
         base_a = root / "base_a"
         base_b = root / "base_b"
 
-        pa = Platform(str(base_a))
-        pa.create_feed(_spec("a_feed"))
-        _write_segment(pa, "a_feed", 10_000, 20_000)
-        pa.close()
+        create_feed(base_a, _spec("a_feed"))
+        _write_segment(base_a, "a_feed", 10_000, 20_000)
 
-        pb = Platform(str(base_b))
-        pb.create_feed(_spec("b_feed"))
-        _write_segment(pb, "b_feed", 15_000, 25_000)
-        pb.close()
+        create_feed(base_b, _spec("b_feed"))
+        _write_segment(base_b, "b_feed", 15_000, 25_000)
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -139,12 +132,10 @@ def test_datasets_cli_text_timestamp_formats():
     with tempfile.TemporaryDirectory(prefix="dw-datasets-text-") as td:
         base = Path(td) / "base"
 
-        p = Platform(str(base))
-        p.create_feed(_spec("f1"))
-        p.create_feed(_spec("f2"))
-        _write_segment(p, "f1", 1_000_000, 1_000_200)
-        _write_segment(p, "f2", 1_000_100, 1_000_300)
-        p.close()
+        create_feed(base, _spec("f1"))
+        create_feed(base, _spec("f2"))
+        _write_segment(base, "f1", 1_000_000, 1_000_200)
+        _write_segment(base, "f2", 1_000_100, 1_000_300)
 
         human_buf = io.StringIO()
         with redirect_stdout(human_buf):

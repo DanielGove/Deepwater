@@ -7,24 +7,25 @@ The read_available() method returns immediately (no spin-wait).
 """
 
 import time
-from deepwater import Platform
+from pathlib import Path
+
+from deepwater import Reader
+from deepwater.metadata.discovery import feed_exists
 
 def test_non_blocking_reads():
     """Show that read_available() never blocks"""
-    
-    platform = Platform('./data/coinbase-test')
+
+    base = Path('./data/coinbase-test')
     
     # Check if feed exists
-    try:
-        reader = platform.create_reader('CB-L2-XRP-USD')
-    except KeyError:
+    if not feed_exists(base, 'CB-L2-XRP-USD'):
         print("Testing non-blocking reads (read_available)")
         print("=" * 60)
         print("\n⚠️  Feed 'CB-L2-XRP-USD' not found")
         print("   (Skipping test - run websocket ingestion first)")
         print("\n✅ Test skipped (no feed data)")
-        platform.close()
         return
+    reader = Reader(base, 'CB-L2-XRP-USD')
     
     print("Testing non-blocking reads (read_available)")
     print("=" * 60)
@@ -82,9 +83,7 @@ def test_non_blocking_reads():
 
 def compare_blocking_vs_nonblocking():
     """Compare blocking stream() vs non-blocking read_available()"""
-    
-    platform = Platform('./data/coinbase-test')
-    
+
     print("\n\nComparing blocking vs non-blocking APIs")
     print("=" * 60)
     
@@ -94,8 +93,6 @@ def compare_blocking_vs_nonblocking():
     print("\n✅ NON-BLOCKING: read_available()")
     print("   Returns immediately (<10µs)")
     print("   (Verified in test 1 above)")
-    
-    platform.close()
     print("\n" + "=" * 60)
 
 

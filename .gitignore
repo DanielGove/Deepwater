@@ -39,6 +39,7 @@ tests/data/
 *.html
 build/
 dist/
+target/
 
 # Keep data structure examples
 !data/test-ring/manifest.json

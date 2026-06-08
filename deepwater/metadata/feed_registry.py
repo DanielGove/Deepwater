@@ -1,0 +1,497 @@
+import os
+import struct
+import mmap
+import fcntl
+import time
+from typing import Iterator, Optional
+
+# Only keep struct for initial setup - eliminate from hot paths
+# New layout (128 bytes):
+#  0  start_time      Q
+#  8  end_time        Q
+# 16  write_pos       Q
+# 24  num_records     Q
+# 32  last_update     Q
+# 40  chunk_id        Q
+# 48  size            Q
+# 56  status          B
+# 57  query_key_count B   (primary + query_cols, capped)
+# 58  pad             6x  (align to 64)
+# 64  q0_min          Q
+# 72  q0_max          Q
+# 80  q1_min          Q
+# 88  q1_max          Q
+# 96  q2_min          Q
+# 104 q2_max          Q
+# 112 pad             16x
+CHUNK_STRUCT = struct.Struct("<QQQQQQQBB6xQQQQQQ16x")
+HEADER_STRUCT = struct.Struct("<Q120x")  # chunk_count + padding = 128 bytes
+
+# No helper functions - direct inline operations for maximum speed
+CHUNK_SIZE = CHUNK_STRUCT.size
+HEADER_SIZE = HEADER_STRUCT.size
+
+# Status constants
+IN_MEMORY = 0
+ON_DISK = 1
+EXPIRED = 2
+
+# Precomputed offsets for direct memory access
+CHUNK_START_OFFSET = 0
+CHUNK_END_OFFSET = 8
+CHUNK_WRITE_POS_OFFSET = 16
+CHUNK_NUM_RECORDS_OFFSET = 24
+CHUNK_LAST_UPDATE_OFFSET = 32
+CHUNK_ID_OFFSET = 40
+CHUNK_SIZE_OFFSET = 48
+CHUNK_STATUS_OFFSET = 56
+CHUNK_QCOUNT_OFFSET = 57
+CHUNK_QMIN_OFFSET = 64
+CHUNK_QMAX_OFFSET = 88
+MAX_QUERY_KEYS = 3
+UINT64_MAX = (1 << 64) - 1
+
+class ChunkMeta:
+    """
+    Zero-copy, mutable view over a single 64-byte chunk record.
+    Reads and writes go directly to the underlying mmapped memory.
+    """
+    __slots__ = ("_mv", "_start", "_end", "_wp", "_nr", "_lu", "_id", "_size",
+                 "_status", "_qcount", "_qmins", "_qmaxs")
+
+    def __init__(self, chunk_record: memoryview):
+        self._mv = chunk_record
+        self._start  = chunk_record[CHUNK_START_OFFSET:CHUNK_END_OFFSET].cast("Q")
+        self._end    = chunk_record[CHUNK_END_OFFSET:CHUNK_WRITE_POS_OFFSET].cast("Q")
+        self._wp     = chunk_record[CHUNK_WRITE_POS_OFFSET:CHUNK_NUM_RECORDS_OFFSET].cast("Q")
+        self._nr     = chunk_record[CHUNK_NUM_RECORDS_OFFSET: CHUNK_LAST_UPDATE_OFFSET].cast("Q")
+        self._lu     = chunk_record[CHUNK_LAST_UPDATE_OFFSET: CHUNK_ID_OFFSET].cast("Q")
+        self._id     = chunk_record[CHUNK_ID_OFFSET:CHUNK_SIZE_OFFSET].cast("Q")
+        self._size   = chunk_record[CHUNK_SIZE_OFFSET:CHUNK_STATUS_OFFSET].cast("Q")
+        self._status = chunk_record[CHUNK_STATUS_OFFSET:CHUNK_QCOUNT_OFFSET].cast("B")
+        self._qcount = chunk_record[CHUNK_QCOUNT_OFFSET:CHUNK_QCOUNT_OFFSET+1].cast("B")
+        self._qmins  = chunk_record[CHUNK_QMIN_OFFSET:CHUNK_QMAX_OFFSET].cast("Q")
+        self._qmaxs  = chunk_record[CHUNK_QMAX_OFFSET:CHUNK_QMAX_OFFSET + 24].cast("Q")
+
+    @property
+    def start_time(self) -> int:
+        return self._start[0]
+    @start_time.setter
+    def start_time(self, v: int) -> None:
+        self._start[0] = v
+
+    @property
+    def end_time(self) -> int:
+        return self._end[0]
+    @end_time.setter
+    def end_time(self, v: int) -> None:
+        self._end[0] = v
+
+    @property
+    def write_pos(self) -> int:
+        return self._wp[0]
+    @write_pos.setter
+    def write_pos(self, v: int) -> None:
+        self._wp[0] = v
+
+    @property
+    def num_records(self) -> int:
+        return self._nr[0]
+    @num_records.setter
+    def num_records(self, v: int) -> None:
+        self._nr[0] = v
+
+    @property
+    def last_update(self) -> int:
+        return self._lu[0]
+    @last_update.setter
+    def last_update(self, v: int) -> None:
+        self._lu[0] = v
+
+    @property
+    def chunk_id(self) -> int:
+        return self._id[0]
+    @chunk_id.setter
+    def chunk_id(self, v: int) -> None:
+        raise Exception("Cannot overwrite chunk id in registry")
+
+    @property
+    def size(self) -> int:
+        return self._size[0]
+    @size.setter
+    def size(self, v: int) -> None:
+        raise Exception("Cannot overwrite chunk size in registry")
+
+    @property
+    def status(self) -> int:
+        return self._status[0]
+    @status.setter
+    def status(self, v: int) -> None:
+        # clamp to 0..255 to avoid ValueError from casted B view
+        self._status[0] = v & 0xFF
+
+    @property
+    def clock_level(self) -> int:
+        return self._qcount[0]
+    @clock_level.setter
+    def clock_level(self, v: int) -> None:
+        # clamp to 0..255 to avoid ValueError from casted B view
+        self._qcount[0] = v & 0xFF
+
+    def get_qmin(self, idx: int) -> int:
+        return self._qmins[idx]
+
+    def get_qmax(self, idx: int) -> int:
+        return self._qmaxs[idx]
+
+    def set_qbounds(self, idx: int, min_v: int, max_v: int) -> None:
+        self._qmins[idx] = min_v
+        self._qmaxs[idx] = max_v
+
+    # Optional helpers
+    def as_tuple(self) -> tuple[int,int,int,int,int]:
+        return (self.start_time, self.end_time, self.chunk_id, self.size, self.status)
+
+    def release(self) -> None:
+        # Release views (important before closing the mmap on some Python builds)
+        self._start.release()
+        self._end.release()
+        self._wp.release()
+        self._nr.release()
+        self._lu.release()
+        self._id.release()
+        self._size.release()
+        self._status.release()
+        self._qcount.release()
+        self._qmins.release()
+        self._qmaxs.release()
+        self._mv.release()
+
+    def __repr__(self) -> str:
+        return (f"ChunkMeta(start={self.start_time}, end={self.end_time}, "
+                f"id={self.chunk_id}, size={self.size}, status={self.status})")
+
+
+class FeedRegistry:
+    __slots__ = ("path", "max_chunks", "fd", "mm", "is_writer", "_mv", "_chunk_count")
+
+    def __init__(self, path: str, max_chunks: int = 65535, mode: str = "r"):
+        self.path = path
+        self.max_chunks = max_chunks
+        self.is_writer = mode == "w"
+
+        desired_size = HEADER_SIZE + (max_chunks * CHUNK_SIZE)
+        already_exists = os.path.exists(path)
+
+        self.fd = os.open(path, os.O_RDWR | os.O_CREAT)
+        self.mm = None
+        self._mv = None
+        self._chunk_count = None
+        try:
+            current_size = os.fstat(self.fd).st_size
+            if current_size >= HEADER_SIZE:
+                self.max_chunks = max(
+                    int(self.max_chunks),
+                    int((current_size - HEADER_SIZE) // CHUNK_SIZE),
+                )
+
+            if self.is_writer:
+                deadline = time.monotonic() + 2.0
+                while True:
+                    try:
+                        fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError as exc:
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("Feed registry locked by another writer") from exc
+                        time.sleep(0.01)
+
+                if current_size < desired_size:
+                    os.posix_fallocate(self.fd, 0, desired_size)
+                    current_size = desired_size
+
+                if (not already_exists) or current_size == 0:
+                    header_data = HEADER_STRUCT.pack(0)
+                    os.pwrite(self.fd, header_data, 0)
+                    current_size = desired_size
+
+            # For reader mode on empty/nonexistent files, ensure minimum size
+            if not self.is_writer and current_size == 0:
+                current_size = desired_size
+
+            self.mm = mmap.mmap(self.fd, current_size, mmap.MAP_SHARED,
+                                mmap.PROT_WRITE | mmap.PROT_READ)
+            self._mv = memoryview(self.mm)
+            self._chunk_count = self._mv[0:8].cast("Q")
+        except Exception:
+            if self.mm is not None:
+                try:
+                    self.mm.close()
+                except Exception:
+                    pass
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            raise
+
+    def close(self):
+        if self.fd is None:
+            return
+        if self._chunk_count is not None:
+            self._chunk_count.release()
+            self._chunk_count = None
+        if self._mv is not None:
+            self._mv.release()
+            self._mv = None
+        if self.mm is not None:
+            self.flush()
+            self.mm.close()
+            self.mm = None
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(self.fd)
+        except Exception:
+            pass
+        self.fd = None
+
+    def flush(self) -> None:
+        self.mm.flush()
+
+    def _get_defaults(self) -> tuple[int, int, int]:
+        def_size = int.from_bytes(self._mv[8:16], 'little')
+        def_chunk_id = int.from_bytes(self._mv[16:24], 'little')
+        def_status = self._mv[24]
+        return def_size, def_chunk_id, def_status
+
+    def register_chunk(self, start_time: int, chunk_id: int = None, size: int = None,
+                      status: int = None, clock_level: int = 1) -> int:
+        if not self.is_writer:
+            raise PermissionError("Read-only mode")
+        next_count = int(self._chunk_count[0]) + 1
+        if next_count > self.max_chunks:
+            if self.max_chunks >= 1048576:  # 1M chunks = 128MB, reasonable limit
+                raise IndexError(f"Registry at maximum size: {self.max_chunks}")
+            new_max = int(self.max_chunks)
+            while next_count > new_max:
+                if new_max >= 1048576:
+                    raise IndexError(f"Registry at maximum size: {self.max_chunks}")
+                new_max = min(max(next_count, 1 + new_max * 2), 1048576)
+            self._resize_file(new_max)
+        self._chunk_count[0] = next_count
+        
+        offset = HEADER_SIZE + ((next_count - 1) * CHUNK_SIZE)
+        try:
+            CHUNK_STRUCT.pack_into(
+                self.mm,
+                offset,
+                int(start_time),
+                0,
+                0,
+                0,
+                0,
+                int(chunk_id),
+                int(size),
+                int(status) & 0xFF,
+                int(clock_level) & 0xFF,
+                UINT64_MAX,
+                UINT64_MAX,
+                UINT64_MAX,
+                0,
+                0,
+                0,
+            )
+        except Exception:
+            if int(self._chunk_count[0]) == next_count:
+                self._chunk_count[0] = next_count - 1
+            raise
+        
+        return next_count
+    
+    def _resize_file(self, new_max_chunks: int):
+        """Resize file and remap for writer. Readers will handle this separately."""
+        if not self.is_writer:
+            raise PermissionError("Read-only mode")
+        
+        new_total_size = HEADER_SIZE + (new_max_chunks * CHUNK_SIZE)
+        
+        # Extend the file
+        os.posix_fallocate(self.fd, 0, new_total_size)
+        map_size = max(new_total_size, os.fstat(self.fd).st_size)
+        
+        # Close and remap to new size
+        self._chunk_count.release()
+        self._mv.release()
+        self.mm.close()
+        self.mm = mmap.mmap(self.fd, map_size, mmap.MAP_SHARED,
+                            mmap.PROT_WRITE | mmap.PROT_READ)
+        self._mv = memoryview(self.mm)
+        self._chunk_count = self._mv[0:8].cast("Q")
+        
+        # Update our max_chunks
+        self.max_chunks = max(int(new_max_chunks), int((map_size - HEADER_SIZE) // CHUNK_SIZE))
+
+    def _chunk_start_time(self, index: int, qoff: int = 0) -> int:
+        """returns recorded chunk start for a specific time key"""
+        offset = CHUNK_QMIN_OFFSET + HEADER_SIZE + qoff + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
+        return self._mv[offset:offset+8].cast('Q')[0]
+
+    def _chunk_end_time(self, index: int, qoff: int = 0) -> int:
+        """returns recorded chunk end for a specific time key"""
+        offset = CHUNK_QMAX_OFFSET + HEADER_SIZE + qoff + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
+        return self._mv[offset:offset+8].cast('Q')[0]
+
+    def _last_non_empty_idx(self, qoff: int = 0) -> int:
+        """Return highest chunk index that has initialized qmin/qmax for the given clock."""
+        count = self._chunk_count[0]
+        while count > 0:
+            qmin = self._chunk_start_time(count, qoff)
+            qmax = self._chunk_end_time(count, qoff)
+            if qmax != 0 and qmin != UINT64_MAX and qmin <= qmax:
+                return count
+            count -= 1
+        return 0
+
+    def get_chunk_metadata(self, index: int) -> memoryview:
+        if index <= 0 or index > int(self._chunk_count[0]):
+            raise IndexError("chunk index out of range")
+        # Inline offset calculation with bit shift
+        offset = HEADER_SIZE + ((index - 1) << 7)  # CHUNK_SIZE = 128 = 2^7
+        return ChunkMeta(self._mv[offset:offset + CHUNK_SIZE])
+
+    def _binary_search_start_time(self, target_time: int, qoff:int = 0, bound: int = None) -> int:
+        """
+        Return the first chunk index whose start_time <= target_time.
+        If target_time is greater than all chunk starts, returns 1.
+        """
+        # Cache chunk_count to avoid repeated property access
+        count = bound if bound is not None else self._chunk_count[0]
+        left, right = 1, count + 1  # right is exclusive
+        while left < right:
+            mid = (left + right) >> 1
+            if mid > count:
+                break
+            if self._chunk_start_time(mid, qoff) > target_time:
+                left = mid + 1
+            else:
+                right = mid
+        return left
+
+    def _binary_search_end_time(self, target_time: int, qoff: int = 0, bound: int = None) -> int:
+        """
+        Return the first 1-based chunk index whose end_time >= target_time.
+        If all chunk end times are <= target_time, returns chunk_count+1.
+        """
+        # Cache chunk_count to avoid repeated property access
+        count = bound if bound is not None else self._chunk_count[0]
+        left, right = 1, count + 1
+        while left < right:
+            mid = (left + right) >> 1
+            if mid > count:
+                break
+            if self._chunk_end_time(mid,qoff) < target_time:
+                left = mid + 1
+            else:
+                right = mid
+        return left
+
+    def get_chunks_before(self, time_t: int, qoff: int = 0) -> Iterator[int]:
+        """Yield 1-based chunk indices whose start_time is before time_t."""
+        last = self._last_non_empty_idx(qoff)
+        if last == 0:
+            return iter(())
+        end_idx = self._binary_search_start_time(time_t, qoff, bound=last)
+        return range(1, min(end_idx, self._chunk_count[0] + 1))
+
+    def get_chunks_after(self, time_t: int, qoff: int = 0) -> Iterator[int]:
+        """Yield 1-based chunk indices whose end_time is >= time_t (inclusive). Uses binary search on qmax."""
+        last = self._last_non_empty_idx(qoff)
+        if last == 0:
+            return iter(())
+        start_idx = self._binary_search_end_time(time_t, qoff, bound=last)
+        for idx in range(start_idx, last + 1):
+            qmin = self._chunk_start_time(idx, qoff)
+            qmax = self._chunk_end_time(idx, qoff)
+            if qmax == 0 or qmin == UINT64_MAX or qmin > qmax:
+                continue  # empty/uninitialized chunk
+            yield idx
+
+    def get_chunks_in_range(self, start_time: int, end_time: int, qoff: int = 0) -> Iterator[int]:
+        """Yield chunk indices whose time window overlaps [start_time, end_time] for a specific time key."""
+        last = self._last_non_empty_idx(qoff)
+        if last == 0:
+            return iter(())
+        # First chunk whose end_time >= start_time
+        idx = self._binary_search_end_time(start_time, qoff, bound=last)
+        while idx <= last:
+            qmin = self._chunk_start_time(idx, qoff)
+            qmax = self._chunk_end_time(idx, qoff)
+            # Stop early if remaining chunks start after the range
+            if qmin > end_time:
+                break
+            if not (qmax == 0 or qmin == UINT64_MAX or qmin > qmax):
+                if qmax >= start_time and qmin <= end_time:
+                    yield idx
+            idx += 1
+
+    def get_chunks_in_range_reverse(self, start_time: int, end_time: int, qoff: int = 0) -> Iterator[int]:
+        """Yield overlapping chunk indices in descending order."""
+        ids = list(self.get_chunks_in_range(start_time, end_time, qoff=qoff))
+        for idx in reversed(ids):
+            yield idx
+
+    def get_latest_chunk_idx(self) -> Optional[int]:
+        """Return the chunk_id of the most recently registered chunk."""
+        return self._chunk_count[0] if self._chunk_count[0] > 0 else None
+
+    def pop_latest_chunk(self) -> bool:
+        if not self.is_writer or self._chunk_count[0] == 0:
+            return False
+        offset = HEADER_SIZE + ((self._chunk_count[0] - 1) << 7)
+        self._mv[offset:offset + CHUNK_SIZE] = b"\x00" * CHUNK_SIZE
+        self._chunk_count[0] -= 1
+        self.mm.flush()
+        return True
+    
+    def get_latest_chunk(self) -> Optional[ChunkMeta]:
+        """Return metadata for the newest chunk (1-indexed internally)."""
+        if self._chunk_count[0] == 0:
+            return None
+        return self.get_chunk_metadata(self._chunk_count[0])
+
+    def iter_chunks_meta(self) -> Iterator[ChunkMeta]:
+        for i in range(1, int(self._chunk_count[0]) + 1):
+            yield self.get_chunk_metadata(i)
+
+    def find_chunk_by_id(self, chunk_id: int) -> Optional[int]:
+        for i in range(1, int(self._chunk_count[0]) + 1):
+            offset = HEADER_SIZE + ((i - 1) * CHUNK_SIZE) + CHUNK_ID_OFFSET
+            val = int.from_bytes(self._mv[offset:offset+8], 'little')
+            if val == chunk_id:
+                return i
+        return None
+
+    def durable_frontier(self) -> tuple[int, int]:
+        total_records = 0
+        latest_ts = 0
+        for idx in range(1, int(self._chunk_count[0]) + 1):
+            meta = self.get_chunk_metadata(idx)
+            try:
+                n = int(meta.num_records)
+                qmin = int(meta.get_qmin(0))
+                qmax = int(meta.get_qmax(0))
+            finally:
+                meta.release()
+            if n <= 0 or qmin == UINT64_MAX or qmax == 0 or qmax < qmin:
+                continue
+            total_records += n
+            if qmax > latest_ts:
+                latest_ts = qmax
+        return total_records, latest_ts
