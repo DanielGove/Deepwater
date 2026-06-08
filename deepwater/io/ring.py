@@ -1,4 +1,5 @@
 import hashlib
+import math
 import os
 import time
 from pathlib import Path
@@ -7,6 +8,9 @@ from typing import Optional
 
 _DRAIN_REQUEST_FLAG = 1 << 63
 _COUNT_MASK = _DRAIN_REQUEST_FLAG - 1
+PAGE_SIZE = int(os.sysconf("SC_PAGE_SIZE"))
+_HEADER_BYTES = 72
+RING_HEADER_SIZE = ((_HEADER_BYTES + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
 
 
 def _yield_cpu() -> None:
@@ -21,6 +25,15 @@ def ring_buffer_shm_names(base_path, feed_name: str) -> tuple[str, ...]:
     digest = hashlib.blake2b(base_key.encode("utf-8", "surrogatepass"), digest_size=8).hexdigest()
     primary = f"dw_{digest}_{feed_name}"
     return (primary, feed_name, f"{feed_name}-ring")
+
+
+def normalize_ring_data_size(requested_bytes: int, record_size: int) -> int:
+    if requested_bytes <= 0:
+        raise ValueError("ring data size must be > 0")
+    if record_size <= 0:
+        raise ValueError("record size must be > 0")
+    unit = math.lcm(PAGE_SIZE, int(record_size))
+    return ((int(requested_bytes) + unit - 1) // unit) * unit
 
 
 class RingBuffer:
@@ -42,7 +55,7 @@ class RingBuffer:
     _OFF_DURABLE_LAST_TS = 48
     _OFF_OVERRUN_COUNT = 56
     _OFF_LOST_RECORDS = 64
-    HEADER_SIZE = 72
+    HEADER_SIZE = RING_HEADER_SIZE
 
     @classmethod
     def open(cls, name: str, data_size: int | None = None, *, shm_name: str | None = None):
@@ -66,13 +79,15 @@ class RingBuffer:
     ):
         if data_size <= 0:
             raise ValueError("data_size must be > 0")
-        if data_size % 4096 != 0:
-            data_size = (data_size + 4095) & ~4095
+        if data_size % PAGE_SIZE != 0:
+            raise ValueError(f"data_size must be a multiple of page size {PAGE_SIZE}")
         self.name = name
         self.shm_name = shm_name or name
         self.data_size = data_size
         self.total_size = self.HEADER_SIZE + data_size
         self.created = False
+        self._resource_name = None
+        self._resource_tracker_unregistered = False
         if create:
             try:
                 self.shm = shared_memory.SharedMemory(name=self.shm_name, create=True, size=self.total_size)
@@ -101,12 +116,13 @@ class RingBuffer:
                     f"(shm_name={self.shm_name})"
                 )
         try:
-            resource_name = getattr(
+            self._resource_name = getattr(
                 self.shm,
                 "_name",
                 self.shm_name if str(self.shm_name).startswith("/") else f"/{self.shm_name}",
             )
-            resource_tracker.unregister(resource_name, "shared_memory")
+            resource_tracker.unregister(self._resource_name, "shared_memory")
+            self._resource_tracker_unregistered = True
         except Exception:
             pass
         self.buf = self.shm.buf
@@ -120,8 +136,11 @@ class RingBuffer:
         self._durable_record_count = self.buf[self._OFF_DURABLE_RECORD_COUNT:self._OFF_DURABLE_LAST_TS].cast("Q")
         self._durable_last_ts = self.buf[self._OFF_DURABLE_LAST_TS:self._OFF_OVERRUN_COUNT].cast("Q")
         self._overrun_count = self.buf[self._OFF_OVERRUN_COUNT:self._OFF_LOST_RECORDS].cast("Q")
-        self._lost_records = self.buf[self._OFF_LOST_RECORDS:self.HEADER_SIZE].cast("Q")
-        self.data = self.buf[self.HEADER_SIZE:]
+        self._lost_records = self.buf[self._OFF_LOST_RECORDS:self._OFF_LOST_RECORDS + 8].cast("Q")
+        from .ring_shadow import map_shadow
+
+        self._shadow_map = map_shadow(self.shm_name, self.HEADER_SIZE, self.data_size)
+        self.data = self._shadow_map.view
 
     @property
     def write_pos(self):
@@ -243,13 +262,21 @@ class RingBuffer:
     def close(self, unlink: bool = False) -> None:
         if unlink:
             try:
-                self.shm.unlink()
+                if self._resource_tracker_unregistered:
+                    shared_memory._posixshmem.shm_unlink(self._resource_name)
+                else:
+                    self.shm.unlink()
             except FileNotFoundError:
                 pass
+        shadow_closed = False
         try:
-            self.data.release()
-        except Exception:
+            self._shadow_map.close()
+            shadow_closed = True
+        except (AttributeError, BufferError):
             pass
+        if shadow_closed:
+            self.data = None
+            self._shadow_map = None
         for view in (
             self._write_pos,
             self._start_pos,
@@ -273,4 +300,3 @@ class RingBuffer:
             self.shm.close()
         except BufferError:
             pass
-

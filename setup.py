@@ -34,6 +34,12 @@ extensions = [
         extra_compile_args=extra_compile_args,
         extra_link_args=["-O3"],
     ),
+    Extension(
+        "deepwater.io.ring_shadow",
+        ["deepwater/io/ring_shadow.pyx"],
+        extra_compile_args=extra_compile_args,
+        extra_link_args=["-O3"],
+    ),
 ]
 
 

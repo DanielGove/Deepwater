@@ -6,6 +6,7 @@ import orjson
 
 from .global_registry import GlobalRegistry
 from .feed_schema import build_schema, save_schema
+from ..io.ring import normalize_ring_data_size
 
 
 def _base(base_path) -> Path:
@@ -58,6 +59,11 @@ def create_feed(base_path, spec: dict) -> None:
         if not uses_ring and not persist:
             raise ValueError("feed must be persistent when uses_ring=false")
 
+        schema = build_schema(
+            tuple((field["name"], field["type"]) for field in spec["fields"]),
+            clock_level=spec.get("clock_level"),
+        )
+
         chunk_size_mb = float(spec.get("chunk_size_mb", 64))
         chunk_size_bytes = _mb_to_bytes(chunk_size_mb, default=64)
         if not uses_ring:
@@ -72,11 +78,9 @@ def create_feed(base_path, spec: dict) -> None:
         else:
             ring_size_mb = chunk_size_mb
             ring_size_bytes = _mb_to_bytes(ring_size_mb, default=ring_size_mb)
-
-        schema = build_schema(
-            tuple((field["name"], field["type"]) for field in spec["fields"]),
-            clock_level=spec.get("clock_level"),
-        )
+        if uses_ring:
+            ring_size_bytes = normalize_ring_data_size(ring_size_bytes, schema.record_size)
+            ring_size_mb = ring_size_bytes / (1024 * 1024)
         save_schema(fdir, schema)
 
         feed_metadata = {
@@ -93,6 +97,7 @@ def create_feed(base_path, spec: dict) -> None:
         config["persist"] = persist
         config["chunk_size_mb"] = chunk_size_mb
         config["ring_size_mb"] = ring_size_mb
+        config["ring_size_bytes"] = ring_size_bytes
         config["storage"] = "ring" if uses_ring else "chunk"
         config["uses_ring"] = uses_ring
         config["segment_tracking"] = bool(spec.get("segment_tracking", True))

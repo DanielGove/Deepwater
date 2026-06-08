@@ -9,7 +9,7 @@ import numpy as np
 from typing import Union
 
 from .chunk import Chunk
-from .ring import RingBuffer, _yield_cpu, ring_buffer_shm_names
+from .ring import RingBuffer, _yield_cpu, normalize_ring_data_size, ring_buffer_shm_names
 from ..metadata.feed_registry import FeedRegistry, ON_DISK, UINT64_MAX
 from ..metadata.feed_metadata import load_feed_metadata
 from ..metadata.feed_schema import load_record_schema_for_feed
@@ -353,9 +353,7 @@ class RingWriter:
             self.ring.close(unlink=True)
         except Exception:
             pass
-        self.ring_bytes = int(new_size_bytes)
-        self._usable_bytes = int(self.ring.data_size)
-        self._ring_capacity = self._usable_bytes // self._rec_size
+        self.ring_bytes = normalize_ring_data_size(int(new_size_bytes), self._rec_size)
         shm_names = ring_buffer_shm_names(self.base_path, self.feed_name)
         self.ring = RingBuffer(
             self.feed_name,
@@ -370,6 +368,8 @@ class RingWriter:
         self._ring_record_count = self.ring._record_count
         self._ring_durable_record_count = self.ring._durable_record_count
         self._ring_data = self.ring.data
+        self._usable_bytes = int(self.ring.data_size)
+        self._ring_capacity = self._usable_bytes // self._rec_size
         self._bootstrap_persisted_ring()
 
     def close(self):

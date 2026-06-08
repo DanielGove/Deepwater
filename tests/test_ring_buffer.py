@@ -9,7 +9,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
-from deepwater.io.ring import ring_buffer_shm_names
+from deepwater.io.ring import PAGE_SIZE, normalize_ring_data_size, ring_buffer_shm_names
+from deepwater.metadata.feed_metadata import load_feed_metadata
 
 
 def test_ring_buffer_shm_name_normalizes_base_path():
@@ -22,6 +23,31 @@ def test_ring_buffer_shm_name_normalizes_base_path():
             assert ring_buffer_shm_names(base.name, "live")[0] == ring_buffer_shm_names(base.resolve(), "live")[0]
         finally:
             os.chdir(cwd)
+
+
+def test_ring_size_normalizes_to_page_and_record_multiple():
+    with tempfile.TemporaryDirectory(prefix="dw-ring-size-") as td:
+        base = Path(td)
+        spec = {
+            "feed_name": "oddsize",
+            "mode": "UF",
+            "fields": [
+                {"name": "ts", "type": "uint64"},
+                {"name": "payload", "type": "bytes61"},
+            ],
+            "clock_level": 1,
+            "persist": False,
+            "ring_size_mb": 0.25,
+            "chunk_size_mb": 0.25,
+        }
+        create_feed(base, spec)
+        metadata = load_feed_metadata(base, "oddsize")
+        requested = int(0.25 * 1024 * 1024)
+        expected = normalize_ring_data_size(requested, 69)
+        assert metadata.ring_size_bytes == expected
+        assert metadata.ring_size_bytes % PAGE_SIZE == 0
+        assert metadata.ring_size_bytes % 69 == 0
+        assert metadata.ring_size_bytes >= requested
 
 
 def test_ring_wrap_and_range():
@@ -104,6 +130,7 @@ def test_live_ring_api_matches_reader_shape():
 def run_tests():
     tests = [
         ("ring_buffer_shm_name_normalizes_base_path", test_ring_buffer_shm_name_normalizes_base_path),
+        ("ring_size_normalizes_to_page_and_record_multiple", test_ring_size_normalizes_to_page_and_record_multiple),
         ("ring_wrap_and_range", test_ring_wrap_and_range),
         ("live_ring_api_matches_reader_shape", test_live_ring_api_matches_reader_shape),
     ]

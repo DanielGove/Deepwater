@@ -69,18 +69,12 @@ def ring_lower_bound(
 
 
 def ring_copy_records(data, pos: int, n_records: int, rec_size: int, ring_usable_bytes: int) -> memoryview:
-    """Copy records from a circular ring into one contiguous owned byte buffer."""
+    """Return records from a circular ring as one contiguous byte view."""
     n_bytes = int(n_records) * int(rec_size)
     pos = int(pos)
     if n_bytes <= 0:
         return memoryview(b"")
-    first = min(n_bytes, int(ring_usable_bytes) - pos)
-    if first == n_bytes:
-        return memoryview(bytes(data[pos:pos + first]))
-    out = bytearray(n_bytes)
-    out[:first] = data[pos:pos + first]
-    out[first:] = data[:n_bytes - first]
-    return memoryview(out)
+    return data[pos:pos + n_bytes]
 
 
 def ring_raw_batches(
@@ -93,7 +87,7 @@ def ring_raw_batches(
     ring_usable_bytes: int,
     batch_records: int,
 ) -> Iterator[memoryview]:
-    """Yield owned raw batches over a sequence range in a circular ring."""
+    """Yield contiguous raw batches over a sequence range in a circular ring."""
     if end_seq <= start_seq:
         return
     batch_records = int(batch_records)
