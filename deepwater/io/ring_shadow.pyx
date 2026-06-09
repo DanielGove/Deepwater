@@ -43,8 +43,10 @@ cdef extern from "sys/mman.h" nogil:
     int MAP_ANONYMOUS
     int MAP_SHARED
     int MAP_FIXED
+    int MADV_HUGEPAGE
 
     void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+    int madvise(void *addr, size_t length, int advice)
     int munmap(void *addr, size_t length)
     int shm_open(const char *name, int oflag, unsigned int mode)
     int shm_unlink(const char *name)
@@ -186,6 +188,9 @@ def map_shadow(str shm_name, Py_ssize_t data_offset, Py_ssize_t data_size):
         err = errno
         munmap(base, total)
         raise OSError(err, "mmap second data view failed")
+
+    # Best-effort THP hint; kernel policy decides whether shmem can use it.
+    madvise(base, total, MADV_HUGEPAGE)
 
     shadow = ShadowMap()
     shadow.bind(base, total)
