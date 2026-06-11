@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import struct
-import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from deepwater import create_feed
+from deepwater.metadata.admin import FeedSpec, FieldSpec
+from deepwater.metadata.feed_metadata import load_feed_metadata
 from deepwater.metadata.feed_schema import build_schema, load_schema, save_schema
 
 
@@ -99,27 +101,69 @@ def test_create_feed_writes_msgpack_schema():
     assert schema.numpy_dtype.names == ("ts", "price", "size")
 
 
-def run_tests():
-    tests = [
-        test_schema_derives_numpy_dtype_and_struct,
-        test_schema_excludes_padding_from_numpy_dtype,
-        test_schema_msgpack_roundtrip,
-        test_create_feed_writes_msgpack_schema,
-    ]
-    print("Feed Schema Tests")
-    print("=" * 60)
-    passed = 0
-    for test in tests:
-        try:
-            test()
-            print(f"PASS {test.__name__}")
-            passed += 1
-        except Exception as exc:
-            print(f"FAIL {test.__name__} - {exc}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
+def test_create_feed_accepts_typed_spec():
+    spec = FeedSpec(
+        feed_name="quotes",
+        fields=(
+            FieldSpec("ts", "uint64"),
+            FieldSpec("bid", "float64"),
+            FieldSpec("ask", "float64"),
+        ),
+        clock_level=1,
+        persist=False,
+        uses_ring=True,
+        chunk_size_mb=1,
+        ring_size_mb=2,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td) / "platform"
+        create_feed(base, spec)
+        feed_dir = base / "data" / "quotes"
+        schema = load_schema(feed_dir)
+        config = (feed_dir / "config.json").read_bytes()
+
+    assert schema.record_size == 24
+    assert schema.fmt == "<Qdd"
+    assert b'"uses_ring":true' in config
+    assert b'"storage":"ring"' in config
 
 
-if __name__ == "__main__":
-    run_tests()
+def test_create_feed_accepts_tuple_fields_and_chunk_storage(base_path):
+    create_feed(
+        base_path,
+        {
+            "feed_name": "orders",
+            "fields": [("ts", "uint64"), ("order_id", "uint64")],
+            "clock_level": 1,
+            "persist": True,
+            "storage": "chunk",
+        },
+    )
+
+    metadata = load_feed_metadata(base_path, "orders")
+    assert metadata.persist is True
+    assert metadata.uses_ring is False
+    assert metadata.ring_size_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"mode": "blob"}, "only UF feeds are supported"),
+        ({"storage": "disk"}, "storage must be 'ring' or 'chunk'"),
+        ({"storage": "chunk", "uses_ring": True}, "uses_ring contradicts storage"),
+        ({"persist": False, "uses_ring": False}, "feed must be persistent"),
+    ],
+)
+def test_create_feed_rejects_invalid_admin_specs(base_path, updates, message):
+    spec = {
+        "feed_name": "bad",
+        "fields": [{"name": "ts", "type": "uint64"}],
+        "clock_level": 1,
+        "persist": True,
+    }
+    spec.update(updates)
+
+    with pytest.raises(ValueError, match=message):
+        create_feed(base_path, spec)

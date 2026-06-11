@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Test runner for Deepwater
 set -e
 
-echo "🧪 Running Deepwater Test Suite"
-echo ""
-
-# Activate venv if it exists
 if [ -d ".venv/bin" ]; then
     source .venv/bin/activate
 fi
 
-# Run the test suite
-python tests/__init__.py "$@"
+if [ -z "${TMPDIR:-}" ] && [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
+    export TMPDIR="/dev/shm"
+fi
+
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+
+python -m pytest -p no:cacheprovider "$@"

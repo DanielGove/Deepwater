@@ -1,5 +1,4 @@
 import struct
-import sys
 import tempfile
 from pathlib import Path
 
@@ -101,27 +100,3 @@ def test_reader_range_uses_per_key_bounds():
             assert len(out_recv) == 2 * 3
         finally:
             r.close()
-
-
-def run_tests():
-    tests = [
-        ("chunk_metadata_bounds_per_key", test_chunk_metadata_bounds_per_key),
-        ("reader_range_uses_per_key_bounds", test_reader_range_uses_per_key_bounds),
-    ]
-    print("Metadata Bounds Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

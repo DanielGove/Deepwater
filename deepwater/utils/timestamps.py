@@ -59,7 +59,7 @@ def us_to_iso(ts_us: int, *, with_z: bool = True, precision: int = 6) -> str:
     if precision < 0 or precision > 6:
         raise ValueError("precision must be between 0 and 6")
     seconds, micros = divmod(int(ts_us), 1_000_000)
-    dt = _dt.datetime.utcfromtimestamp(seconds)
+    dt = _dt.datetime.fromtimestamp(seconds, _dt.UTC)
     if precision == 0:
         frac = ""
     else:

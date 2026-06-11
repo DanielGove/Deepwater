@@ -158,8 +158,8 @@ def codec(base_path, feed_name: str):
     return struct.Struct(lay.fmt), int(lay.primary_ts_offset)
 
 
-def create_feed(base_path, spec: dict) -> None:
-    return _create_feed(_base(base_path), dict(spec))
+def create_feed(base_path, spec) -> None:
+    return _create_feed(_base(base_path), spec)
 
 
 def delete_feed(base_path, feed_name: str, *, missing_ok: bool = False) -> bool:

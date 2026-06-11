@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Range across many chunks to catch overlap/iteration bugs."""
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
 from deepwater.metadata.feed_registry import FeedRegistry
@@ -66,24 +64,3 @@ def test_range_spans_hundred_chunks():
         assert len(full) == N, "ev_us full-span mismatch"
 
         r.close(); reg.close()
-
-
-def run_tests():
-    tests = [("range_spans_hundred_chunks", test_range_spans_hundred_chunks)]
-    print("Range Many Chunks Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

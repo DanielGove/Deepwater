@@ -2,12 +2,10 @@
 """Tests for multi-feed contiguous dataset planning."""
 import io
 import json
-import sys
 import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Writer, create_feed
 from deepwater.cli.datasets_cli import _format_duration_us, main as datasets_cli_main
@@ -178,30 +176,3 @@ def test_datasets_cli_duration_formatting():
     assert _format_duration_us(61_000_000) == "1.017m"
     assert _format_duration_us(3_661_000_000) == "1.017h"
     assert _format_duration_us(-1_500) == "-1.5ms"
-
-
-def run_tests():
-    tests = [
-        ("common_windows_across_two_feeds", test_common_windows_across_two_feeds),
-        ("datasets_cli_json_and_manifest_output", test_datasets_cli_json_and_manifest_output),
-        ("datasets_cli_multi_source_two_base_paths", test_datasets_cli_multi_source_two_base_paths),
-        ("datasets_cli_text_timestamp_formats", test_datasets_cli_text_timestamp_formats),
-        ("datasets_cli_duration_formatting", test_datasets_cli_duration_formatting),
-    ]
-    print("Datasets Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import socket
-import sys
 import tempfile
 import threading
 import io
@@ -12,7 +11,6 @@ import time
 from contextlib import redirect_stdout
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import deepwater.network.protocol as protocol
 import orjson
@@ -565,38 +563,3 @@ def test_remote_metadata_clis_loopback():
             server.shutdown()
             server.server_close()
             delete_feed(base, "events", missing_ok=True)
-
-
-def run_tests():
-    tests = [
-        ("path_parser", test_path_parser),
-        ("agent_path_guard", test_agent_path_guard),
-        ("protocol_round_trip", test_protocol_round_trip),
-        ("protocol_rejects_oversized_frames_without_payload_alloc", test_protocol_rejects_oversized_frames_without_payload_alloc),
-        ("remote_reader_range_loopback", test_remote_reader_range_loopback),
-        ("remote_reader_ts_key_loopback", test_remote_reader_ts_key_loopback),
-        ("remote_reader_range_batches_loopback", test_remote_reader_range_batches_loopback),
-        ("remote_reader_read_available_loopback", test_remote_reader_read_available_loopback),
-        ("remote_stream_with_start_loopback", test_remote_stream_with_start_loopback),
-        ("remote_stream_heartbeat_loopback", test_remote_stream_heartbeat_loopback),
-        ("local_live_ring_range_batches_loopback", test_local_live_ring_range_batches_loopback),
-        ("remote_metadata_and_reader_loopback", test_remote_metadata_and_reader_loopback),
-        ("remote_metadata_clis_loopback", test_remote_metadata_clis_loopback),
-    ]
-    print("Network Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

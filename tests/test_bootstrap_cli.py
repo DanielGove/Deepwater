@@ -2,12 +2,10 @@
 """Tests for the top-level `deepwater` bootstrap command."""
 import io
 import os
-import sys
 import tempfile
 from contextlib import redirect_stderr
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater.cli.bootstrap import main as bootstrap_main
 
@@ -88,29 +86,3 @@ def test_bootstrap_force_overwrites_generated_files():
         rc2 = bootstrap_main(["--path", str(out), "--force", "--quiet"])
         assert rc2 == 0
         assert "Deepwater: Start Here" in start_here.read_text(encoding="utf-8")
-
-
-def run_tests():
-    tests = [
-        ("bootstrap_creates_starter_folder_and_files", test_bootstrap_creates_starter_folder_and_files),
-        ("bootstrap_defaults_to_local_deepwater_starter_folder", test_bootstrap_defaults_to_local_deepwater_starter_folder),
-        ("bootstrap_refuses_overwrite_without_force", test_bootstrap_refuses_overwrite_without_force),
-        ("bootstrap_force_overwrites_generated_files", test_bootstrap_force_overwrites_generated_files),
-    ]
-    print("Bootstrap CLI Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Tests for deepwater-feeds metadata CLI."""
 import io
-import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import orjson
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import create_feed
 from deepwater.cli.feeds_cli import main as feeds_main
@@ -128,30 +126,3 @@ def test_describe_single_feed_text_timestamp_formats():
         assert rc_us == 0
         us_out = us_buf.getvalue()
         assert "created_us=" in us_out
-
-
-def run_tests():
-    tests = [
-        ("list_feeds_text", test_list_feeds_text),
-        ("describe_single_feed_json", test_describe_single_feed_json),
-        ("describe_all_json", test_describe_all_json),
-        ("describe_missing_feed_fails", test_describe_missing_feed_fails),
-        ("describe_single_feed_text_timestamp_formats", test_describe_single_feed_text_timestamp_formats),
-    ]
-    print("Feeds CLI Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

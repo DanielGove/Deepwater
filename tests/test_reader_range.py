@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Reader range/ts_key coverage using shared helpers."""
-import sys
 import tempfile
 import struct
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
 from helpers import make_feed, seed_records, close_all
@@ -124,29 +122,3 @@ def test_reader_point_lookups_live_ring_only():
             assert bytes(r.first_after(base_ts + 15, format="raw")) == struct.pack(r.format, base_ts + 20, 2)
         finally:
             close_all(r, w)
-
-
-def run_tests():
-    tests = [
-        ("range_per_axis_clock3", test_range_per_axis_clock3),
-        ("reader_point_lookups_per_axis", test_reader_point_lookups_per_axis),
-        ("reader_point_lookup_edges_across_chunks", test_reader_point_lookup_edges_across_chunks),
-        ("reader_point_lookups_live_ring_only", test_reader_point_lookups_live_ring_only),
-    ]
-    print("Reader Range Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

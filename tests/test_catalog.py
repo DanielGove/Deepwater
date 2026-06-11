@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Standalone catalog and coverage helpers do not require Platform."""
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Writer, catalog, create_feed, feed_coverage
 
@@ -67,28 +65,3 @@ def test_feed_coverage_falls_back_to_chunks_without_segment_side_effect():
         assert coverage["duration_us"] == 3
         assert coverage["records"] == 3
         assert not segments_path.exists()
-
-
-def run_tests():
-    tests = [
-        ("feed_coverage_prefers_segments", test_feed_coverage_prefers_segments),
-        ("feed_coverage_falls_back_to_chunks_without_segment_side_effect", test_feed_coverage_falls_back_to_chunks_without_segment_side_effect),
-    ]
-    print("Catalog Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-            raise
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

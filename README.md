@@ -1,6 +1,6 @@
 # Deepwater
 
-Data platform for time-series storage and replay.
+Low-latency feed substrate for fixed-width time-series records, live shared-memory rings, durable chunks, and blob sidecars.
 
 ---
 
@@ -47,7 +47,14 @@ deepwater --path ./my-deepwater-guide --force
 
 ---
 
-## Primitive Core
+## Core API
+
+The public workflow is intentionally small:
+
+- `create_feed(base, spec)` defines metadata and schema.
+- `Writer(base, feed)` appends records.
+- `Reader(base, feed)` reads local feeds, or transparently opens a remote reader for `host:/path` and `dw://host:port/path`.
+- Metadata/catalog helpers are standalone functions; there is no `Platform` object.
 
 ```python
 import time
@@ -55,7 +62,6 @@ from deepwater import Reader, Writer, create_feed, delete_feed
 
 base = './data'
 
-# Create feed (define schema)
 create_feed(base, {
     'feed_name': 'trades',
     'mode': 'UF',
@@ -64,41 +70,61 @@ create_feed(base, {
         {'name': 'price', 'type': 'float64'},
         {'name': 'size', 'type': 'float64'},
     ],
-    'clock_level': 1,  # number of time axes (1-3); first N fields must be uint64 timestamps
-    'persist': True,  # True=disk, False=memory-only ring buffer
+    'clock_level': 1,
+    'persist': True,
 })
 
-# Write
-writer = Writer(base, 'trades')
-writer.write_values(int(time.time() * 1e6), 123.45, 100.0)
-writer.close()
+with Writer(base, 'trades') as writer:
+    writer.write_values(int(time.time() * 1e6), 123.45, 100.0)
 
-# Read
-reader = Reader(base, 'trades')
-for record in reader.stream():  # Live streaming
-    print(record)
-    break
-records = reader.range(start_us, end_us)  # Historical range
-arrays = reader.range(start_us, end_us, format="numpy")  # Structured NumPy array
-columns = reader.range_columns(start_us, end_us, ["price", "size"])
-reader.close()
+with Reader(base, 'trades') as reader:
+    records = reader.range(start_us, end_us)
+    arrays = reader.range(start_us, end_us, format="numpy")
+    columns = reader.range_columns(start_us, end_us, ["price", "size"])
+    for record in reader.stream():
+        print(record)
+        break
 
-# Delete feed (wipe data + registry entry)
-delete_feed(base, 'trades')  # Useful for development resets
+delete_feed(base, 'trades')
+```
 
-# Clock Levels
-# -------------
-# clock_level defines how many timelines your feed tracks:
-#   1 → single timeline (e.g., wall clock)
-#   2 → dual timelines (e.g., exchange event time + receive time)
-#   3 → triple timelines (e.g., event, received, processed)
-# Place those time fields first in `fields` (all uint64). They are all queryable via `ts_key`.
+### Storage Modes
 
-# API docs
-help(Reader)
-help(Writer)
-help(reader.stream)
-help(reader.range)
+- `persist=True`, `uses_ring=False` or omitted: direct durable chunk writer.
+- `persist=False`: live ring only.
+- `persist=True`, `uses_ring=True`: live ring first, drained by the persistent-ring persister into durable chunks.
+
+`clock_level` defines how many leading `uint64` fields are timestamp axes. Readers query the first timestamp by default; pass `ts_key=` to use another clock field.
+
+### Blob Sidecars
+
+Blob sidecars store variable-size payloads next to a normal fixed-row index feed. The index row is still a regular Deepwater record, so it can be ranged, streamed, and queried like any other feed.
+
+```python
+import msgspec
+from deepwater import Reader, Writer, create_feed
+from deepwater.metadata.admin import BlobSidecarSpec, FeedSpec, FieldSpec
+
+base = "./data"
+
+create_feed(base, FeedSpec(
+    feed_name="book_snapshots",
+    fields=(FieldSpec("ts", "uint64"),),
+    clock_level=1,
+    persist=True,
+    uses_ring=True,
+    sidecars=(BlobSidecarSpec(name="snapshot", codec="msgpack"),),
+))
+
+payload = msgspec.msgpack.encode({"bids": [[100.0, 2.0]], "asks": [[101.0, 1.5]]})
+
+with Writer(base, "book_snapshots") as writer:
+    ref = writer.write_blob(1_000, payload, sidecar="snapshot", codec="msgpack", schema_id=7)
+
+with Reader(base, "book_snapshots") as reader:
+    row = reader.range(999, 1_001)[0]
+    assert reader.blob_ref(row, sidecar="snapshot") == ref
+    assert reader.blob(row, sidecar="snapshot") == payload
 ```
 
 ---
@@ -112,7 +138,7 @@ Current scope:
 - large historical reads: supported via `range_batches()`
 - non-blocking event-loop reads: supported via `read_available()`
 - remote writes: not supported in v0; writers remain local to the data machine
-- transport: TCP, length-prefixed frames, JSON control header plus optional binary payload
+- transport: TCP, length-prefixed frames, msgpack control header plus optional binary payload
 - payload: Deepwater raw record bytes where possible, decoded by the client into tuple/dict/numpy/raw formats
 - stream liveness: TCP keepalive plus lightweight idle heartbeats for live remote streams
 
@@ -158,28 +184,19 @@ For remote metadata, use the explicit helpers in `deepwater.network.client` or t
 
 ## Testing
 
-### Running Tests
-
 ```bash
-./test.sh  # Runs all test_*.py files in tests/
+./test.sh
+.venv/bin/python -m pytest tests/test_ring_buffer.py
+.venv/bin/python -m pytest --cov=deepwater
 ```
 
-### Adding Tests
-
-Create `tests/test_yourfeature.py`:
+Tests are pytest-native. Use fixtures from `tests/conftest.py` and keep data under temporary directories.
 
 ```python
-#!/usr/bin/env python3
-"""Test: Your Feature"""
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 from deepwater import Reader, Writer, create_feed
 
-def test_your_feature():
-    base = './data/test-yourfeature'  # Unique test dir
-    create_feed(base, {
+def test_your_feature(base_path):
+    create_feed(base_path, {
         'feed_name': 'test',
         'mode': 'UF',
         'fields': [
@@ -189,44 +206,15 @@ def test_your_feature():
         'clock_level': 1,
         'persist': True,
     })
-    
-    writer = Writer(base, 'test')
-    writer.write_values(12345, 7)
-    writer.close()
-    
-    reader = Reader(base, 'test')
-    data = reader.range(0, 99999)
-    assert len(data) > 0, "Expected data"
-    assert data[0][0] == 12345
-    
-    reader.close()
-    return True
 
-def run_tests():
-    tests = [("Your Feature", test_your_feature)]
-    print("Your Feature Tests")
-    print("=" * 60)
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
+    with Writer(base_path, 'test') as writer:
+        writer.write_values(12345, 7)
 
-if __name__ == '__main__':
-    run_tests()
+    with Reader(base_path, 'test') as reader:
+        assert reader.range(0, 99999) == [(12345, 7)]
 ```
 
-Run `./test.sh` to auto-discover and execute.
-
-**Guidelines:**
-- Isolated: Unique data directory (`./data/test-*`)
-- Fast: <5s per test
-- Deterministic: No random data, no network
-- Clear assertions: Descriptive error messages
+Hot-path changes need edge coverage for wraparound, chunk boundaries, malformed metadata, and empty inputs.
 
 ---
 
@@ -244,6 +232,7 @@ Validates:
 - Global registry accessible
 - Feed registries readable
 - Recent write activity (if --check-feeds)
+- Persistent-ring persister ownership when ring-backed durable feeds exist
 - Disk space available
 
 Exit codes: 0=healthy, 1=unhealthy, 2=error
@@ -301,8 +290,25 @@ Single feed file:
   ],
   "clock_level": 1,
   "persist": true,
+  "uses_ring": false,
   "chunk_size_mb": 64,
   "retention_hours": 0
+}
+```
+
+Blob sidecar feed file:
+
+```json
+{
+  "feed_name": "book_snapshots",
+  "mode": "UF",
+  "fields": [{"name": "ts", "type": "uint64"}],
+  "clock_level": 1,
+  "persist": true,
+  "uses_ring": true,
+  "sidecars": [
+    {"name": "snapshot", "codec": "msgpack", "chunk_size_mb": 16, "retention": "follows_parent"}
+  ]
 }
 ```
 
@@ -350,7 +356,7 @@ Delete removes feed data, feed registry files, ring shared memory (if used), and
 # list available feeds
 deepwater-feeds --base-path ./data
 
-# inspect one feed: lifecycle, fmt, record size, fields
+# inspect one feed: metadata, schema, record size, fields
 deepwater-feeds --base-path ./data --feed trades
 
 # inspect all feeds in JSON for automation/tools

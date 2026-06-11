@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Persistent ring raw paths should not diverge from tuple/range batch semantics."""
 import struct
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
 
@@ -94,28 +92,3 @@ def test_persistent_read_available_raw_matches_new_records():
         finally:
             r.close()
             w.close()
-
-
-def run_tests():
-    tests = [
-        ("persistent_raw_range_and_batches_match_tuples", test_persistent_raw_range_and_batches_match_tuples),
-        ("persistent_read_available_raw_matches_new_records", test_persistent_read_available_raw_matches_new_records),
-    ]
-    print("Persistent Raw Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-            raise
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

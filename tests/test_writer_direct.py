@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Direct Writer workflow without Platform."""
-import sys
 import tempfile
 import struct
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
 
@@ -105,28 +103,3 @@ def test_chunk_writer_rejects_wrong_raw_record_size():
                 raise AssertionError("short raw record write was not rejected")
         finally:
             w.close()
-
-
-def run_tests():
-    tests = [
-        ("direct_chunk_writer_roundtrip", test_direct_chunk_writer_roundtrip),
-        ("direct_ring_writer_roundtrip", test_direct_ring_writer_roundtrip),
-        ("chunk_writer_rejects_wrong_raw_record_size", test_chunk_writer_rejects_wrong_raw_record_size),
-    ]
-    print("Direct Writer Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

@@ -3,12 +3,10 @@
 Smoke tests using the shared helper harness.
 Keeps feed creation centralized to cut churn when UX changes.
 """
-import sys
 import time
 from pathlib import Path
 import tempfile
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from helpers import make_feed, seed_records, close_all
 from deepwater import Reader, Writer
@@ -56,27 +54,3 @@ def test_clock3_bounds_and_ranges():
         out_ev = r.range(999_990, 1_000_031, ts_key="ev_us")
         assert len(out_ev) == 5, "range on ev_us should return all rows"
         close_all(r)
-
-
-def run_tests():
-    tests = [
-        ("Reuse Single Creation", test_reuse_single_creation),
-        ("Clock3 Bounds and Ranges", test_clock3_bounds_and_ranges),
-    ]
-    print("Helper Harness Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

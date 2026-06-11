@@ -3,12 +3,10 @@
 Core Test: Primitive Feed Creation
 Tests basic primitive feed metadata and write/read behavior.
 """
-import sys
 import time
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
 from deepwater.metadata.discovery import feed_exists
@@ -30,7 +28,6 @@ def test_feed_root_init():
         })
         assert (base / "data").exists()
         assert feed_exists(base, "test_basic")
-    return True
 
 
 def test_feed_creation():
@@ -51,7 +48,6 @@ def test_feed_creation():
         create_feed(base, spec)
         create_feed(base, spec)
         assert feed_exists(base, "test_basic")
-    return True
 
 
 def test_write_read_cycle():
@@ -83,7 +79,6 @@ def test_write_read_cycle():
         assert len(records) == 10, f"Expected 10 records, got {len(records)}"
         assert records[-1] == (base_time + 9, 9.0, 9)
         reader.close()
-    return True
 
 
 def test_empty_persistent_feed_reads_empty():
@@ -105,42 +100,3 @@ def test_empty_persistent_feed_reads_empty():
         assert reader.range(0, 10) == []
         assert reader.read_available() == []
         reader.close()
-    return True
-
-
-def run_tests():
-    """Run all core tests"""
-    tests = [
-        ("Feed Root Init", test_feed_root_init),
-        ("Feed Creation", test_feed_creation),
-        ("Write/Read Cycle", test_write_read_cycle),
-        ("Empty Persistent Feed Reads Empty", test_empty_persistent_feed_reads_empty),
-    ]
-    
-    print("Core Primitive Tests")
-    print("=" * 60)
-    
-    passed = 0
-    failed = 0
-    
-    for name, test_fn in tests:
-        try:
-            result = test_fn()
-            if result:
-                print(f"✅ {name}")
-                passed += 1
-            else:
-                print(f"❌ {name} - returned False")
-                failed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-            failed += 1
-    
-    print(f"\nPassed: {passed}/{len(tests)}")
-    
-    if failed > 0:
-        sys.exit(1)
-
-
-if __name__ == '__main__':
-    run_tests()

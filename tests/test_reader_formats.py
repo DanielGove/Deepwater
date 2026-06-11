@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Exercise reader formats (tuple/dict/numpy/raw), latest, stream, read_available."""
-import sys
 import tempfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
 
@@ -108,28 +106,3 @@ def test_stream_modes():
         # Allow empty if range caught earlier writes only; ensure no crash and optional detection
         assert vals in ([200, 201], [], [200], [201]), f"live-like range values {vals}"
         r2.close()
-
-
-def run_tests():
-    tests = [
-        ("range_formats", test_range_formats),
-        ("range_read_available", test_range_and_read_available),
-        ("stream_modes", test_stream_modes),
-    ]
-    print("Reader Format & Stream Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

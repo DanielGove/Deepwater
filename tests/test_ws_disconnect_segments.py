@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """Regression: websocket disconnect should close writers and segments."""
-import sys
 import tempfile
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "coinbase"))
 
 from deepwater.metadata.discovery import list_segments
 import websocket_client as ws_client
@@ -88,26 +84,3 @@ def test_disconnect_closes_segments_and_reopens_writers():
             ws_client.trades_spec = old_trade_spec
             ws_client.l2_spec = old_l2_spec
             engine.stop()
-
-
-def run_tests():
-    tests = [
-        ("disconnect_closes_segments_and_reopens_writers", test_disconnect_closes_segments_and_reopens_writers),
-    ]
-    print("Websocket Disconnect Segment Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

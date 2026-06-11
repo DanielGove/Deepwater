@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Tests for primitive feed deletion."""
-import sys
 import tempfile
 import time
 from multiprocessing import shared_memory
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed, delete_feed
 from deepwater.io.ring import _ring_data_shm_name, ring_buffer_shm_names
@@ -191,29 +189,3 @@ def test_reader_close_does_not_unlink_ring_shared_memory():
         except FileNotFoundError:
             pass
         assert not _shm_path(data_shm_name).exists()
-
-
-def run_tests():
-    tests = [
-        ("delete_persistent_feed_removes_all_state_and_allows_recreate", test_delete_persistent_feed_removes_all_state_and_allows_recreate),
-        ("delete_ring_feed_unlinks_shared_memory_and_registry_entry", test_delete_ring_feed_unlinks_shared_memory_and_registry_entry),
-        ("delete_ring_feed_unlinks_shared_memory_with_exported_view", test_delete_ring_feed_unlinks_shared_memory_with_exported_view),
-        ("reader_close_does_not_unlink_ring_shared_memory", test_reader_close_does_not_unlink_ring_shared_memory),
-    ]
-    print("Delete Feed Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

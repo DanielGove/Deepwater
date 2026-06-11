@@ -8,7 +8,6 @@ import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Writer, create_feed
 from deepwater.cli.segments_cli import main as segments_cli_main
@@ -341,35 +340,3 @@ def test_writer_manual_segment_boundary_without_close():
         assert second["start_us"] == 6_000_100
         assert second["end_us"] == 6_000_101
         assert second["records"] == 2
-
-
-def run_tests():
-    tests = [
-        ("writer_auto_segment_closed_and_suggested_range", test_writer_auto_segment_closed_and_suggested_range),
-        ("writer_recovery_crash_closes_previous_open_segment_at_last_ts", test_writer_recovery_crash_closes_previous_open_segment_at_last_ts),
-        ("writer_recovery_repairs_chunk_metadata_before_segment_close", test_writer_recovery_repairs_chunk_metadata_before_segment_close),
-        ("repair_utility_backfills_legacy_segment_zero_records", test_repair_utility_backfills_legacy_segment_zero_records),
-        ("repair_utility_crash_closes_open_segment", test_repair_utility_crash_closes_open_segment),
-        ("segments_cli_lists_and_suggests_range", test_segments_cli_lists_and_suggests_range),
-        ("segments_cli_timestamp_format_us", test_segments_cli_timestamp_format_us),
-        ("segments_cli_timestamp_format_timezone_name", test_segments_cli_timestamp_format_timezone_name),
-        ("ring_writer_auto_segments_closed", test_ring_writer_auto_segments_closed),
-        ("writer_manual_segment_boundary_without_close", test_writer_manual_segment_boundary_without_close),
-    ]
-    print("Segments Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

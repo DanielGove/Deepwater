@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Tests for health_check and cleanup utilities."""
-import sys
 import tempfile
 from pathlib import Path
 import time
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Writer, create_feed
 from deepwater.ops.health_check import check_global_registry, check_feeds
@@ -69,27 +67,3 @@ def test_cleanup_deletes_expired_chunks():
         cleanup_all_feeds(base, dry_run=False)
 
         assert not chunk_file.exists(), "cleanup did not delete expired chunk"
-
-
-def run_tests():
-    tests = [
-        ("health_checks_pass_on_fresh_platform", test_health_checks_pass_on_fresh_platform),
-        ("cleanup_deletes_expired_chunks", test_cleanup_deletes_expired_chunks),
-    ]
-    print("Health/Cleanup Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

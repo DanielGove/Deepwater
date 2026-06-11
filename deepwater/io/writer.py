@@ -9,6 +9,7 @@ import numpy as np
 from typing import Union
 
 from .chunk import Chunk
+from .blob_sidecar import BlobRef, BlobSidecarWriters, ref_values
 from .ring import RingBuffer, _yield_cpu, ring_buffer_shm_names
 from ..metadata.feed_registry import FeedRegistry, ON_DISK, UINT64_MAX
 from ..metadata.feed_metadata import load_feed_metadata
@@ -56,6 +57,48 @@ def _load_durable_frontier(feed_dir, feed_name: str) -> tuple[int, int]:
         registry.close()
 
 
+def _persistent_ring_owner_healthy(base_path: Path) -> bool:
+    try:
+        from ..metadata.global_registry import GlobalRegistry
+
+        registry = GlobalRegistry(base_path)
+        try:
+            owner = registry.get_persistent_ring_owner()
+            return bool(owner.get("healthy") and not owner.get("stale"))
+        finally:
+            registry.close()
+    except Exception:
+        return False
+
+
+def _blob_index_record(writer, timestamp: int, sidecar_name: str, ref: BlobRef) -> dict:
+    sidecars = writer._blob_writers.sidecars
+    sidecar = sidecars[sidecar_name]
+    fields = sidecar.ref_fields
+    record = {name: 0 for name in writer._value_fields}
+    record[writer._value_fields[0]] = int(timestamp)
+    (
+        record[fields.chunk_id],
+        record[fields.offset],
+        record[fields.size],
+        record[fields.codec],
+        record[fields.schema_id],
+        record[fields.flags],
+        record[fields.crc],
+    ) = ref_values(ref)
+    return record
+
+
+def _write_blob(writer, timestamp: int, payload, *, sidecar: str, codec: str | None, schema_id: int, flags: int) -> BlobRef:
+    if writer._blob_writers is None:
+        writer._blob_writers = BlobSidecarWriters(writer.base_path, writer.feed_name)
+    sidecar_meta = writer._blob_writers.sidecars[sidecar]
+    selected_codec = sidecar_meta.codec if codec is None else str(codec)
+    ref = writer._blob_writers[sidecar].write(payload, codec=selected_codec, schema_id=schema_id, flags=flags)
+    writer.write_dict(_blob_index_record(writer, timestamp, sidecar, ref))
+    return ref
+
+
 class RingWriter:
     """Single-writer for ring-backed feeds."""
 
@@ -71,6 +114,7 @@ class RingWriter:
         self._prefault_ring = bool(self.feed_metadata.prefault_ring)
         self._writer_lock_fd = None
         self._closed = False
+        self._blob_writers = None
 
         self._S = struct.Struct(self.record_format.fmt)
         self._u64 = struct.Struct("<Q")
@@ -127,6 +171,13 @@ class RingWriter:
     @property
     def closed(self) -> bool:
         return bool(self._closed)
+
+    def __enter__(self) -> "RingWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -300,6 +351,27 @@ class RingWriter:
         vals = tuple(record[name] for name in self._value_fields)
         return self.write_values(*vals)
 
+    def write_blob(
+        self,
+        timestamp: int,
+        payload,
+        *,
+        sidecar: str,
+        codec: str | None = None,
+        schema_id: int = 0,
+        flags: int = 0,
+    ) -> BlobRef:
+        """Append a sidecar payload, then publish its fixed-width index row."""
+        return _write_blob(
+            self,
+            timestamp,
+            payload,
+            sidecar=sidecar,
+            codec=codec,
+            schema_id=schema_id,
+            flags=flags,
+        )
+
     def write_batch_bytes(self, data: bytes) -> int:
         self._ensure_open()
         rec_sz = self._rec_size
@@ -349,13 +421,17 @@ class RingWriter:
         if self._persist:
             if int(self._ring_durable_record_count[0]) < int(self._ring_record_count[0]):
                 self.ring.request_drain()
-            deadline = time.monotonic() + 30.0
-            while time.monotonic() < deadline:
-                if int(self._ring_durable_record_count[0]) >= int(self._ring_record_count[0]):
-                    break
-                _yield_cpu()
+                if _persistent_ring_owner_healthy(self.base_path):
+                    deadline = time.monotonic() + 30.0
+                    while time.monotonic() < deadline:
+                        if int(self._ring_durable_record_count[0]) >= int(self._ring_record_count[0]):
+                            break
+                        _yield_cpu()
         if self.segment_store is not None:
             self.segment_store.close_open_segment("writer_close")
+        if self._blob_writers is not None:
+            self._blob_writers.close()
+            self._blob_writers = None
         try:
             self.ring.close(unlink=False)
         except Exception:
@@ -383,6 +459,7 @@ class ChunkWriter:
         "data_dir", "registry",
         "current_chunk", "current_chunk_metadata", "current_chunk_id",
         "_S", "_rec_size", "_clock_level", "_key_min_set", "_u64", "_qmins", "_qmaxs",
+        "_value_fields", "_blob_writers",
         "segment_store", "_segment_note_write", "_segment_note_batch",
     )
 
@@ -401,6 +478,7 @@ class ChunkWriter:
         self.current_chunk_metadata = None
         self.segment_store = None
         self._key_min_set = None
+        self._blob_writers = None
 
         try:
             self.registry = FeedRegistry(self.data_dir / f"{feed_name}.reg", mode="w")
@@ -413,6 +491,7 @@ class ChunkWriter:
             self._u64 = struct.Struct("<Q")
             self._rec_size = self._S.size
             self._clock_level = self.feed_metadata.clock_level
+            self._value_fields = tuple(f.name for f in self.record_format.fields if f.name != "_")
             if bool(self.feed_metadata.segment_tracking if segment_tracking is None else segment_tracking):
                 self.segment_store = SegmentStore(self.data_dir, self.feed_name)
                 self._segment_note_write = self.segment_store.note_write_one
@@ -453,6 +532,13 @@ class ChunkWriter:
     @property
     def chunk_record_capacity(self) -> int:
         return int(self.feed_metadata.chunk_size_bytes) // self._rec_size
+
+    def __enter__(self) -> "ChunkWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
 
     def _latest_level1_timestamp(self):
         latest_idx = self.registry.get_latest_chunk_idx()
@@ -652,6 +738,34 @@ class ChunkWriter:
         self.current_chunk_metadata.num_records += 1
         return self.current_chunk_metadata.write_pos
 
+    def write_tuple(self, record: tuple) -> int:
+        return self.write_values(*record)
+
+    def write_dict(self, record: dict) -> int:
+        vals = tuple(record[name] for name in self._value_fields)
+        return self.write_values(*vals)
+
+    def write_blob(
+        self,
+        timestamp: int,
+        payload,
+        *,
+        sidecar: str,
+        codec: str | None = None,
+        schema_id: int = 0,
+        flags: int = 0,
+    ) -> BlobRef:
+        """Append a sidecar payload, then publish its fixed-width index row."""
+        return _write_blob(
+            self,
+            timestamp,
+            payload,
+            sidecar=sidecar,
+            codec=codec,
+            schema_id=schema_id,
+            flags=flags,
+        )
+
     def write_batch_bytes(self, data) -> int:
         if self.current_chunk is None:
             return 0
@@ -727,6 +841,9 @@ class ChunkWriter:
                 if self.registry is not None:
                     self.registry.close()
             finally:
+                if self._blob_writers is not None:
+                    self._blob_writers.close()
+                    self._blob_writers = None
                 if self.segment_store is not None:
                     self.segment_store.close_open_segment("writer_close")
 

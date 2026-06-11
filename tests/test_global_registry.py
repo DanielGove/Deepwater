@@ -2,11 +2,9 @@
 """GlobalRegistry fixed-entry ABI coverage."""
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater.metadata.global_registry import ENTRY_SIZE, FeedMetadata, GlobalRegistry
 
@@ -66,27 +64,3 @@ def test_feed_metadata_registry_abi_roundtrip():
             assert updated.ring_size_bytes == 16_777_216
         finally:
             registry.close()
-
-
-def run_tests():
-    tests = [
-        ("feed_metadata_registry_abi_roundtrip", test_feed_metadata_registry_abi_roundtrip),
-    ]
-    print("Global Registry Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-            raise
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

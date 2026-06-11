@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Parity tests for raw historical range scanning extraction."""
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
 
@@ -91,28 +89,3 @@ def test_reader_raw_range_batches_respects_empty_and_batch_limit():
             ]
         finally:
             r.close()
-
-
-def run_tests():
-    tests = [
-        ("reader_range_batches_match_range", test_reader_iter_raw_range_matches_range_and_batches),
-        ("reader_raw_range_batches_respects_empty_and_batch_limit", test_reader_raw_range_batches_respects_empty_and_batch_limit),
-    ]
-    print("Range Scan Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-            raise
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

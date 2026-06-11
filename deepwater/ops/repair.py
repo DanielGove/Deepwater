@@ -593,7 +593,7 @@ def repair_feed(base_path: Path, feed_name: str, dry_run: bool = False) -> Tuple
 
 
 def repair_all_feeds(base_path: Path, dry_run: bool = False) -> None:
-    """Repair all feeds in the platform."""
+    """Repair all feeds under a Deepwater base path."""
     total_checked = 0
     total_repaired = 0
     feeds_repaired = 0

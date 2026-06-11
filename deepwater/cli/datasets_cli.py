@@ -141,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--status",
         default="usable",
-        help="Segment status filter passed to platform (default: usable)",
+        help="Segment status filter (default: usable)",
     )
     parser.add_argument(
         "--min-duration-seconds",

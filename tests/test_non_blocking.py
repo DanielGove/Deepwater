@@ -1,105 +1,36 @@
-#!/usr/bin/env python3
-"""
-Test non-blocking read_available() API.
+from __future__ import annotations
 
-This demonstrates the solution to the 6-8ms blocking issue.
-The read_available() method returns immediately (no spin-wait).
-"""
+from deepwater import Reader, Writer, create_feed
 
-import time
-from pathlib import Path
 
-from deepwater import Reader
-from deepwater.metadata.discovery import feed_exists
+def test_read_available_starts_at_live_head_and_returns_new_rows(base_path):
+    create_feed(
+        base_path,
+        {
+            "feed_name": "events",
+            "mode": "UF",
+            "fields": [
+                {"name": "ts", "type": "uint64"},
+                {"name": "value", "type": "uint64"},
+            ],
+            "clock_level": 1,
+            "persist": False,
+            "ring_size_mb": 1,
+        },
+    )
 
-def test_non_blocking_reads():
-    """Show that read_available() never blocks"""
+    writer = Writer(base_path, "events")
+    reader = Reader(base_path, "events")
 
-    base = Path('./data/coinbase-test')
-    
-    # Check if feed exists
-    if not feed_exists(base, 'CB-L2-XRP-USD'):
-        print("Testing non-blocking reads (read_available)")
-        print("=" * 60)
-        print("\n⚠️  Feed 'CB-L2-XRP-USD' not found")
-        print("   (Skipping test - run websocket ingestion first)")
-        print("\n✅ Test skipped (no feed data)")
-        return
-    reader = Reader(base, 'CB-L2-XRP-USD')
-    
-    print("Testing non-blocking reads (read_available)")
-    print("=" * 60)
-    
-    # Test 1: Empty reads (should be instant)
-    print("\n1. Testing empty reads (no new data):")
-    latencies = []
-    for i in range(10):
-        start = time.perf_counter()
-        records = reader.read_available(max_records=10)
-        elapsed = (time.perf_counter() - start) * 1_000_000  # microseconds
-        latencies.append(elapsed)
-        print(f"   Read #{i+1}: {len(records)} records, {elapsed:.1f}µs")
-    
-    avg_latency = sum(latencies) / len(latencies)
-    print(f"\n   Average latency: {avg_latency:.1f}µs (should be <100µs)")
-    print(f"   ✅ No blocking! No 6-8ms delays!")
-    
-    # Test 2: Event loop pattern (what they need)
-    print("\n2. Event loop pattern (consume up to 10 per cycle):")
-    
-    cycle_times = []
-    for cycle in range(5):
-        start = time.perf_counter()
-        
-        # Read up to 10 records (non-blocking)
-        records = reader.read_available(max_records=10)
-        
-        # Process records
-        for rec in records:
-            pass  # Process here
-        
-        # Simulate other background work
-        time.sleep(0.001)  # 1ms of other work
-        
-        elapsed = (time.perf_counter() - start) * 1000  # milliseconds
-        cycle_times.append(elapsed)
-        print(f"   Cycle #{cycle+1}: {len(records)} records, {elapsed:.3f}ms total")
-    
-    avg_cycle = sum(cycle_times) / len(cycle_times)
-    print(f"\n   Average cycle time: {avg_cycle:.3f}ms")
-    print(f"   ✅ Predictable timing! Background tasks run smoothly!")
-    
-    # Test 3: Dictionary format
-    print("\n3. Dictionary format (readable):")
-    records = reader.read_available(max_records=3, format='dict')
-    for i, rec in enumerate(records):
-        print(f"   Record #{i+1}: {list(rec.keys())[:5]}...")  # First 5 fields
-    
+    assert reader.read_available(max_records=10) == []
+
+    writer.write_values(1_000, 1)
+    writer.write_values(1_001, 2)
+    writer.write_values(1_002, 3)
+
+    assert reader.read_available(max_records=2) == [(1_000, 1), (1_001, 2)]
+    assert reader.read_available(max_records=2) == [(1_002, 3)]
+    assert reader.read_available(max_records=2) == []
+
+    writer.close()
     reader.close()
-    print("\n" + "=" * 60)
-    print("✅ All tests passed! No blocking, no 6-8ms delays.")
-    print("\nThis is the solution for event loops and background tasks.")
-
-
-def compare_blocking_vs_nonblocking():
-    """Compare blocking stream() vs non-blocking read_available()"""
-
-    print("\n\nComparing blocking vs non-blocking APIs")
-    print("=" * 60)
-    
-    print("\n❌ BLOCKING: stream() with no data")
-    print("   Would block for 6-8ms on average (skipping)")
-    
-    print("\n✅ NON-BLOCKING: read_available()")
-    print("   Returns immediately (<10µs)")
-    print("   (Verified in test 1 above)")
-    print("\n" + "=" * 60)
-
-
-if __name__ == "__main__":
-    test_non_blocking_reads()
-    compare_blocking_vs_nonblocking()
-    
-    print("\n" + "=" * 60)
-    print("✅ All tests passed!")
-    print("=" * 60)

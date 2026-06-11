@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """Ring (persist=False) path smoke tests with wrap-around."""
-import sys
 import tempfile
 import struct
 import os
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
-from deepwater.io.ring import PAGE_SIZE, normalize_ring_data_size, ring_buffer_shm_names
+from deepwater.io.ring import PAGE_SIZE, RingBuffer, normalize_ring_data_size, ring_buffer_shm_names
 from deepwater.metadata.feed_metadata import load_feed_metadata
 
 
@@ -48,6 +46,23 @@ def test_ring_size_normalizes_to_page_and_record_multiple():
         assert metadata.ring_size_bytes % PAGE_SIZE == 0
         assert metadata.ring_size_bytes % 69 == 0
         assert metadata.ring_size_bytes >= requested
+
+
+def test_ring_buffer_data_shadow_is_contiguous_across_physical_end():
+    with tempfile.TemporaryDirectory(prefix="dw-ring-shadow-") as td:
+        shm_name = ring_buffer_shm_names(Path(td), "shadow")[0]
+        ring = RingBuffer("shadow", data_size=PAGE_SIZE, create=True, shm_name=shm_name)
+        try:
+            assert len(ring.data) == PAGE_SIZE * 2
+
+            ring.data[PAGE_SIZE - 4:PAGE_SIZE + 4] = b"abcdEFGH"
+
+            assert bytes(ring.data[PAGE_SIZE - 4:PAGE_SIZE + 4]) == b"abcdEFGH"
+            assert bytes(ring.data[PAGE_SIZE - 4:PAGE_SIZE]) == b"abcd"
+            assert bytes(ring.data[:4]) == b"EFGH"
+            assert bytes(ring.data[PAGE_SIZE:PAGE_SIZE + 4]) == b"EFGH"
+        finally:
+            ring.close(unlink=True)
 
 
 def test_ring_wrap_and_range():
@@ -156,30 +171,3 @@ def test_live_ring_api_matches_reader_shape():
             assert next(stream) == (base_ts + 20, 2)
         finally:
             r.close()
-
-
-def run_tests():
-    tests = [
-        ("ring_buffer_shm_name_normalizes_base_path", test_ring_buffer_shm_name_normalizes_base_path),
-        ("ring_size_normalizes_to_page_and_record_multiple", test_ring_size_normalizes_to_page_and_record_multiple),
-        ("ring_wrap_and_range", test_ring_wrap_and_range),
-        ("ring_batch_wrap_preserves_logical_order", test_ring_batch_wrap_preserves_logical_order),
-        ("live_ring_api_matches_reader_shape", test_live_ring_api_matches_reader_shape),
-    ]
-    print("Ring Buffer Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

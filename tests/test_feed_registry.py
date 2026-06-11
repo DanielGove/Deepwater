@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """FeedRegistry public chunk helpers use one-based chunk indices."""
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Writer, create_feed
 from deepwater.metadata.feed_registry import FeedRegistry
@@ -66,27 +64,3 @@ def test_chunk_iteration_and_lookup_are_one_based():
                 raise AssertionError("chunk index latest+1 should be invalid")
         finally:
             registry.close()
-
-
-def run_tests():
-    tests = [
-        ("chunk_iteration_and_lookup_are_one_based", test_chunk_iteration_and_lookup_are_one_based),
-    ]
-    print("Feed Registry Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-            raise
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

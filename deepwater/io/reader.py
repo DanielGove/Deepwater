@@ -8,6 +8,7 @@ from typing import Iterator, Optional
 
 import numpy as np
 
+from .blob_sidecar import BlobRef, BlobSidecarReaders, codec_name
 from .chunk import Chunk
 from .formatting import format_empty_batch, format_raw_batch, format_record_at, raw_record_formatter
 from .ring import RingBuffer, ring_buffer_shm_names
@@ -40,6 +41,9 @@ class Reader:
         first_before(ts): last record with key <= ts.
         read_available(): stateful nonblocking tail read.
         state(): live ring cursor/header state when a ring exists.
+        blob_ref(row, sidecar=...): decode sidecar payload coordinates from an index row.
+        blob(row, sidecar=...): load one blob sidecar payload.
+        blobs(rows, sidecar=...): load payloads for a batch of index rows.
     """
 
     __slots__ = (
@@ -53,6 +57,7 @@ class Reader:
         "_primary_ts_off", "_tail_read_seq",
         "_chunk_lower_bound", "_chunk_raw_batches",
         "_ring_lower_bound", "_ring_raw_batches", "_ring_copy_records",
+        "_sidecars", "_blob_readers",
     )
 
     def __new__(
@@ -102,6 +107,8 @@ class Reader:
         self._ring_record_capacity = 0
         self._ring_usable_bytes = 0
         self._tail_read_seq: Optional[int] = None
+        self._sidecars = None
+        self._blob_readers = None
 
         self._metadata = load_feed_metadata(self.base_path, feed_name)
         if self._metadata is None:
@@ -573,6 +580,62 @@ class Reader:
     ) -> dict[str, np.ndarray]:
         arr = self.range(start, end, format="numpy", ts_key=ts_key)
         return {name: arr[name] for name in columns}
+
+    def _ensure_blob_readers(self) -> BlobSidecarReaders:
+        readers = self._blob_readers
+        if readers is None:
+            readers = BlobSidecarReaders(self.base_path, self.feed_name)
+            self._blob_readers = readers
+            self._sidecars = readers.sidecars
+        return readers
+
+    def _row_value(self, row, name: str):
+        if isinstance(row, dict):
+            return row[name]
+        if isinstance(row, tuple) or isinstance(row, list):
+            return row[self._field_names.index(name)]
+        return row[name]
+
+    def blob_ref(self, row, *, sidecar: str) -> BlobRef:
+        """Decode a blob sidecar reference from a formatted index row."""
+        readers = self._ensure_blob_readers()
+        meta = readers.sidecars[sidecar]
+        fields = meta.ref_fields
+        codec_id = int(self._row_value(row, fields.codec))
+        return BlobRef(
+            sidecar=sidecar,
+            chunk_id=int(self._row_value(row, fields.chunk_id)),
+            offset=int(self._row_value(row, fields.offset)),
+            size=int(self._row_value(row, fields.size)),
+            codec=codec_name(codec_id),
+            codec_id=codec_id,
+            schema_id=int(self._row_value(row, fields.schema_id)),
+            flags=int(self._row_value(row, fields.flags)),
+            crc=int(self._row_value(row, fields.crc)),
+        )
+
+    def blob(self, row, *, sidecar: str) -> bytes:
+        """Read one blob sidecar payload referenced by a formatted index row."""
+        readers = self._ensure_blob_readers()
+        return readers[sidecar].read(self.blob_ref(row, sidecar=sidecar))
+
+    def blobs(self, rows, *, sidecar: str) -> list[bytes]:
+        """Read blob sidecar payloads for formatted index rows."""
+        return [self.blob(row, sidecar=sidecar) for row in rows]
+
+    def range_with_blobs(
+        self,
+        start: int,
+        end: int,
+        *,
+        sidecar: str,
+        format: str = "tuple",
+        ts_key: Optional[str] = None,
+    ):
+        """Yield ``(row, payload)`` pairs for a time range and one sidecar."""
+        rows = self.range(start, end, format=format, ts_key=ts_key)
+        for row in rows:
+            yield row, self.blob(row, sidecar=sidecar)
 
     def _iter_raw_range(
         self,

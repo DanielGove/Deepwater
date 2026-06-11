@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deepwater health check - validates platform state for monitoring.
+Deepwater health check - validates base/feed state for monitoring.
 
 Exit codes:
     0 = healthy

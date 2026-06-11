@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Reader should skip expired/missing chunks after cleanup."""
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
 
@@ -66,30 +64,3 @@ def test_reader_constructs_directly_from_base_path_and_closes_idempotently():
             assert out == [(2_000_000, 0), (2_000_001, 1), (2_000_002, 2)]
 
         r.close()
-
-
-def run_tests():
-    tests = [
-        ("reader_skips_deleted_chunk_files", test_reader_skips_deleted_chunk_files),
-        (
-            "reader_constructs_directly_from_base_path_and_closes_idempotently",
-            test_reader_constructs_directly_from_base_path_and_closes_idempotently,
-        ),
-    ]
-    print("Reader Cleanup Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()

@@ -4,12 +4,10 @@ Test: Multi-Key Clock Functionality
 ----------------------------------
 Comprehensive test demonstrating querying on different timestamp columns.
 """
-import sys
 import time
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import Reader, Writer, create_feed
 
@@ -106,7 +104,3 @@ def test_multi_key_feature():
     print("  create_feed(base_path, {..., 'clock_level': 3})")
     print("  reader = Reader(base_path, feed_name)")
     print("  data = reader.range(start, end, ts_key='ev_us')")
-
-
-if __name__ == '__main__':
-    test_multi_key_feature()

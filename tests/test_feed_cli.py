@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Tests for deepwater-create-feed and deepwater-delete-feed CLIs."""
-import sys
 import tempfile
 from pathlib import Path
 
 import orjson
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepwater import create_feed
 from deepwater.cli.feed_cli import create_main, delete_main
@@ -92,29 +90,3 @@ def test_delete_cli_strict_missing_fails():
             "--strict-missing",
         ])
         assert rc == 1
-
-
-def run_tests():
-    tests = [
-        ("create_cli_idempotent_from_single_config", test_create_cli_idempotent_from_single_config),
-        ("create_cli_supports_bundle_and_config_dir", test_create_cli_supports_bundle_and_config_dir),
-        ("delete_cli_from_feed_names_and_config", test_delete_cli_from_feed_names_and_config),
-        ("delete_cli_strict_missing_fails", test_delete_cli_strict_missing_fails),
-    ]
-    print("Feed CLI Tests")
-    print("=" * 60)
-    passed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"✅ {name}")
-            passed += 1
-        except Exception as e:
-            print(f"❌ {name} - {e}")
-    print(f"\nPassed: {passed}/{len(tests)}")
-    if passed != len(tests):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    run_tests()
