@@ -18,18 +18,9 @@ Usage:
 import argparse
 import logging
 import os
-import sys
 import time
 from pathlib import Path
 from typing import List, Tuple
-
-# Allow running as standalone script
-if __name__ == "__main__":
-    # Add src/ to path if running directly
-    script_dir = Path(__file__).resolve().parent
-    src_dir = script_dir.parent
-    if src_dir.name == "src":
-        sys.path.insert(0, str(src_dir))
 
 from deepwater.metadata.feed_registry import FeedRegistry, EXPIRED, ON_DISK
 from deepwater.metadata.feed_metadata import list_feeds, load_feed_metadata

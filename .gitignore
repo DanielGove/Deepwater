@@ -26,11 +26,9 @@ Thumbs.db
 *.log
 deepwater.log*
 
-# Test data directories
+# Local generated data
 platform_data/
-data/test-*/
-data/coinbase-test/
-data/test-ring/
+data/
 tests/data/
 
 # Build artifacts (Cython)
@@ -39,8 +37,3 @@ tests/data/
 *.html
 build/
 dist/
-target/
-
-# Keep data structure examples
-!data/test-ring/manifest.json
-!data/coinbase-test/manifest.json

@@ -21,17 +21,9 @@ import argparse
 import fcntl
 import logging
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple
-
-# Allow running as standalone script
-if __name__ == "__main__":
-    script_dir = Path(__file__).resolve().parent
-    src_dir = script_dir.parent
-    if src_dir.name == "src":
-        sys.path.insert(0, str(src_dir))
 
 from deepwater.metadata.feed_registry import FeedRegistry, ON_DISK, IN_MEMORY, EXPIRED, UINT64_MAX
 from deepwater.metadata.feed_metadata import list_feeds, load_record_format_dict

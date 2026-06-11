@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-__version__ = "0.0.1"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("deepwater")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
 
 from .io import Reader, Writer
 from .metadata.catalog import catalog, feed_coverage
