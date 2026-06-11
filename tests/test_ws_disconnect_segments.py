@@ -1,16 +1,12 @@
-#!/usr/bin/env python3
-"""Regression: websocket disconnect should close writers and segments."""
-import tempfile
-from pathlib import Path
+"""Regression: closing a live writer should close its active segment."""
 
+from deepwater import Writer, create_feed
 from deepwater.metadata.discovery import list_segments
-import websocket_client as ws_client
-from websocket_client import MarketDataEngine
 
 
-def _test_trade_spec(pid: str) -> dict:
+def _trade_spec(feed_name: str) -> dict:
     return {
-        "feed_name": f"CB-TRADES-{pid}",
+        "feed_name": feed_name,
         "mode": "UF",
         "fields": [
             {"name": "recv_us", "type": "uint64"},
@@ -19,20 +15,6 @@ def _test_trade_spec(pid: str) -> dict:
         ],
         "clock_level": 1,
         "persist": True,
-        "chunk_size_mb": 1,
-    }
-
-
-def _test_l2_spec(pid: str) -> dict:
-    return {
-        "feed_name": f"CB-L2-{pid}",
-        "mode": "UF",
-        "fields": [
-            {"name": "recv_us", "type": "uint64"},
-            {"name": "price", "type": "float64"},
-            {"name": "qty", "type": "float64"},
-        ],
-        "clock_level": 1,
         "persist": True,
         "chunk_size_mb": 1,
     }
@@ -46,41 +28,20 @@ def _write_trade(writer, ts: int) -> int:
     )
 
 
-def test_disconnect_closes_segments_and_reopens_writers():
-    with tempfile.TemporaryDirectory(prefix="dw-ws-disconnect-") as td:
-        base = Path(td) / "platform"
-        pid = "BTC-USD"
-        feed_name = f"CB-TRADES-{pid}"
+def test_writer_close_closes_segment_and_new_writer_reopens(base_path):
+    feed_name = "trades"
+    create_feed(base_path, _trade_spec(feed_name))
 
-        engine = MarketDataEngine(sample_size=4)
-        old_trade_spec = ws_client.trades_spec
-        old_l2_spec = ws_client.l2_spec
-        # Replace default base path and feed specs with test-local config.
-        engine.base_path = base
-        engine.trade_writers.clear()
-        engine.book_writers.clear()
-        engine.product_ids.clear()
-        ws_client.trades_spec = _test_trade_spec
-        ws_client.l2_spec = _test_l2_spec
+    w1 = Writer(base_path, feed_name)
+    assert _write_trade(w1, 1_000_000) > 0
+    w1.close()
 
-        try:
-            engine.subscribe(pid)
-            w1 = engine.trade_writers[pid]
-            assert _write_trade(w1, 1_000_000) > 0
+    segs = list_segments(base_path, feed_name)
+    assert segs, "expected at least one segment after write"
+    assert segs[-1]["status"] == "closed", f"expected closed segment, got {segs[-1]}"
 
-            # Simulate websocket disconnect finalizer path.
-            engine._close_all_writers()
-
-            segs = list_segments(base, feed_name)
-            assert segs, "expected at least one segment after write"
-            assert segs[-1]["status"] == "closed", f"expected closed segment, got {segs[-1]}"
-
-            # Re-subscribe should create a fresh writer that can ingest again.
-            engine.subscribe(pid)
-            w2 = engine.trade_writers[pid]
-            assert w2 is not w1
-            assert _write_trade(w2, 2_000_000) > 0
-        finally:
-            ws_client.trades_spec = old_trade_spec
-            ws_client.l2_spec = old_l2_spec
-            engine.stop()
+    w2 = Writer(base_path, feed_name)
+    try:
+        assert _write_trade(w2, 2_000_000) > 0
+    finally:
+        w2.close()

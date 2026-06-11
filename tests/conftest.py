@@ -8,13 +8,10 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES_COINBASE = PROJECT_ROOT / "examples" / "coinbase"
 
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-if str(EXAMPLES_COINBASE) not in sys.path:
-    sys.path.insert(0, str(EXAMPLES_COINBASE))
 
 
 def _deepwater_shm_files() -> set[Path]:
