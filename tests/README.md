@@ -2,12 +2,20 @@
 
 Deepwater uses `pytest` as the test runner.
 
+Install the dev extra before running the suite:
+
+```bash
+pip install -e ".[dev]"
+```
+
 ```bash
 ./test.sh
-.venv/bin/python -m pytest
-.venv/bin/python -m pytest tests/test_ring_buffer.py
-.venv/bin/python -m pytest --cov=deepwater
+python -m pytest
+python -m pytest tests/test_ring_buffer.py
+python -m pytest --cov=deepwater
 ```
+
+`test.sh` activates `.venv` if present; without one, it runs the active `python`.
 
 ## Layout
 

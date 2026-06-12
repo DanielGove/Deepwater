@@ -14,6 +14,12 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
+For development and tests, install the dev extra:
+
+```bash
+pip install -e ".[dev]"
+```
+
 ---
 
 ## Quick Start Folder
@@ -186,11 +192,11 @@ For remote metadata, use the explicit helpers in `deepwater.network.client` or t
 
 ```bash
 ./test.sh
-.venv/bin/python -m pytest tests/test_ring_buffer.py
-.venv/bin/python -m pytest --cov=deepwater
+python -m pytest tests/test_ring_buffer.py
+python -m pytest --cov=deepwater
 ```
 
-Tests are pytest-native. Use fixtures from `tests/conftest.py` and keep data under temporary directories.
+`test.sh` activates `.venv` if it exists, otherwise it uses the active `python`. Tests are pytest-native. Use fixtures from `tests/conftest.py` and keep data under temporary directories.
 
 ```python
 from deepwater import Reader, Writer, create_feed
