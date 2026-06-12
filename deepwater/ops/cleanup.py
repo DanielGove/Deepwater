@@ -18,6 +18,7 @@ Usage:
 import argparse
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import List, Tuple
@@ -137,7 +138,6 @@ def install_cron(base_path: str, interval: int = 15) -> None:
     """Install cron job to run cleanup periodically."""
     from crontab import CronTab
     
-    script_path = Path(__file__).resolve()
     python_path = sys.executable
     command = f"{python_path} -m deepwater.ops.cleanup --base-path {base_path}"
     

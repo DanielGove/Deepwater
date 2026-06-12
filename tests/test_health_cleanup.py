@@ -2,6 +2,8 @@
 """Tests for health_check and cleanup utilities."""
 import tempfile
 from pathlib import Path
+import subprocess
+import sys
 import time
 
 
@@ -67,3 +69,17 @@ def test_cleanup_deletes_expired_chunks():
         cleanup_all_feeds(base, dry_run=False)
 
         assert not chunk_file.exists(), "cleanup did not delete expired chunk"
+
+
+def test_ops_cli_error_paths_exit_cleanly():
+    missing = "/tmp/deepwater-missing-cli-smoke"
+    commands = [
+        [sys.executable, "-m", "deepwater.ops.cleanup", "--base-path", missing],
+        [sys.executable, "-m", "deepwater.ops.repair", "--base-path", missing, "--all"],
+    ]
+    for cmd in commands:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        assert proc.returncode == 1
+        combined = proc.stdout + proc.stderr
+        assert "NameError" not in combined
+        assert "base path does not exist" in combined.lower()
