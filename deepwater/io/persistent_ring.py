@@ -34,7 +34,6 @@ class _FeedState:
         "writer",
         "record_size",
         "capacity_records",
-        "usable_bytes",
         "target_records",
         "max_records",
     )
@@ -64,7 +63,6 @@ class _FeedState:
         self.writer = writer
         self.record_size = record_size
         self.capacity_records = capacity_records
-        self.usable_bytes = capacity_records * record_size
         self.max_records = max_records
         self.target_records = min(max_records, max(1, capacity_records // 2))
 
@@ -120,27 +118,18 @@ def _copy_ring_window(state: _FeedState, start_seq: int, end_seq: int, earliest_
     ring = state.ring
     writer = state.writer
     record_size = state.record_size
-    usable_bytes = state.usable_bytes
     data = ring.data
-    seq = start_seq
-    pos = (start_pos + ((seq - earliest_live) * record_size)) % usable_bytes
-    last_ts = int(ring.durable_last_ts[0])
+    n_records = end_seq - start_seq
+    if n_records <= 0:
+        return _IDLE
+    pos = (start_pos + ((start_seq - earliest_live) * record_size)) % ring.data_size
+    byte_len = n_records * record_size
+    blob = data[pos:pos + byte_len]
+    last_ts = _U64.unpack_from(blob, byte_len - record_size)[0]
 
     writer.begin_chunk_commit()
     try:
-        while seq < end_seq:
-            if pos + record_size > usable_bytes:
-                pos = 0
-            run_records = min(end_seq - seq, (usable_bytes - pos) // record_size)
-            if run_records <= 0:
-                pos = 0
-                continue
-            end = pos + (run_records * record_size)
-            blob = data[pos:end]
-            writer.write_batch_bytes(blob)
-            last_ts = _U64.unpack_from(blob, len(blob) - record_size)[0]
-            seq += run_records
-            pos = 0 if end >= usable_bytes else end
+        writer.write_batch_bytes(blob)
         writer.finish_chunk_commit()
     except Exception:
         writer.finish_chunk_commit()

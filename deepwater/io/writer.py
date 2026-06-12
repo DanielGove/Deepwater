@@ -122,9 +122,9 @@ class RingWriter:
         self._value_fields = tuple(value_fields)
         self._ts_idx = 0 if value_fields else None
 
-        self.ring_bytes = int(self.feed_metadata.ring_size_bytes or self.feed_metadata.chunk_size_bytes)
-        if self.ring_bytes < self._rec_size:
-            raise ValueError(f"ring size {self.ring_bytes} too small for record size {self._rec_size}")
+        ring_bytes = int(self.feed_metadata.ring_size_bytes or self.feed_metadata.chunk_size_bytes)
+        if ring_bytes < self._rec_size:
+            raise ValueError(f"ring size {ring_bytes} too small for record size {self._rec_size}")
 
         lock_path = self.base_path / "data" / feed_name / f"{feed_name}.writer.lock"
         self._writer_lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
@@ -138,7 +138,7 @@ class RingWriter:
         shm_names = ring_buffer_shm_names(self.base_path, self.feed_name)
         self.ring = RingBuffer(
             self.feed_name,
-            data_size=self.ring_bytes,
+            data_size=ring_bytes,
             create=True,
             shm_name=shm_names[0],
         )
@@ -151,8 +151,7 @@ class RingWriter:
         self._ring_data = self.ring.data
         if self._prefault_ring:
             self._prefault_ring_pages()
-        self._usable_bytes = int(self.ring.data_size)
-        self._ring_capacity = self._usable_bytes // self._rec_size
+        self._ring_capacity = self.ring.data_size // self._rec_size
         self.segment_store = SegmentStore(self.base_path / "data" / feed_name, feed_name) if self._segment_tracking else None
         self._bootstrap_persisted_ring()
         if self._persist:
@@ -187,10 +186,11 @@ class RingWriter:
             mv = self._ring_data
             step = max(4096, os.sysconf("SC_PAGE_SIZE"))
             acc = 0
-            for i in range(0, self.ring_bytes, step):
+            ring_size = self.ring.data_size
+            for i in range(0, ring_size, step):
                 acc ^= mv[i]
-            if self.ring_bytes > 0:
-                acc ^= mv[self.ring_bytes - 1]
+            if ring_size > 0:
+                acc ^= mv[ring_size - 1]
             self._prefault_checksum = acc
         except Exception:
             pass
@@ -259,38 +259,19 @@ class RingWriter:
         ):
             _yield_cpu()
 
-    def _prepare_single_write(self):
-        while self._persist and int(self._ring_record_count[0]) - int(self._ring_durable_record_count[0]) >= self._ring_capacity:
-            _yield_cpu()
-        write_pos = int(self._ring_write_pos[0])
-        start_pos = int(self._ring_start_pos[0])
-        generation = int(self._ring_generation[0])
-        record_count = int(self._ring_record_count[0])
-        if write_pos + self._rec_size > self._usable_bytes:
-            write_pos = 0
-            generation += 1
-        slice_end = write_pos + self._rec_size
-        next_write_pos = 0 if slice_end >= self._usable_bytes else slice_end
-        if record_count >= self._ring_capacity:
-            start_pos = next_write_pos
-        new_record_count = record_count + 1
-        return write_pos, next_write_pos, start_pos, generation, new_record_count
-
     def _write_bytes(self, payload: bytes, last_ts: int) -> int:
         self._ensure_open()
         if len(payload) != self._rec_size:
             raise ValueError(f"record length {len(payload)} != expected {self._rec_size}")
         while self._persist and int(self._ring_record_count[0]) - int(self._ring_durable_record_count[0]) >= self._ring_capacity:
             _yield_cpu()
+        ring_size = self.ring.data_size
         write_pos = int(self._ring_write_pos[0])
         generation = int(self._ring_generation[0])
         start_pos = int(self._ring_start_pos[0])
         record_count = int(self._ring_record_count[0])
-        if write_pos + self._rec_size > self._usable_bytes:
-            write_pos = 0
-            generation += 1
         slice_end = write_pos + self._rec_size
-        next_write_pos = 0 if slice_end >= self._usable_bytes else slice_end
+        next_write_pos = 0 if slice_end == ring_size else slice_end
         if record_count >= self._ring_capacity:
             start_pos = next_write_pos
         self._ring_data[write_pos:slice_end] = payload
@@ -302,15 +283,13 @@ class RingWriter:
         self._ensure_open()
         while self._persist and int(self._ring_record_count[0]) - int(self._ring_durable_record_count[0]) >= self._ring_capacity:
             _yield_cpu()
+        ring_size = self.ring.data_size
         write_pos = int(self._ring_write_pos[0])
         generation = int(self._ring_generation[0])
         start_pos = int(self._ring_start_pos[0])
         record_count = int(self._ring_record_count[0])
-        if write_pos + self._rec_size > self._usable_bytes:
-            write_pos = 0
-            generation += 1
         slice_end = write_pos + self._rec_size
-        next_write_pos = 0 if slice_end >= self._usable_bytes else slice_end
+        next_write_pos = 0 if slice_end == ring_size else slice_end
         if record_count >= self._ring_capacity:
             start_pos = next_write_pos
         self._ring_data[write_pos:slice_end] = record_data
@@ -325,15 +304,13 @@ class RingWriter:
         last_ts = vals[self._ts_idx] if self._ts_idx is not None else 0
         while self._persist and int(self._ring_record_count[0]) - int(self._ring_durable_record_count[0]) >= self._ring_capacity:
             _yield_cpu()
+        ring_size = self.ring.data_size
         write_pos = int(self._ring_write_pos[0])
         generation = int(self._ring_generation[0])
         start_pos = int(self._ring_start_pos[0])
         record_count = int(self._ring_record_count[0])
-        if write_pos + self._rec_size > self._usable_bytes:
-            write_pos = 0
-            generation += 1
         next_write_pos = write_pos + self._rec_size
-        if next_write_pos >= self._usable_bytes:
+        if next_write_pos == ring_size:
             next_write_pos = 0
         if record_count >= self._ring_capacity:
             start_pos = next_write_pos
@@ -377,7 +354,8 @@ class RingWriter:
         n = len(data)
         if n == 0 or n % rec_sz != 0:
             raise ValueError("batch length must be a positive multiple of record_size")
-        if n > self._usable_bytes:
+        ring_size = self.ring.data_size
+        if n > ring_size:
             raise ValueError("batch larger than ring capacity")
 
         batch_records = n // rec_sz
@@ -398,17 +376,17 @@ class RingWriter:
         new_earliest = max(0, new_record_count - self._ring_capacity)
         advanced = new_earliest - old_earliest
         if advanced > 0:
-            start_pos = (start_pos + (advanced * rec_sz)) % self._usable_bytes
+            start_pos = (start_pos + (advanced * rec_sz)) % ring_size
 
         end = write_pos + n
         self._ring_data[write_pos:end] = data
-        if end > self._usable_bytes:
+        if end > ring_size:
             generation += 1
 
         unpack_from = self._u64.unpack_from
         first_ts = unpack_from(data, 0)[0]
         last_ts = unpack_from(data, n - rec_sz)[0]
-        end_pos = end % self._usable_bytes
+        end_pos = end % ring_size
         self.ring.update_live_header(end_pos, start_pos, generation, last_ts if last_ts else last_ts_prev, new_record_count)
         self._segment_note_batch(first_ts, last_ts, batch_records)
         return end_pos

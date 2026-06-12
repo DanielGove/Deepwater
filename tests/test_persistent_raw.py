@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 from deepwater import Reader, Writer, create_feed
+from deepwater.io.persistent_ring import _copy_ring_window, _FeedState, _FLUSHED
 
 
 def _make_feed(base: Path):
@@ -92,3 +93,55 @@ def test_persistent_read_available_raw_matches_new_records():
         finally:
             r.close()
             w.close()
+
+
+def test_persister_copies_shadow_ring_across_wrap_boundary():
+    with tempfile.TemporaryDirectory(prefix="dw-persist-wrap-") as td:
+        base = Path(td)
+        create_feed(base, {
+            "feed_name": "events",
+            "mode": "UF",
+            "fields": [
+                {"name": "ts", "type": "uint64"},
+                {"name": "value", "type": "uint64"},
+            ],
+            "clock_level": 1,
+            "persist": True,
+            "uses_ring": True,
+            "ring_size_mb": 0.001,
+            "chunk_size_mb": 1,
+            "segment_tracking": False,
+        })
+        w = Writer(base, "events")
+        start = 1_900_000_000_000_000
+        cap = w._ring_capacity
+        for i in range(cap):
+            w.write_values(start + i, i)
+        w.ring.update_durable_header(
+            durable_record_count=cap - 2,
+            durable_last_ts=start + cap - 3,
+        )
+        w.write_values(start + cap, cap)
+        w.write_values(start + cap + 1, cap + 1)
+
+        state = _FeedState(base, "events")
+        try:
+            _, start_pos, _, _, record_count, *_ = w.ring.header()
+            earliest_live = record_count - cap
+            assert _copy_ring_window(
+                state,
+                cap - 2,
+                cap + 2,
+                earliest_live,
+                int(start_pos),
+            ) == _FLUSHED
+        finally:
+            state.close()
+            w.close()
+
+        r = Reader(base, "events")
+        try:
+            rows = r.range(start, start + cap + 2)
+            assert rows == [(start + i, i) for i in range(cap - 2, cap + 2)]
+        finally:
+            r.close()

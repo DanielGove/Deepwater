@@ -53,7 +53,7 @@ class Reader:
         "_chunk", "_chunk_meta", "_chunk_id",
         "_S", "_u64", "_unpack", "_rec_size", "_ts_offset_by_name",
         "_field_names", "_dtype", "_read_head",
-        "_ring", "_ring_record_capacity", "_ring_usable_bytes",
+        "_ring", "_ring_record_capacity",
         "_primary_ts_off", "_tail_read_seq",
         "_chunk_lower_bound", "_chunk_raw_batches",
         "_ring_lower_bound", "_ring_raw_batches", "_ring_copy_records",
@@ -87,14 +87,10 @@ class Reader:
 
     def __init__(
         self,
-        base_path: str | os.PathLike[str] | NetworkTarget,
-        feed_name: str,
-        port: int = DEFAULT_PORT,
-        timeout: float = 10.0,
-        status_callback=None,
+        base_path: str | os.PathLike[str],
+        feed_name: str
     ):
-        target = base_path if isinstance(base_path, NetworkTarget) else parse_target(base_path, default_port=port)
-        self.base_path = Path(target.path)
+        self.base_path = Path(base_path)
         self.data_dir = self.base_path / "data" / feed_name
         self.feed_name = feed_name
 
@@ -105,7 +101,6 @@ class Reader:
         self._read_head: Optional[int] = None
         self._ring: RingBuffer | None = None
         self._ring_record_capacity = 0
-        self._ring_usable_bytes = 0
         self._tail_read_seq: Optional[int] = None
         self._sidecars = None
         self._blob_readers = None
@@ -155,14 +150,6 @@ class Reader:
                 pass
             else:
                 self._ring_record_capacity = self._ring.data_size // self._rec_size
-                self._ring_usable_bytes = self._ring_record_capacity * self._rec_size
-                if self._ring_record_capacity <= 0:
-                    self._ring.close()
-                    self._ring = None
-                    self.close()
-                    raise RuntimeError(
-                        f"ring for feed '{feed_name}' is too small for record size {self._rec_size}"
-                    )
 
     @property
     def format(self) -> str:
@@ -401,7 +388,6 @@ class Reader:
             "earliest_live_seq": max(0, record_count - self._ring_record_capacity),
             "ring_record_capacity": self._ring_record_capacity,
             "ring_data_size": ring.data_size,
-            "ring_usable_bytes": self._ring_usable_bytes,
             "ring_total_size": ring.total_size,
         }
 
@@ -424,12 +410,12 @@ class Reader:
         if start_time is not None:
             start_seq = self._ring_lower_bound(
                 self._ring.data, start_pos, earliest_seq, start_seq, end_seq,
-                int(start_time), ts_off, self._rec_size, self._ring_usable_bytes,
+                int(start_time), ts_off, self._rec_size, self._ring.data_size,
             )
         if end_time is not None:
             end_seq = self._ring_lower_bound(
                 self._ring.data, start_pos, earliest_seq, start_seq, end_seq,
-                int(end_time), ts_off, self._rec_size, self._ring_usable_bytes,
+                int(end_time), ts_off, self._rec_size, self._ring.data_size,
             )
         if end_seq <= start_seq:
             return
@@ -441,7 +427,7 @@ class Reader:
             start_seq,
             end_seq,
             self._rec_size,
-            self._ring_usable_bytes,
+            self._ring.data_size,
             int(batch_records),
         )
 
@@ -456,14 +442,14 @@ class Reader:
         earliest_seq = max(0, record_count - self._ring_record_capacity)
         records_read = max(start_seq, earliest_seq)
         records_read = min(records_read, record_count)
+        ring_size = ring.data_size
         read_pos = (
-            (ring.start_pos[0] + ((records_read - earliest_seq) * self._rec_size)) % self._ring_usable_bytes
+            (ring.start_pos[0] + ((records_read - earliest_seq) * self._rec_size)) % ring_size
             if records_read < record_count
             else ring.write_pos[0]
         )
         data = ring.data
         rec_sz = self._rec_size
-        ring_usable_bytes = self._ring_usable_bytes
         ring_record_capacity = self._ring_record_capacity
         unpack_u64 = self._u64.unpack_from
 
@@ -476,7 +462,7 @@ class Reader:
             if records_read >= record_count:
                 os.sched_yield()
                 continue
-            if read_pos >= ring_usable_bytes:
+            if read_pos == ring_size:
                 read_pos = 0
             pos = read_pos
             if start_time is not None and unpack_u64(data, pos + ts_off)[0] < start_time:
@@ -745,10 +731,10 @@ class Reader:
                 start_pos = self._ring.start_pos[0]
                 seq = self._ring_lower_bound(
                     self._ring.data, start_pos, earliest_seq, start_seq, record_count,
-                    start, ts_off, self._rec_size, self._ring_usable_bytes,
+                    start, ts_off, self._rec_size, self._ring.data_size,
                 )
                 if seq < record_count:
-                    pos = (start_pos + ((seq - earliest_seq) * self._rec_size)) % self._ring_usable_bytes
+                    pos = (start_pos + ((seq - earliest_seq) * self._rec_size)) % self._ring.data_size
                     return format_record_at(
                         self._ring.data, pos, format, self._unpack,
                         self._rec_size, self._field_names, dtype,
@@ -776,10 +762,10 @@ class Reader:
                 start_pos = self._ring.start_pos[0]
                 seq = self._ring_lower_bound(
                     self._ring.data, start_pos, earliest_seq, start_seq, record_count,
-                    ts + 1, ts_off, self._rec_size, self._ring_usable_bytes,
+                    ts + 1, ts_off, self._rec_size, self._ring.data_size,
                 ) - 1
                 if seq >= start_seq:
-                    pos = (start_pos + ((seq - earliest_seq) * self._rec_size)) % self._ring_usable_bytes
+                    pos = (start_pos + ((seq - earliest_seq) * self._rec_size)) % self._ring.data_size
                     return format_record_at(
                         self._ring.data, pos, format, self._unpack,
                         self._rec_size, self._field_names, dtype,
@@ -821,9 +807,9 @@ class Reader:
         self._tail_read_seq = end_seq
         n_records = end_seq - tail_seq
         start_pos = ring.start_pos[0]
-        pos = (start_pos + ((tail_seq - earliest_seq) * self._rec_size)) % self._ring_usable_bytes
+        pos = (start_pos + ((tail_seq - earliest_seq) * self._rec_size)) % ring.data_size
         raw = self._ring_copy_records(
-            ring.data, pos, n_records, self._rec_size, self._ring_usable_bytes
+            ring.data, pos, n_records, self._rec_size, ring.data_size
         )
         return format_raw_batch(raw, format, self._unpack, self._rec_size, self._field_names, dtype)
 
