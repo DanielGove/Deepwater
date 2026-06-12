@@ -68,6 +68,16 @@ def _close_all(*objects) -> None:
             pass
 
 
+def _serve(server):
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.001},
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def test_path_parser():
     local = parse_target("/deepwater/data/local")
     assert not local.is_remote
@@ -178,8 +188,7 @@ def test_remote_reader_range_loopback():
             writer.write_values(start + i * 10, i)
 
         server = make_server(Path(td), ("127.0.0.1", 0))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        thread = _serve(server)
         try:
             port = int(server.server_address[1])
             rr = RemoteReader("127.0.0.1", str(base), "events", port=port, timeout=2.0)
@@ -255,8 +264,7 @@ def test_remote_reader_ts_key_loopback():
         writer.close()
 
         server = make_server(Path(td), ("127.0.0.1", 0))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        thread = _serve(server)
         try:
             port = int(server.server_address[1])
             rr = RemoteReader("127.0.0.1", str(base), "events", port=port, timeout=2.0)
@@ -310,8 +318,7 @@ def test_remote_reader_range_batches_loopback():
             assert local.first_before(start + 25) == (start + 20, 2)
 
         server = make_server(Path(td), ("127.0.0.1", 0))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        thread = _serve(server)
         try:
             port = int(server.server_address[1])
             rr = RemoteReader("127.0.0.1", str(base), "events", port=port, timeout=2.0)
@@ -345,8 +352,7 @@ def test_remote_reader_read_available_loopback():
         writer.write_values(start, 0)
 
         server = make_server(Path(td), ("127.0.0.1", 0))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        thread = _serve(server)
         try:
             port = int(server.server_address[1])
             rr = RemoteReader("127.0.0.1", str(base), "events", port=port, timeout=2.0)
@@ -376,8 +382,7 @@ def test_remote_stream_with_start_loopback():
         writer.close()
 
         server = make_server(Path(td), ("127.0.0.1", 0), heartbeat_interval=0.1)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        thread = _serve(server)
         try:
             port = int(server.server_address[1])
             rr = RemoteReader("127.0.0.1", str(base), "events", port=port, timeout=2.0)
@@ -408,8 +413,7 @@ def test_remote_stream_heartbeat_loopback():
             stream_poll_interval=0.005,
             idle_timeout=2.0,
         )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        thread = _serve(server)
         try:
             port = int(server.server_address[1])
             sock = socket.create_connection(("127.0.0.1", port), timeout=1.0)
@@ -485,8 +489,7 @@ def test_remote_metadata_and_reader_loopback():
         writer.close()
 
         server = make_server(Path(td), ("127.0.0.1", 0))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        thread = _serve(server)
         try:
             port = int(server.server_address[1])
             remote_base = f"dw://127.0.0.1:{port}{base}"
@@ -520,8 +523,7 @@ def test_remote_metadata_clis_loopback():
         writer.close()
 
         server = make_server(Path(td), ("127.0.0.1", 0))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        thread = _serve(server)
         try:
             port = int(server.server_address[1])
             remote_base = f"dw://127.0.0.1:{port}{base}"
