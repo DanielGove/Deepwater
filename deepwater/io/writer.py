@@ -15,7 +15,6 @@ from ..metadata.feed_registry import FeedRegistry, ON_DISK, UINT64_MAX
 from ..metadata.feed_metadata import load_feed_metadata
 from ..metadata.feed_schema import load_record_schema_for_feed
 from ..metadata.segments import SegmentStore
-from ..utils.process import ProcessUtils
 
 log = logging.getLogger("dw.writer")
 
@@ -470,7 +469,7 @@ class ChunkWriter:
         if self.feed_metadata is None:
             raise KeyError(feed_name)
         self.record_format = load_record_schema_for_feed(self.base_path, feed_name)
-        self.my_pid = ProcessUtils.get_current_pid()
+        self.my_pid = os.getpid()
 
         self.data_dir = self.base_path / "data" / feed_name
         self.registry = None

@@ -4,8 +4,6 @@ from pathlib import Path
 from typing import Optional
 import time
 
-from ..utils.process import ProcessUtils
-
 
 FEED_NAME_LEN = 32
 PERSISTER_STALE_US = 5_000_000
@@ -28,6 +26,16 @@ FEED_FLAG_PERSIST = 1 << 0
 FEED_FLAG_SEGMENT_TRACKING = 1 << 1
 FEED_FLAG_PREFAULT_RING = 1 << 2
 FEED_FLAG_USES_RING = 1 << 3
+
+
+def _is_process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
 
 
 class FeedMetadata:
@@ -278,7 +286,7 @@ class GlobalRegistry:
         started_us = self._read_qword(PERSISTER_STARTED_US_OFFSET)
         heartbeat_us = self._read_qword(PERSISTER_HEARTBEAT_US_OFFSET)
         now_us = time.time_ns() // 1_000
-        alive = ProcessUtils.is_process_alive(pid)
+        alive = _is_process_alive(pid)
         stale = bool(pid and heartbeat_us and (now_us - heartbeat_us) > PERSISTER_STALE_US)
         healthy = bool(pid and alive)
         return {
@@ -299,7 +307,7 @@ class GlobalRegistry:
             current_pid = self._read_qword(PERSISTER_PID_OFFSET)
             current_started_us = self._read_qword(PERSISTER_STARTED_US_OFFSET)
             current_heartbeat_us = self._read_qword(PERSISTER_HEARTBEAT_US_OFFSET)
-            current_alive = ProcessUtils.is_process_alive(current_pid)
+            current_alive = _is_process_alive(current_pid)
             current_stale = bool(
                 current_pid
                 and current_heartbeat_us

@@ -40,6 +40,12 @@ extensions = [
         extra_compile_args=extra_compile_args,
         extra_link_args=["-O3"],
     ),
+    Extension(
+        "deepwater.utils.timestamps",
+        ["deepwater/utils/timestamps.pyx"],
+        extra_compile_args=extra_compile_args,
+        extra_link_args=["-O3"],
+    ),
 ]
 
 
