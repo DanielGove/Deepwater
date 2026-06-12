@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -e
 
-if [ -d ".venv/bin" ]; then
-    source .venv/bin/activate
+if [ -x ".venv/bin/python" ]; then
+    PYTHON_BIN=".venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+else
+    echo "test.sh: python3 or python is required" >&2
+    exit 127
 fi
 
 if [ -z "${TMPDIR:-}" ] && [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
@@ -11,4 +18,4 @@ fi
 
 export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 
-python -m pytest -p no:cacheprovider "$@"
+"$PYTHON_BIN" -m pytest -p no:cacheprovider "$@"
