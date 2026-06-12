@@ -145,3 +145,55 @@ def test_persister_copies_shadow_ring_across_wrap_boundary():
             assert rows == [(start + i, i) for i in range(cap - 2, cap + 2)]
         finally:
             r.close()
+
+
+def test_reader_range_merges_durable_chunks_with_live_ring_tail():
+    with tempfile.TemporaryDirectory(prefix="dw-persist-mixed-") as td:
+        base = Path(td)
+        create_feed(base, {
+            "feed_name": "events",
+            "mode": "UF",
+            "fields": [
+                {"name": "ts", "type": "uint64"},
+                {"name": "value", "type": "uint64"},
+            ],
+            "clock_level": 1,
+            "persist": True,
+            "uses_ring": True,
+            "ring_size_mb": 0.001,
+            "chunk_size_mb": 1,
+            "segment_tracking": False,
+        })
+        w = Writer(base, "events")
+        start = 2_000_000_000_000_000
+        for i in range(6):
+            w.write_values(start + i * 10, i)
+
+        state = _FeedState(base, "events")
+        try:
+            _, start_pos, _, _, record_count, *_ = w.ring.header()
+            assert record_count == 6
+            assert _copy_ring_window(state, 0, 4, 0, int(start_pos)) == _FLUSHED
+        finally:
+            state.close()
+
+        for i in range(6, 10):
+            w.write_values(start + i * 10, i)
+
+        r = Reader(base, "events")
+        try:
+            rows = r.range(start + 20, start + 90)
+            expected_rows = [(start + i * 10, i) for i in range(2, 9)]
+            expected_raw = b"".join(struct.pack("<QQ", ts, value) for ts, value in expected_rows)
+
+            assert rows == expected_rows
+            assert bytes(r.range(start + 20, start + 90, format="raw")) == expected_raw
+            assert b"".join(
+                bytes(batch)
+                for batch in r.range_batches(start + 20, start + 90, format="raw", batch_records=2)
+            ) == expected_raw
+            numpy_rows = r.range(start + 20, start + 90, format="numpy")
+            assert list(numpy_rows["value"]) == list(range(2, 9))
+        finally:
+            r.close()
+            w.close()

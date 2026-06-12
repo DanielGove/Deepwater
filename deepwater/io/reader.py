@@ -442,16 +442,28 @@ class Reader:
         earliest_seq = max(0, record_count - self._ring_record_capacity)
         records_read = max(start_seq, earliest_seq)
         records_read = min(records_read, record_count)
+        start_pos = ring.start_pos[0]
+        if start_time is not None and records_read < record_count:
+            records_read = self._ring_lower_bound(
+                ring.data,
+                start_pos,
+                earliest_seq,
+                records_read,
+                record_count,
+                start_time,
+                ts_off,
+                self._rec_size,
+                ring.data_size,
+            )
         ring_size = ring.data_size
         read_pos = (
-            (ring.start_pos[0] + ((records_read - earliest_seq) * self._rec_size)) % ring_size
+            (start_pos + ((records_read - earliest_seq) * self._rec_size)) % ring_size
             if records_read < record_count
             else ring.write_pos[0]
         )
         data = ring.data
         rec_sz = self._rec_size
         ring_record_capacity = self._ring_record_capacity
-        unpack_u64 = self._u64.unpack_from
 
         while True:
             record_count = ring.record_count[0]
@@ -465,10 +477,6 @@ class Reader:
             if read_pos == ring_size:
                 read_pos = 0
             pos = read_pos
-            if start_time is not None and unpack_u64(data, pos + ts_off)[0] < start_time:
-                read_pos += rec_sz
-                records_read += 1
-                continue
             read_pos += rec_sz
             records_read += 1
             yield data[pos:pos + rec_sz]
@@ -517,11 +525,6 @@ class Reader:
         for raw in raw_records:
             yield format_raw_record(raw)
 
-    def latest(self, seconds: float = 60.0, format: str = "tuple", ts_key: Optional[str] = None):
-        end = time.time_ns() // 1_000
-        start = end - int(float(seconds) * 1_000_000)
-        return self.range(start, end + 1, format=format, ts_key=ts_key)
-
     def range(
         self,
         start: int,
@@ -538,23 +541,76 @@ class Reader:
             ts_off = self._primary_ts_off if ts_key is None else self._ts_offset_by_name[ts_key]
         except KeyError:
             raise ValueError(f"Timestamp key '{ts_key}' not found, options are: {tuple(self._ts_offset_by_name)}") from None
-        dtype = self._dtype
-        batches = self._iter_raw_range(start, end, ts_off=ts_off)
-        try:
-            raw = next(batches)
-        except StopIteration:
-            return format_empty_batch(format, dtype)
-        try:
-            second = next(batches)
-        except StopIteration:
-            return format_raw_batch(raw, format, self._unpack, self._rec_size, self._field_names, dtype)
-        merged = bytearray()
-        merged.extend(raw)
-        merged.extend(second)
-        for batch in batches:
-            merged.extend(batch)
-        raw = memoryview(merged)
-        return format_raw_batch(raw, format, self._unpack, self._rec_size, self._field_names, dtype)
+        if end <= start:
+            return format_empty_batch(format, self._dtype)
+        ring = self._ring
+        if (
+            ring is not None
+            and (
+                not self._persistent
+                or (ring.durable_record_count[0] > 0 and start > ring.durable_last_ts[0])
+            )
+        ):
+            record_count = ring.record_count[0]
+            durable_seq = ring.durable_record_count[0]
+            earliest_seq = max(0, record_count - self._ring_record_capacity)
+            start_seq = max(durable_seq, earliest_seq)
+            if record_count <= start_seq:
+                return format_empty_batch(format, self._dtype)
+            start_pos = ring.start_pos[0]
+            start_seq = self._ring_lower_bound(
+                ring.data, start_pos, earliest_seq, start_seq, record_count,
+                start, ts_off, self._rec_size, ring.data_size,
+            )
+            end_seq = self._ring_lower_bound(
+                ring.data, start_pos, earliest_seq, start_seq, record_count,
+                end, ts_off, self._rec_size, ring.data_size,
+            )
+            if end_seq <= start_seq:
+                return format_empty_batch(format, self._dtype)
+            pos = (start_pos + ((start_seq - earliest_seq) * self._rec_size)) % ring.data_size
+            byte_len = (end_seq - start_seq) * self._rec_size
+            raw = bytes(ring.data[pos:pos + byte_len])
+            return format_raw_batch(raw, format, self._unpack, self._rec_size, self._field_names, self._dtype)
+
+        data = bytearray()
+        if self.feed_registry is not None and self.feed_registry.get_latest_chunk_idx() is not None:
+            for chunk_id in self.feed_registry.get_chunks_in_range(start, end, qoff=ts_off):
+                try:
+                    self._open_chunk(chunk_id)
+                except FileNotFoundError:
+                    continue
+                buf = self._chunk.buffer
+                write_pos = self._chunk_meta.write_pos
+                pos = self._chunk_lower_bound(buf, start, write_pos, self._rec_size, ts_off)
+                end_pos = self._chunk_lower_bound(buf, end, write_pos, self._rec_size, ts_off)
+                if end_pos > pos:
+                    data.extend(buf[pos:end_pos])
+
+        if ring is not None:
+            record_count = ring.record_count[0]
+            durable_seq = ring.durable_record_count[0]
+            if record_count > durable_seq:
+                earliest_seq = max(0, record_count - self._ring_record_capacity)
+                start_seq = max(durable_seq, earliest_seq)
+                if record_count > start_seq:
+                    start_pos = ring.start_pos[0]
+                    start_seq = self._ring_lower_bound(
+                        ring.data, start_pos, earliest_seq, start_seq, record_count,
+                        start, ts_off, self._rec_size, ring.data_size,
+                    )
+                    end_seq = self._ring_lower_bound(
+                        ring.data, start_pos, earliest_seq, start_seq, record_count,
+                        end, ts_off, self._rec_size, ring.data_size,
+                    )
+                    if end_seq > start_seq:
+                        pos = (start_pos + ((start_seq - earliest_seq) * self._rec_size)) % ring.data_size
+                        byte_len = (end_seq - start_seq) * self._rec_size
+                        data.extend(ring.data[pos:pos + byte_len])
+
+        if not data:
+            return format_empty_batch(format, self._dtype)
+        return format_raw_batch(memoryview(data), format, self._unpack, self._rec_size, self._field_names, self._dtype)
 
     def range_columns(
         self,
@@ -648,7 +704,7 @@ class Reader:
 
         ring = self._ring
         durable_seq = ring.durable_record_count[0]
-        if durable_seq > 0:
+        if self.feed_registry is not None and self.feed_registry.get_latest_chunk_idx() is not None:
             yield from self._iter_durable_raw_range(
                 start,
                 end,
