@@ -9,10 +9,10 @@ import sys
 import time
 from pathlib import Path
 
-from .ring import RingBuffer, _yield_cpu, ring_buffer_shm_names
+from ..ring import RingBuffer, _yield_cpu, ring_buffer_shm_names
 from .writer import ChunkWriter
-from ..metadata.feed_metadata import load_feed_metadata
-from ..metadata.feed_schema import load_record_schema_for_feed
+from ...metadata.feed_metadata import load_feed_metadata
+from ...metadata.feed_schema import load_record_schema_for_feed
 
 
 log = logging.getLogger("dw.persistent_ring")
@@ -251,7 +251,7 @@ def run_persister(base_path: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) != 1:
-        print("usage: python -m deepwater.io.persistent_ring <base_path>", file=sys.stderr)
+        print("usage: python -m deepwater.io.writer.persistent_ring <base_path>", file=sys.stderr)
         return 2
     run_persister(argv[0])
     return 0

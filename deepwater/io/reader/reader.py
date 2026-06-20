@@ -8,10 +8,10 @@ from typing import Iterator, Optional
 
 import numpy as np
 
-from .blob_sidecar import BlobRef, BlobSidecarReaders, codec_name
-from .chunk import Chunk
-from .formatting import format_empty_batch, format_raw_batch, format_record_at, raw_record_formatter
-from .ring import RingBuffer, ring_buffer_shm_names
+from ..blob_sidecar import BlobRef, BlobSidecarReaders, codec_name
+from ..chunk import Chunk
+from ..formatting import format_empty_batch, format_raw_batch, format_record_at, raw_record_formatter
+from ..ring import RingBuffer, ring_buffer_shm_names
 from .traversal import (
     chunk_lower_bound,
     chunk_raw_batches,
@@ -19,10 +19,10 @@ from .traversal import (
     ring_lower_bound,
     ring_raw_batches,
 )
-from ..metadata.feed_registry import EXPIRED, ON_DISK, FeedRegistry
-from ..metadata.feed_metadata import load_feed_metadata
-from ..metadata.feed_schema import load_record_schema_for_feed
-from ..network.path import DEFAULT_PORT, NetworkTarget, parse_target
+from ...metadata.feed_registry import EXPIRED, ON_DISK, FeedRegistry
+from ...metadata.feed_metadata import load_feed_metadata
+from ...metadata.feed_schema import load_record_schema_for_feed
+from ...network.path import DEFAULT_PORT, NetworkTarget, parse_target
 
 
 class Reader:
@@ -73,7 +73,7 @@ class Reader:
             return super().__new__(cls)
         target = base_path if isinstance(base_path, NetworkTarget) else parse_target(base_path, default_port=port)
         if target.is_remote:
-            from ..network.client import RemoteReader
+            from ...network.client import RemoteReader
 
             assert target.host is not None
             return RemoteReader(

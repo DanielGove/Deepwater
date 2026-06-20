@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 from deepwater import Reader, Writer, create_feed
-from deepwater.io.persistent_ring import _copy_ring_window, _FeedState, _FLUSHED
+from deepwater.io.writer.persistent_ring import _copy_ring_window, _FeedState, _FLUSHED
 
 
 def _make_feed(base: Path):

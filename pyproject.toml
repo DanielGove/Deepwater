@@ -39,6 +39,7 @@ include = ["deepwater", "deepwater.*"]
 
 [tool.setuptools.package-data]
 "deepwater.io" = ["*.pyx"]
+"deepwater.io.reader" = ["*.pyx"]
 "deepwater.utils" = ["*.pyx"]
 
 [tool.pytest.ini_options]

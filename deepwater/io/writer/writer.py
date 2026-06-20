@@ -8,13 +8,13 @@ import numpy as np
 
 from typing import Union
 
-from .chunk import Chunk
-from .blob_sidecar import BlobRef, BlobSidecarWriters, ref_values
-from .ring import RingBuffer, _yield_cpu, ring_buffer_shm_names
-from ..metadata.feed_registry import FeedRegistry, ON_DISK, UINT64_MAX
-from ..metadata.feed_metadata import load_feed_metadata
-from ..metadata.feed_schema import load_record_schema_for_feed
-from ..metadata.segments import SegmentStore
+from ..chunk import Chunk
+from ..blob_sidecar import BlobRef, BlobSidecarWriters, ref_values
+from ..ring import RingBuffer, _yield_cpu, ring_buffer_shm_names
+from ...metadata.feed_registry import FeedRegistry, ON_DISK, UINT64_MAX
+from ...metadata.feed_metadata import load_feed_metadata
+from ...metadata.feed_schema import load_record_schema_for_feed
+from ...metadata.segments import SegmentStore
 
 log = logging.getLogger("dw.writer")
 
@@ -58,7 +58,7 @@ def _load_durable_frontier(feed_dir, feed_name: str) -> tuple[int, int]:
 
 def _persistent_ring_owner_healthy(base_path: Path) -> bool:
     try:
-        from ..metadata.global_registry import GlobalRegistry
+        from ...metadata.global_registry import GlobalRegistry
 
         registry = GlobalRegistry(base_path)
         try:
@@ -230,7 +230,7 @@ class RingWriter:
         if not reg_path.exists():
             return
         try:
-            from ..ops import repair
+            from ...ops import repair
 
             registry = FeedRegistry(reg_path, mode="w")
         except Exception:
@@ -615,7 +615,7 @@ class ChunkWriter:
         self.current_chunk_metadata = None
 
     def _validate_chunk(self):
-        from ..ops import repair
+        from ...ops import repair
 
         meta = self.registry.get_chunk_metadata(self.current_chunk_id)
         if meta is None:

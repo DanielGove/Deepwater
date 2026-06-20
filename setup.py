@@ -23,14 +23,14 @@ if sys.platform == "darwin":
 
 extensions = [
     Extension(
-        "deepwater.io.reader",
-        ["deepwater/io/reader.py"],
+        "deepwater.io.reader.reader",
+        ["deepwater/io/reader/reader.py"],
         extra_compile_args=extra_compile_args,
         extra_link_args=["-O3"],
     ),
     Extension(
-        "deepwater.io.traversal",
-        ["deepwater/io/traversal.pyx"],
+        "deepwater.io.reader.traversal",
+        ["deepwater/io/reader/traversal.pyx"],
         extra_compile_args=extra_compile_args,
         extra_link_args=["-O3"],
     ),
