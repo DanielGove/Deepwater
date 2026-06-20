@@ -10,7 +10,7 @@ import msgspec
 
 MAX_FRAME_BYTES = 512 * 1024 * 1024
 MAX_HEADER_BYTES = 1024 * 1024
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 DEFAULT_MAX_BATCH_RECORDS = 50_000
 DEFAULT_HEARTBEAT_INTERVAL_S = 5.0
 DEFAULT_STREAM_POLL_INTERVAL_S = 0.01
@@ -42,8 +42,8 @@ class Op(IntEnum):
     HELLO = 3
     OPEN_READER = 4
     READER_OPEN = 5
-    READER_DESCRIBE = 6
-    STATE = 7
+    READER_SCHEMA = 6
+    RING_STATE = 7
     LIST_FEEDS = 8
     FEED_EXISTS = 9
     DESCRIBE_FEED = 10
@@ -66,6 +66,7 @@ class Op(IntEnum):
     CLOSE = 27
     CLOSED = 28
     ERROR = 29
+    LAST_TIMESTAMP = 30
 
 
 class Frame(msgspec.Struct, array_like=True, frozen=True):

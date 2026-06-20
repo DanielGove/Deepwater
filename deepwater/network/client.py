@@ -389,11 +389,15 @@ class RemoteReader:
     def dtype(self):
         return self._dtype
 
-    def describe(self) -> dict[str, Any]:
-        return self._metadata(Op.READER_DESCRIBE)
+    def schema(self) -> dict[str, Any]:
+        return self._metadata(Op.READER_SCHEMA)
 
-    def state(self) -> dict[str, Any]:
-        return self._metadata(Op.STATE)
+    def ring_state(self) -> dict[str, Any]:
+        return self._metadata(Op.RING_STATE)
+
+    def last_timestamp(self, ts_key: Optional[str] = None) -> int | None:
+        value = self._metadata(Op.LAST_TIMESTAMP, ts_key)
+        return None if value is None else int(value)
 
     def first_after(
         self,

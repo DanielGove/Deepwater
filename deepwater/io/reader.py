@@ -33,14 +33,15 @@ class Reader:
     ring tail. The feed metadata decides which paths exist.
 
     Public methods:
-        describe(): metadata and schema summary.
+        schema(): schema fields and timestamp layout.
         range(start, end): finite historical window, [start, end).
         range_batches(start, end): finite historical window in batches.
         stream(start=None): infinite live stream, optionally replaying from time.
         first_after(start): first record with key >= start.
         first_before(ts): last record with key <= ts.
+        last_timestamp(ts_key=None): latest timestamp value for this feed.
         read_available(): stateful nonblocking tail read.
-        state(): live ring cursor/header state when a ring exists.
+        ring_state(): live ring cursor/header state when a ring exists.
         blob_ref(row, sidecar=...): decode sidecar payload coordinates from an index row.
         blob(row, sidecar=...): load one blob sidecar payload.
         blobs(rows, sidecar=...): load payloads for a batch of index rows.
@@ -187,32 +188,19 @@ class Reader:
     def is_persistent(self) -> bool:
         return self._persistent
 
-    def describe(self) -> dict:
-        """Return feed metadata and schema fields."""
+    def schema(self) -> dict:
+        """Return schema fields and timestamp layout."""
         clock_level = int(self.record_format.clock_level)
         fields = [field.to_dict() for field in self.record_format.fields]
         timestamp_fields = fields[:clock_level]
         ts_offset = self.record_format.primary_ts_offset
-        storage = "ring" if self._uses_ring else "chunk"
         return {
-            "feed_name": self.feed_name,
-            "metadata": {
-                "chunk_size_bytes": self._metadata.chunk_size_bytes,
-                "ring_size_bytes": self._metadata.ring_size_bytes,
-                "retention_hours": self._metadata.retention_hours,
-                "persist": self._persistent,
-                "segment_tracking": self._metadata.segment_tracking,
-                "prefault_ring": self._metadata.prefault_ring,
-                "storage": storage,
-                "uses_ring": self._uses_ring,
-            },
             "clock_level": clock_level,
             "timestamp_fields": timestamp_fields,
             "record_fmt": self.record_format.fmt,
             "record_size": self.record_format.record_size,
             "ts_offset": ts_offset,
             "fields": fields,
-            "created_us": self._metadata.created_us,
         }
 
     def __repr__(self) -> str:
@@ -370,7 +358,7 @@ class Reader:
                     continue
             os.sched_yield()
 
-    def state(self) -> dict:
+    def ring_state(self) -> dict:
         """Return live ring counters for diagnostics."""
         if self._ring is None:
             raise FileNotFoundError(f"feed '{self.feed_name}' has no live ring")
@@ -390,6 +378,51 @@ class Reader:
             "ring_data_size": ring.data_size,
             "ring_total_size": ring.total_size,
         }
+
+    def last_timestamp(self, ts_key: Optional[str] = None) -> int | None:
+        """Return the latest readable timestamp value, or None when the feed is empty."""
+        if ts_key is None:
+            ts_off = self._primary_ts_off
+        else:
+            try:
+                ts_off = self._ts_offset_by_name[ts_key]
+            except KeyError:
+                raise ValueError(f"Timestamp key '{ts_key}' not found, options are: {tuple(self._ts_offset_by_name)}") from None
+
+        ring = self._ring
+        if ring is not None:
+            record_count = int(ring.record_count[0])
+            if record_count > 0 and self._ring_record_capacity > 0:
+                earliest_seq = max(0, record_count - self._ring_record_capacity)
+                seq = record_count - 1
+                pos = (int(ring.start_pos[0]) + ((seq - earliest_seq) * self._rec_size)) % ring.data_size
+                return int.from_bytes(ring.data[pos + ts_off:pos + ts_off + 8], "little")
+
+        if self.feed_registry is None:
+            return None
+
+        chunk_id = self.feed_registry.get_latest_chunk_idx()
+        while chunk_id and chunk_id > 0:
+            meta = self.feed_registry.get_chunk_metadata(chunk_id)
+            if meta is None:
+                chunk_id -= 1
+                continue
+            try:
+                if meta.status != ON_DISK or int(meta.num_records) <= 0:
+                    chunk_id -= 1
+                    continue
+            finally:
+                meta.release()
+            try:
+                self._open_chunk(chunk_id)
+            except FileNotFoundError:
+                chunk_id -= 1
+                continue
+            pos = int(self._chunk_meta.write_pos) - self._rec_size
+            if pos >= 0:
+                return int.from_bytes(self._chunk.buffer[pos + ts_off:pos + ts_off + 8], "little")
+            chunk_id -= 1
+        return None
 
     def _raw_seq_batches(
         self,

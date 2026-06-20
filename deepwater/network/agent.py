@@ -186,10 +186,12 @@ class DeepwaterAgentHandler(socketserver.BaseRequestHandler):
                     self._hello(request_id, header)
                 elif op == Op.OPEN_READER:
                     self._open_reader(request_id, header)
-                elif op == Op.READER_DESCRIBE:
-                    self._reader_describe(request_id)
-                elif op == Op.STATE:
-                    self._state(request_id)
+                elif op == Op.READER_SCHEMA:
+                    self._reader_schema(request_id)
+                elif op == Op.RING_STATE:
+                    self._ring_state(request_id)
+                elif op == Op.LAST_TIMESTAMP:
+                    self._last_timestamp(request_id, header)
                 elif op == Op.LIST_FEEDS:
                     self._list_feeds(request_id, header)
                 elif op == Op.FEED_EXISTS:
@@ -415,11 +417,18 @@ class DeepwaterAgentHandler(socketserver.BaseRequestHandler):
             ),
         )
 
-    def _reader_describe(self, request_id: Any) -> None:
-        self._metadata(request_id, self._require_reader().describe())
+    def _reader_schema(self, request_id: Any) -> None:
+        self._metadata(request_id, self._require_reader().schema())
 
-    def _state(self, request_id: Any) -> None:
-        self._metadata(request_id, self._require_reader().state())
+    def _ring_state(self, request_id: Any) -> None:
+        self._metadata(request_id, self._require_reader().ring_state())
+
+    def _last_timestamp(self, request_id: Any, header: Frame) -> None:
+        values = _args(header, "LAST_TIMESTAMP")
+        ts_key = values[0] if values else None
+        if ts_key is not None and not isinstance(ts_key, str):
+            raise ValueError("ts_key must be a string or null")
+        self._metadata(request_id, self._require_reader().last_timestamp(ts_key=ts_key))
 
     def _read_range(self, request_id: Any, header: Frame) -> None:
         reader = self._require_reader()

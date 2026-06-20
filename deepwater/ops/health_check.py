@@ -43,14 +43,9 @@ def check_global_registry(base_path: Path) -> Tuple[bool, str]:
 
 
 def _reader_state(reader) -> Optional[dict]:
-    if hasattr(reader, "_ring_state"):
+    if hasattr(reader, "ring_state"):
         try:
-            return reader._ring_state()
-        except FileNotFoundError:
-            return None
-    if hasattr(reader, "state"):
-        try:
-            return reader.state()
+            return reader.ring_state()
         except FileNotFoundError:
             return None
     return None

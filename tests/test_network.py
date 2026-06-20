@@ -196,9 +196,9 @@ def test_remote_reader_range_loopback():
                 assert isinstance(rr.layout, FeedSchema)
                 assert isinstance(rr.record_format, FeedSchema)
                 assert rr.layout.record_size == 16
-                description = rr.describe()
-                assert description["record_size"] == 16
-                assert description["record_fmt"] == "<QQ"
+                schema = rr.schema()
+                assert schema["record_size"] == 16
+                assert schema["record_fmt"] == "<QQ"
                 assert rr.fields == (
                     {"name": "ts", "type": "uint64", "offset": 0, "size": 8},
                     {"name": "value", "type": "uint64", "offset": 8, "size": 8},
@@ -207,8 +207,9 @@ def test_remote_reader_range_loopback():
                     {"name": "ts", "type": "uint64", "offset": 0, "size": 8},
                 )
                 assert rr.is_persistent is False
-                state = rr.state()
+                state = rr.ring_state()
                 assert state["record_count"] >= 5
+                assert rr.last_timestamp() == start + 40
                 assert rr.first_after(start + 1) == (start + 10, 1)
                 assert rr.first_before(start + 25) == (start + 20, 2)
                 assert rr.first_before(start - 1) is None
