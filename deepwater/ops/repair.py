@@ -29,7 +29,6 @@ from typing import Optional, Tuple
 from deepwater.metadata.feed_registry import FeedRegistry, ON_DISK, IN_MEMORY, EXPIRED, UINT64_MAX
 from deepwater.metadata.feed_metadata import list_feeds, load_record_format_dict
 from deepwater.metadata.feed_schema import FeedSchema
-from deepwater.metadata.segments import SegmentStore, USABLE_SEGMENT_STATUSES
 
 log = logging.getLogger("dw.repair")
 
@@ -186,189 +185,6 @@ def _repair_chunk_from_file(
     )
 
 
-def _latest_level1_timestamp(registry: FeedRegistry) -> Optional[int]:
-    """Return latest level-1 qmax from feed registry, if available."""
-    latest_idx = registry.get_latest_chunk_idx()
-    if latest_idx is None:
-        return None
-    idx = int(latest_idx)
-    while idx > 0:
-        meta = registry.get_chunk_metadata(idx)
-        try:
-            qmin = int(meta.get_qmin(0))
-            qmax = int(meta.get_qmax(0))
-            if qmax != 0 and qmin != UINT64_MAX and qmin <= qmax:
-                return qmax
-        finally:
-            meta.release()
-        idx -= 1
-    return None
-
-
-def _count_records_in_span(
-    *,
-    feed_dir: Path,
-    feed_name: str,
-    record_format: dict,
-    start_us: int,
-    end_us: int,
-) -> Optional[int]:
-    """
-    Count records whose level-1 timestamp falls in [start_us, end_us].
-    Returns None if counting cannot be completed.
-    """
-    if end_us < start_us:
-        return None
-
-    rec_size = int(record_format["record_size"])
-    ts_offset = int(record_format.get("ts", {}).get("offset", 0))
-    if rec_size <= 0 or ts_offset < 0 or (ts_offset + 8) > rec_size:
-        return None
-
-    reg_path = feed_dir / f"{feed_name}.reg"
-    if not reg_path.exists():
-        return None
-
-    registry = FeedRegistry(str(reg_path), mode="r")
-    total = 0
-    counted_any = False
-    try:
-        for chunk_idx in registry.get_chunks_in_range(int(start_us), int(end_us), qoff=0):
-            meta = registry.get_chunk_metadata(chunk_idx)
-            try:
-                chunk_id = int(meta.chunk_id)
-                qmin = int(meta.get_qmin(0))
-                qmax = int(meta.get_qmax(0))
-                num_records = int(meta.num_records)
-            finally:
-                meta.release()
-
-            if num_records <= 0:
-                continue
-
-            if qmin >= start_us and qmax <= end_us:
-                total += num_records
-                counted_any = True
-                continue
-
-            chunk_path = feed_dir / f"chunk_{chunk_id:08d}.bin"
-            if not chunk_path.exists():
-                continue
-
-            to_read = num_records * rec_size
-            if to_read <= 0:
-                continue
-
-            local_count = 0
-            with open(chunk_path, "rb") as f:
-                remaining = to_read
-                carry = b""
-                while remaining > 0:
-                    block = f.read(min(remaining, 4 * 1024 * 1024))
-                    if not block:
-                        break
-                    remaining -= len(block)
-                    data = carry + block
-                    full = (len(data) // rec_size) * rec_size
-                    mv = memoryview(data)
-                    try:
-                        for pos in range(0, full, rec_size):
-                            ts = int.from_bytes(mv[pos + ts_offset:pos + ts_offset + 8], "little")
-                            if start_us <= ts <= end_us:
-                                local_count += 1
-                    finally:
-                        mv.release()
-                    carry = data[full:]
-
-            total += local_count
-            counted_any = True
-    finally:
-        registry.close()
-
-    if not counted_any:
-        return None
-    return int(total)
-
-
-def repair_feed_segments(base_path: Path, feed_name: str, record_format: dict, dry_run: bool = False) -> Tuple[int, int]:
-    """
-    Validate/repair segment metadata for a feed.
-    Returns (segments_checked, segments_repaired).
-    """
-    feed_dir = base_path / "data" / feed_name
-    reg_path = feed_dir / f"{feed_name}.reg"
-    if not reg_path.exists():
-        return 0, 0
-
-    store = SegmentStore(feed_dir, feed_name)
-    checked = 0
-    repaired = 0
-
-    # Close crash-open segment first so it is visible as crash_closed for backfill.
-    if dry_run:
-        has_open = any(s.get("status") == "open" for s in store.list_segments(status="all"))
-        if has_open:
-            checked += 1
-            repaired += 1
-            log.info("[DRY RUN] Would crash-close open segment for feed '%s'", feed_name)
-    else:
-        latest_ts = None
-        reg = FeedRegistry(str(reg_path), mode="r")
-        try:
-            latest_ts = _latest_level1_timestamp(reg)
-        finally:
-            reg.close()
-        if store.recover_open_segment(latest_ts):
-            checked += 1
-            repaired += 1
-
-    fd, mm = store._open_mmap()
-    try:
-        header = store._read_header(mm)
-        count = int(header["segment_count"])
-        dirty = False
-
-        for idx in range(1, count + 1):
-            seg = store._read_entry(mm, idx)
-            status = seg.get("status")
-            if status not in USABLE_SEGMENT_STATUSES:
-                continue
-            if seg.get("records") not in (None, 0):
-                continue
-
-            start_us = seg.get("start_us")
-            end_us = seg.get("end_us")
-            if start_us is None or end_us is None:
-                continue
-
-            checked += 1
-            cnt = _count_records_in_span(
-                feed_dir=feed_dir,
-                feed_name=feed_name,
-                record_format=record_format,
-                start_us=int(start_us),
-                end_us=int(end_us),
-            )
-            if cnt is None:
-                continue
-            if int(seg.get("records") or 0) == int(cnt):
-                continue
-
-            repaired += 1
-            if not dry_run:
-                seg["records"] = int(cnt)
-                store._write_entry(mm, idx, seg)
-                dirty = True
-
-        if dirty:
-            mm.flush()
-    finally:
-        mm.close()
-        os.close(fd)
-
-    return checked, repaired
-
-
 # ============================================================================
 # INTERNAL HELPERS - Used by CLI repair tool
 # ============================================================================
@@ -483,7 +299,7 @@ def repair_chunk_metadata(
 
 def repair_feed(base_path: Path, feed_name: str, dry_run: bool = False) -> Tuple[int, int]:
     """
-    Validate and repair chunk + segment metadata in a feed.
+    Validate and repair chunk metadata in a feed.
     Returns (entries_checked, entries_repaired).
     """
     feed_dir = base_path / "data" / feed_name
@@ -550,17 +366,20 @@ def repair_feed(base_path: Path, feed_name: str, dry_run: bool = False) -> Tuple
                         else:
                             try:
                                 # Need write access for repair
+                                meta.release()
+                                meta = None
                                 registry.close()
                                 registry = FeedRegistry(str(reg_path), mode="w")
-                                meta = registry.get_chunk_metadata(chunk_id)
-                                
-                                repair_chunk_metadata(
-                                    chunk_path, meta, record_format, dry_run=False
-                                )
+                                repair_meta = registry.get_chunk_metadata(chunk_id)
+                                try:
+                                    repair_chunk_metadata(
+                                        chunk_path, repair_meta, record_format, dry_run=False
+                                    )
+                                finally:
+                                    repair_meta.release()
                                 chunks_repaired += 1
-                                
+
                                 # Back to read mode
-                                meta.release()
                                 registry.close()
                                 registry = FeedRegistry(str(reg_path), mode="r")
                             except Exception as e:
@@ -575,14 +394,7 @@ def repair_feed(base_path: Path, feed_name: str, dry_run: bool = False) -> Tuple
     finally:
         registry.close()
     
-    seg_checked = 0
-    seg_repaired = 0
-    try:
-        seg_checked, seg_repaired = repair_feed_segments(base_path, feed_name, record_format, dry_run=dry_run)
-    except Exception as e:
-        log.error(f"Segment metadata repair failed for '{feed_name}': {e}")
-
-    return chunks_checked + seg_checked, chunks_repaired + seg_repaired
+    return chunks_checked, chunks_repaired
 
 
 def repair_all_feeds(base_path: Path, dry_run: bool = False) -> None:

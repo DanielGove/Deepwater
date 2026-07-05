@@ -21,7 +21,7 @@ python -m pytest --cov=deepwater
 
 - `test_ring_buffer.py`, `test_reader_*.py`, `test_range_*.py`, `test_writer_direct.py`, `test_persistent_raw.py`, `test_non_blocking.py`: hot I/O primitives, wraparound, live rings, chunk ranges, and raw reads.
 - `test_feed_schema.py`, `test_global_registry.py`, `test_feed_registry.py`, `test_metadata_bounds.py`, `test_timestamps.py`: schema, registry ABI, metadata bounds, and timestamp parsing contracts.
-- `test_segments.py`, `test_ws_disconnect_segments.py`, `test_catalog.py`, `test_datasets.py`: durable coverage, segment recovery, and research/catalog surfaces.
+- `test_catalog.py`, `test_datasets.py`: durable chunk coverage and research/catalog surfaces.
 - `test_health_cleanup.py`, `test_reader_cleanup.py`, `test_delete_feed.py`: ops paths, retention cleanup, deleted chunk behavior, and feed deletion.
 - `test_network.py`: loopback network reader/protocol behavior using local sockets only.
 - `test_blob_sidecar_api.py`: variable-size blob sidecars indexed by fixed-row feeds.

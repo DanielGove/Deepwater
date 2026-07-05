@@ -23,7 +23,6 @@ PERSISTER_STARTED_US_OFFSET = 16
 PERSISTER_HEARTBEAT_US_OFFSET = 24
 
 FEED_FLAG_PERSIST = 1 << 0
-FEED_FLAG_SEGMENT_TRACKING = 1 << 1
 FEED_FLAG_PREFAULT_RING = 1 << 2
 FEED_FLAG_USES_RING = 1 << 3
 
@@ -89,10 +88,6 @@ class FeedMetadata:
         return bool(self.flags & FEED_FLAG_PERSIST)
 
     @property
-    def segment_tracking(self) -> bool:
-        return bool(self.flags & FEED_FLAG_SEGMENT_TRACKING)
-
-    @property
     def prefault_ring(self) -> bool:
         return bool(self.flags & FEED_FLAG_PREFAULT_RING)
 
@@ -107,7 +102,6 @@ class FeedMetadata:
             "ring_size_bytes": self.ring_size_bytes,
             "retention_hours": self.retention_hours,
             "persist": self.persist,
-            "segment_tracking": self.segment_tracking,
             "prefault_ring": self.prefault_ring,
             "uses_ring": self.uses_ring,
             "clock_level": self.clock_level,
@@ -195,8 +189,6 @@ class GlobalRegistry:
             flags = 0
             if bool(metadata.get("persist", True)):
                 flags |= FEED_FLAG_PERSIST
-            if bool(metadata.get("segment_tracking", True)):
-                flags |= FEED_FLAG_SEGMENT_TRACKING
             if bool(metadata.get("prefault_ring", True)):
                 flags |= FEED_FLAG_PREFAULT_RING
             if bool(metadata.get("uses_ring", True)):
@@ -261,7 +253,6 @@ class GlobalRegistry:
                     self.mmap[offset+RETAIN_HOURS_OFFSET:offset+RETAIN_HOURS_OFFSET+4] = int(kwargs.get("retention_hours")).to_bytes(4, "little")
                 flag_updates = {
                     "persist": FEED_FLAG_PERSIST,
-                    "segment_tracking": FEED_FLAG_SEGMENT_TRACKING,
                     "prefault_ring": FEED_FLAG_PREFAULT_RING,
                     "uses_ring": FEED_FLAG_USES_RING,
                 }
@@ -378,7 +369,6 @@ if __name__ == "__main__":
                     "ring_size_bytes": 4096,
                     "retention_hours": 24,
                     "persist": True,
-                    "segment_tracking": True,
                     "prefault_ring": False,
                     "uses_ring": True,
                 },
@@ -391,7 +381,6 @@ if __name__ == "__main__":
             assert md.ring_size_bytes == 4096
             assert md.retention_hours == 24
             assert md.persist is True
-            assert md.segment_tracking is True
             assert md.prefault_ring is False
             assert md.uses_ring is True
             assert md.clock_level == 2

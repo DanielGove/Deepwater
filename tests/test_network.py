@@ -18,7 +18,6 @@ import deepwater as dw
 from deepwater import Reader, Writer, create_feed, delete_feed
 from deepwater.cli.datasets_cli import main as datasets_cli_main
 from deepwater.cli.feeds_cli import main as feeds_cli_main
-from deepwater.cli.segments_cli import main as segments_cli_main
 from deepwater.metadata.feed_schema import FeedSchema
 from deepwater.network.agent import make_server
 from deepwater.network.client import RemoteReader, RemoteReaderError, remote_metadata
@@ -499,8 +498,7 @@ def test_remote_metadata_and_reader_loopback():
             assert dw.feed_metadata(remote_base, "events")["persist"] is True
             assert dw.get_record_format(remote_base, "events")["fmt"] == "<QQ"
             assert dw.describe_feed(remote_base, "events")["record_size"] == 16
-            assert isinstance(dw.list_segments(remote_base, "events"), list)
-            assert dw.suggested_reader_range(remote_base, "events") is not None
+            assert dw.feed_intervals(remote_base, "events") == [(start, start + 20)]
             with Reader(remote_base, "events", timeout=2.0) as reader:
                 assert reader.range(start, start + 30) == [
                     (start, 0),
@@ -536,19 +534,6 @@ def test_remote_metadata_clis_loopback():
             feed_payload = orjson.loads(out.getvalue().encode("utf-8"))
             assert feed_payload["feed_name"] == "events"
             assert feed_payload["record_fmt"] == "<QQ"
-
-            out = io.StringIO()
-            with redirect_stdout(out):
-                rc = segments_cli_main([
-                    "--base-path", remote_base,
-                    "--feed", "events",
-                    "--status", "usable",
-                    "--json",
-                ])
-            assert rc == 0
-            segments_payload = orjson.loads(out.getvalue().encode("utf-8"))
-            assert segments_payload["feed"] == "events"
-            assert segments_payload["segments"]
 
             out = io.StringIO()
             with redirect_stdout(out):

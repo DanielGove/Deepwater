@@ -17,8 +17,8 @@ from deepwater.metadata.feed_metadata import (
     load_feed_metadata_dict,
     load_record_format_dict,
 )
+from deepwater.metadata.discovery import feed_intervals
 from deepwater.metadata.feed_schema import load_record_schema_for_feed
-from deepwater.metadata.segments import SegmentStore
 
 from .path import DEFAULT_PORT, resolve_agent_path
 from .protocol import (
@@ -98,7 +98,6 @@ def _describe_feed(base_path: Path, feed_name: str) -> dict[str, Any]:
             "retention_hours": metadata.retention_hours,
             "persist": metadata.persist,
             "ring_size_bytes": metadata.ring_size_bytes,
-            "segment_tracking": metadata.segment_tracking,
             "prefault_ring": metadata.prefault_ring,
             "uses_ring": metadata.uses_ring,
             "storage": "ring" if metadata.uses_ring else "chunk",
@@ -111,13 +110,6 @@ def _describe_feed(base_path: Path, feed_name: str) -> dict[str, Any]:
         "fields": [field.to_dict() for field in layout.fields],
         "created_us": metadata.created_us,
     }
-
-
-def _segment_store(base_path: Path, feed_name: str) -> SegmentStore:
-    if not feed_exists(base_path, feed_name):
-        raise KeyError(feed_name)
-    return SegmentStore(base_path / "data" / feed_name, feed_name)
-
 
 class DeepwaterAgentServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
@@ -202,10 +194,8 @@ class DeepwaterAgentHandler(socketserver.BaseRequestHandler):
                     self._feed_metadata(request_id, header)
                 elif op == Op.RECORD_FORMAT:
                     self._record_format(request_id, header)
-                elif op == Op.LIST_SEGMENTS:
-                    self._list_segments(request_id, header)
-                elif op == Op.SUGGESTED_READER_RANGE:
-                    self._suggested_reader_range(request_id, header)
+                elif op == Op.FEED_INTERVALS:
+                    self._feed_intervals(request_id, header)
                 elif op == Op.READ_RANGE:
                     self._read_range(request_id, header)
                 elif op == Op.READ_RANGE_PAGE:
@@ -373,20 +363,10 @@ class DeepwaterAgentHandler(socketserver.BaseRequestHandler):
         base = self._open_platform(path)
         self._metadata(request_id, load_record_format_dict(base, str(feed_name)))
 
-    def _list_segments(self, request_id: Any, header: Frame) -> None:
-        values = _args(header, "LIST_SEGMENTS", 2)
-        path, feed_name = values[:2]
-        status = None
-        if len(values) > 2:
-            status = values[2]
+    def _feed_intervals(self, request_id: Any, header: Frame) -> None:
+        path, feed_name = _args(header, "FEED_INTERVALS", 2)[:2]
         base = self._open_platform(path)
-        self._metadata(request_id, _segment_store(base, str(feed_name)).list_segments(status=status))
-
-    def _suggested_reader_range(self, request_id: Any, header: Frame) -> None:
-        path, feed_name = _args(header, "SUGGESTED_READER_RANGE", 2)[:2]
-        base = self._open_platform(path)
-        suggested = _segment_store(base, str(feed_name)).suggested_timestamp_range()
-        self._metadata(request_id, list(suggested) if suggested is not None else None)
+        self._metadata(request_id, [list(interval) for interval in feed_intervals(base, str(feed_name))])
 
     def _require_reader(self):
         if self.reader is None or self.feed_name is None:

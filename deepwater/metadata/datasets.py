@@ -112,7 +112,7 @@ def build_manifest(
     *,
     base_path: str,
     feeds: list[str],
-    status_filter: str,
+    source: str,
     intervals: list[dict],
     recommendation: dict | None,
 ) -> dict:
@@ -121,7 +121,7 @@ def build_manifest(
         "created_at_us": time.time_ns() // 1_000,
         "base_path": str(base_path),
         "feeds": list(feeds),
-        "status_filter": status_filter,
+        "source": str(source),
         "intervals": intervals,
         "recommended": recommendation,
     }
@@ -131,7 +131,7 @@ def build_multi_manifest(
     *,
     sources: dict[str, str],
     feed_refs: list[str],
-    status_filter: str,
+    source: str,
     intervals: list[dict],
     recommendation: dict | None,
 ) -> dict:
@@ -141,7 +141,7 @@ def build_multi_manifest(
         "mode": "multi_source",
         "sources": dict(sources),
         "feed_refs": list(feed_refs),
-        "status_filter": status_filter,
+        "source": str(source),
         "intervals": intervals,
         "recommended": recommendation,
     }

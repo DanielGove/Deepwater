@@ -50,13 +50,7 @@ python ./apps/quickstart_app.py
 deepwater-health --base-path "$DEEPWATER_BASE" --check-feeds --max-age-seconds 300
 ```
 
-6) See usable segment windows (for backtests):
-
-```bash
-deepwater-segments --base-path "$DEEPWATER_BASE" --feed trades --status usable --suggest-range
-```
-
-7) Compute common contiguous windows across your strategy feed set:
+6) Compute common contiguous windows across your strategy feed set:
 
 ```bash
 deepwater-datasets --base-path "$DEEPWATER_BASE" \
@@ -164,29 +158,6 @@ deepwater-feeds --base-path ./data --all --json
 
 # same CLI over a remote reader agent
 deepwater-feeds --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --all --json
-```
-
-## Automatic Segmentation
-
-Segmentation is metadata attached to each feed and managed by writers automatically:
-- segment starts on first write (not on `create_feed`)
-- segment closes on writer close
-- segment can be explicitly split without closing writer: `writer.mark_segment_boundary("disconnect")`
-- if writer crashes, next writer start closes prior open segment at last level-1 timestamp
-
-Query it with:
-
-```bash
-deepwater-segments --base-path ./data --feed trades --status usable --suggest-range
-deepwater-segments --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --feed trades --status usable --suggest-range
-```
-
-Disconnect/reconnect boundary pattern:
-
-```python
-trade_writer.mark_segment_boundary("disconnect")
-book_writer.mark_segment_boundary("disconnect")
-# next write starts a new segment automatically
 ```
 
 ## Multi-Feed Dataset Planning

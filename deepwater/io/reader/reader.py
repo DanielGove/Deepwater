@@ -542,7 +542,7 @@ class Reader:
             else:
                 durable_seq = ring.durable_record_count[0]
                 durable_last_ts = ring.durable_last_ts[0]
-                if durable_seq > 0 and durable_last_ts and start <= durable_last_ts:
+                if durable_last_ts and start <= durable_last_ts:
                     rec_size = self._rec_size
                     for batch in self._iter_durable_raw_range(
                         start,

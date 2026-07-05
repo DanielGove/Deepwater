@@ -52,7 +52,7 @@ class _FeedState:
             shm_name=shm_names[0],
             fallback_names=shm_names[1:],
         )
-        writer = ChunkWriter(base, feed_name, segment_tracking=False)
+        writer = ChunkWriter(base, feed_name)
         record_size = int(layout.record_size)
         capacity_records = max(1, ring.data_size // record_size)
         chunk_records = max(1, int(metadata.chunk_size_bytes) // record_size)

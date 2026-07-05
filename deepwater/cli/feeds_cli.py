@@ -31,8 +31,7 @@ def _print_feed(desc: dict, ts_fmt: TimestampFormat) -> None:
         f"persist={metadata.get('persist')} "
         f"chunk_size_bytes={metadata.get('chunk_size_bytes')} "
         f"ring_size_bytes={metadata.get('ring_size_bytes')} "
-        f"retention_hours={metadata.get('retention_hours')} "
-        f"segment_tracking={metadata.get('segment_tracking')}"
+        f"retention_hours={metadata.get('retention_hours')}"
     )
     print(
         "  "

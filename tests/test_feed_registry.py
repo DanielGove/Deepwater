@@ -48,6 +48,7 @@ def test_chunk_iteration_and_lookup_are_one_based():
             assert registry.find_chunk_by_id(int(latest)) == int(latest)
             assert registry.find_chunk_by_id(999_999) is None
             assert registry.durable_frontier() == (300, 1_299)
+            assert registry.latest_timestamp() == 1_299
 
             try:
                 registry.get_chunk_metadata(0)

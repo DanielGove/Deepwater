@@ -26,7 +26,7 @@ def _spec(name: str) -> dict:
     }
 
 
-def _write_segment(base: Path, feed: str, start_us: int, end_us: int) -> None:
+def _write_window(base: Path, feed: str, start_us: int, end_us: int) -> None:
     w = Writer(base, feed)
     if end_us < start_us:
         raise ValueError("end_us must be >= start_us")
@@ -42,13 +42,13 @@ def test_common_windows_across_two_feeds():
         create_feed(base, _spec("f1"))
         create_feed(base, _spec("f2"))
 
-        _write_segment(base, "f1", 100, 200)
-        _write_segment(base, "f1", 300, 500)
+        _write_window(base, "f1", 100, 200)
+        _write_window(base, "f1", 300, 500)
 
-        _write_segment(base, "f2", 150, 250)
-        _write_segment(base, "f2", 260, 480)
+        _write_window(base, "f2", 150, 250)
+        _write_window(base, "f2", 260, 480)
 
-        windows = common_time_windows(base, ["f1", "f2"], status="usable")
+        windows = common_time_windows(base, ["f1", "f2"])
         got = [(w["start_us"], w["end_us"]) for w in windows]
         assert got == [(150, 200), (300, 480)], f"unexpected windows: {got}"
 
@@ -71,8 +71,8 @@ def test_datasets_cli_json_and_manifest_output():
 
         create_feed(base, _spec("f1"))
         create_feed(base, _spec("f2"))
-        _write_segment(base, "f1", 1_000_000, 1_000_200)
-        _write_segment(base, "f2", 1_000_100, 1_000_300)
+        _write_window(base, "f1", 1_000_000, 1_000_200)
+        _write_window(base, "f2", 1_000_100, 1_000_300)
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -100,10 +100,10 @@ def test_datasets_cli_multi_source_two_base_paths():
         base_b = root / "base_b"
 
         create_feed(base_a, _spec("a_feed"))
-        _write_segment(base_a, "a_feed", 10_000, 20_000)
+        _write_window(base_a, "a_feed", 10_000, 20_000)
 
         create_feed(base_b, _spec("b_feed"))
-        _write_segment(base_b, "b_feed", 15_000, 25_000)
+        _write_window(base_b, "b_feed", 15_000, 25_000)
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -132,8 +132,8 @@ def test_datasets_cli_text_timestamp_formats():
 
         create_feed(base, _spec("f1"))
         create_feed(base, _spec("f2"))
-        _write_segment(base, "f1", 1_000_000, 1_000_200)
-        _write_segment(base, "f2", 1_000_100, 1_000_300)
+        _write_window(base, "f1", 1_000_000, 1_000_200)
+        _write_window(base, "f2", 1_000_100, 1_000_300)
 
         human_buf = io.StringIO()
         with redirect_stdout(human_buf):

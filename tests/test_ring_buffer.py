@@ -116,7 +116,6 @@ def test_ring_batch_wrap_preserves_logical_order():
             "clock_level": 1,
             "persist": False,
             "ring_size_mb": 0.001,
-            "segment_tracking": False,
         }
         create_feed(base, spec)
         w = Writer(base, "batchwrap")

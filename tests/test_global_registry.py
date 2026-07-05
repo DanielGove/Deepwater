@@ -21,7 +21,6 @@ def test_feed_metadata_registry_abi_roundtrip():
                     "ring_size_bytes": 8_388_608,
                     "retention_hours": 12,
                     "persist": True,
-                    "segment_tracking": False,
                     "prefault_ring": True,
                     "uses_ring": True,
                 },
@@ -37,7 +36,6 @@ def test_feed_metadata_registry_abi_roundtrip():
             assert decoded.ring_size_bytes == 8_388_608
             assert decoded.retention_hours == 12
             assert decoded.persist is True
-            assert decoded.segment_tracking is False
             assert decoded.prefault_ring is True
             assert decoded.uses_ring is True
             assert decoded.clock_level == 3
@@ -50,7 +48,6 @@ def test_feed_metadata_registry_abi_roundtrip():
             assert registry.update_metadata(
                 "events",
                 persist=False,
-                segment_tracking=True,
                 prefault_ring=False,
                 uses_ring=False,
                 ring_size_bytes=16_777_216,
@@ -58,7 +55,6 @@ def test_feed_metadata_registry_abi_roundtrip():
             updated = registry.get_feed("events")
             assert updated is not None
             assert updated.persist is False
-            assert updated.segment_tracking is True
             assert updated.prefault_ring is False
             assert updated.uses_ring is False
             assert updated.ring_size_bytes == 16_777_216

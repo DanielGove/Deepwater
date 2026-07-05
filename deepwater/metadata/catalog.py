@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..metadata.feed_registry import FeedRegistry, UINT64_MAX
-from .discovery import describe_feed, list_segments
-from .feed_metadata import list_feeds, load_feed_metadata
+from .discovery import describe_feed
+from .feed_metadata import list_feeds
 
 
 def _chunk_coverage(base_path: Path, feed_name: str) -> dict:
@@ -64,24 +64,6 @@ def _chunk_coverage(base_path: Path, feed_name: str) -> dict:
 
 def feed_coverage(base_path, feed_name: str):
     base = Path(base_path)
-    feed_metadata = load_feed_metadata(base, feed_name)
-    segment_tracking = True if feed_metadata is None else feed_metadata.segment_tracking
-
-    if segment_tracking:
-        segments = list_segments(base, feed_name, status="usable")
-        if segments:
-            start_us = min(int(seg["start_us"]) for seg in segments)
-            end_us = max(int(seg["end_us"]) for seg in segments)
-            records = sum(int(seg.get("records") or 0) for seg in segments)
-            return {
-                "feed_name": feed_name,
-                "source": "segments",
-                "start_us": start_us,
-                "end_us": end_us,
-                "duration_us": end_us - start_us + 1,
-                "records": records,
-            }
-
     return _chunk_coverage(base, feed_name)
 
 

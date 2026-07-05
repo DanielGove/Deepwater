@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Persistent ring raw paths should not diverge from tuple/range batch semantics."""
+import itertools
 import struct
 import tempfile
 from pathlib import Path
 
 
 from deepwater import Reader, Writer, create_feed
-from deepwater.io.writer.persistent_ring import _copy_ring_window, _FeedState, _FLUSHED
+from deepwater.io.ring import RingBuffer
+from deepwater.io.writer.persistent_ring import _copy_ring_window, _drain, _FeedState, _FLUSHED
 
 
 def _make_feed(base: Path):
@@ -110,7 +112,6 @@ def test_persister_copies_shadow_ring_across_wrap_boundary():
             "uses_ring": True,
             "ring_size_mb": 0.001,
             "chunk_size_mb": 1,
-            "segment_tracking": False,
         })
         w = Writer(base, "events")
         start = 1_900_000_000_000_000
@@ -162,7 +163,6 @@ def test_reader_range_merges_durable_chunks_with_live_ring_tail():
             "uses_ring": True,
             "ring_size_mb": 0.001,
             "chunk_size_mb": 1,
-            "segment_tracking": False,
         })
         w = Writer(base, "events")
         start = 2_000_000_000_000_000
@@ -197,3 +197,66 @@ def test_reader_range_merges_durable_chunks_with_live_ring_tail():
         finally:
             r.close()
             w.close()
+
+
+def test_fresh_persistent_ring_epoch_does_not_import_registry_record_counts():
+    with tempfile.TemporaryDirectory(prefix="dw-persist-restart-") as td:
+        base = Path(td)
+        create_feed(base, {
+            "feed_name": "events",
+            "mode": "UF",
+            "fields": [
+                {"name": "ts", "type": "uint64"},
+                {"name": "value", "type": "uint64"},
+            ],
+            "clock_level": 1,
+            "persist": True,
+            "uses_ring": True,
+            "storage": "ring",
+            "chunk_size_mb": 1,
+            "ring_size_mb": 1,
+        })
+        start = 2_100_000_000_000_000
+
+        w1 = Writer(base, "events")
+        try:
+            for i in range(5):
+                w1.write_values(start + i, i)
+            state = _FeedState(base, "events")
+            try:
+                w1.ring.request_drain()
+                assert _drain(base, state) == _FLUSHED
+            finally:
+                state.close()
+        finally:
+            w1.close()
+
+        # Simulate a second process generation after shared memory is gone.
+        # The new ring must start with local sequence counters at zero; durable
+        # disk history is exposed only as a timestamp routing hint.
+        RingBuffer.unlink_for_feed(base, "events")
+
+        w2 = Writer(base, "events")
+        try:
+            header = w2.ring.header()
+            assert header[4] == 0
+            assert header[5] == 0
+            assert header[6] == start + 4
+
+            w2.write_values(start + 5, 5)
+            w2.write_values(start + 6, 6)
+            state = _FeedState(base, "events")
+            try:
+                w2.ring.request_drain()
+                assert _drain(base, state) == _FLUSHED
+            finally:
+                state.close()
+        finally:
+            w2.close()
+
+        r = Reader(base, "events")
+        try:
+            assert r.range(start, start + 7) == [(start + i, i) for i in range(7)]
+            assert list(itertools.islice(r.stream(start=start), 7)) == [(start + i, i) for i in range(7)]
+        finally:
+            r.close()

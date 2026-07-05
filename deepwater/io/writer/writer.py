@@ -11,49 +11,12 @@ from typing import Union
 from ..chunk import Chunk
 from ..blob_sidecar import BlobRef, BlobSidecarWriters, ref_values
 from ..ring import RingBuffer, _yield_cpu, ring_buffer_shm_names
+from ...ops import repair
 from ...metadata.feed_registry import FeedRegistry, ON_DISK, UINT64_MAX
 from ...metadata.feed_metadata import load_feed_metadata
 from ...metadata.feed_schema import load_record_schema_for_feed
-from ...metadata.segments import SegmentStore
 
 log = logging.getLogger("dw.writer")
-
-
-def _noop_note_write(*_args, **_kwargs) -> None:
-    return None
-
-
-def _noop_note_batch(*_args, **_kwargs) -> None:
-    return None
-
-
-def _load_durable_frontier(feed_dir, feed_name: str) -> tuple[int, int]:
-    reg_path = feed_dir / f"{feed_name}.reg"
-    if not reg_path.exists():
-        return 0, 0
-    try:
-        registry = FeedRegistry(reg_path, mode="r")
-    except (OSError, ValueError):
-        # A brand-new persistent feed can briefly expose an empty/truncated
-        # registry file while metadata is still being initialized.
-        return 0, 0
-    try:
-        total_records = 0
-        latest_ts = 0
-        latest_chunk_id = registry.get_latest_chunk_idx() or 0
-        for chunk_id in range(1, int(latest_chunk_id) + 1):
-            meta = registry.get_chunk_metadata(chunk_id)
-            try:
-                total_records += int(meta.num_records)
-                qmax = int(meta.get_qmax(0))
-                qmin = int(meta.get_qmin(0))
-                if qmax and qmin != UINT64_MAX and qmax >= qmin:
-                    latest_ts = qmax
-            finally:
-                meta.release()
-        return total_records, latest_ts
-    finally:
-        registry.close()
 
 
 def _persistent_ring_owner_healthy(base_path: Path) -> bool:
@@ -109,7 +72,6 @@ class RingWriter:
             raise KeyError(feed_name)
         self.record_format = load_record_schema_for_feed(self.base_path, feed_name)
         self._persist = bool(self.feed_metadata.persist)
-        self._segment_tracking = bool(self.feed_metadata.segment_tracking)
         self._prefault_ring = bool(self.feed_metadata.prefault_ring)
         self._writer_lock_fd = None
         self._closed = False
@@ -152,20 +114,40 @@ class RingWriter:
         if self._prefault_ring:
             self._prefault_ring_pages()
         self._ring_capacity = self.ring.data_size // self._rec_size
-        self.segment_store = SegmentStore(self.base_path / "data" / feed_name, feed_name) if self._segment_tracking else None
-        self._bootstrap_persisted_ring()
         if self._persist:
-            self._repair_persisted_chunks_for_recovery()
-            self._bootstrap_persisted_ring()
-        if self.segment_store is not None:
-            last_ts = int(self._ring_last_ts[0])
-            self.segment_store.recover_open_segment(last_ts if last_ts > 0 else None)
-            self._segment_note_write = self.segment_store.note_write_one
-            self._segment_note_batch = self.segment_store.note_batch
-        else:
-            self._segment_note_write = _noop_note_write
-            self._segment_note_batch = _noop_note_batch
-
+            reg_path = self.base_path / "data" / self.feed_name / f"{self.feed_name}.reg"
+            if reg_path.exists():
+                registry = None
+                try:
+                    registry = FeedRegistry(reg_path, mode="w")
+                except Exception:
+                    try:
+                        read_registry = FeedRegistry(reg_path, mode="r")
+                    except (OSError, ValueError, FileNotFoundError):
+                        pass
+                    else:
+                        latest_ts = read_registry.latest_timestamp()
+                        read_registry.close()
+                        self.ring.update_durable_header(durable_last_ts=latest_ts)
+                if registry is not None:
+                    try:
+                        latest_idx = registry.get_latest_chunk_idx() or 0
+                        for chunk_id in range(1, int(latest_idx) + 1):
+                            meta = registry.get_chunk_metadata(chunk_id)
+                            try:
+                                repair.validate_and_repair_chunk(
+                                    chunk_id=chunk_id,
+                                    meta=meta,
+                                    feed_name=self.feed_name,
+                                    feed_dir=self.base_path / "data" / self.feed_name,
+                                    record_format=self.record_format,
+                                )
+                            finally:
+                                meta.release()
+                        latest_ts = registry.latest_timestamp()
+                    finally:
+                        registry.close()
+                    self.ring.update_durable_header(durable_last_ts=latest_ts)
     @property
     def closed(self) -> bool:
         return bool(self._closed)
@@ -195,63 +177,6 @@ class RingWriter:
         except Exception:
             pass
 
-    def _bootstrap_persisted_ring(self) -> None:
-        if not self._persist:
-            return
-        durable_count, durable_last_ts = _load_durable_frontier(self.base_path / "data" / self.feed_name, self.feed_name)
-        write_pos, start_pos, generation, last_ts, record_count, ring_durable_count, ring_durable_last_ts, overrun_count, lost_records = self.ring.header()
-        if record_count == 0 and ring_durable_count == 0 and durable_count > 0:
-            self.ring.update_live_header(0, 0, 0, durable_last_ts, durable_count)
-            self.ring.update_durable_header(
-                durable_record_count=durable_count,
-                durable_last_ts=durable_last_ts,
-                overrun_count=overrun_count,
-                lost_records=lost_records,
-            )
-            return
-        if durable_count > ring_durable_count:
-            self.ring.update_durable_header(
-                durable_record_count=durable_count,
-                durable_last_ts=max(ring_durable_last_ts, durable_last_ts),
-                overrun_count=overrun_count,
-                lost_records=lost_records,
-            )
-            if record_count < durable_count:
-                self.ring.update_live_header(
-                    write_pos,
-                    start_pos,
-                    generation,
-                    max(last_ts, durable_last_ts),
-                    durable_count,
-                )
-
-    def _repair_persisted_chunks_for_recovery(self) -> None:
-        reg_path = self.base_path / "data" / self.feed_name / f"{self.feed_name}.reg"
-        if not reg_path.exists():
-            return
-        try:
-            from ...ops import repair
-
-            registry = FeedRegistry(reg_path, mode="w")
-        except Exception:
-            return
-        try:
-            latest_idx = registry.get_latest_chunk_idx() or 0
-            for chunk_id in range(1, int(latest_idx) + 1):
-                meta = registry.get_chunk_metadata(chunk_id)
-                try:
-                    repair.validate_and_repair_chunk(
-                        chunk_id=chunk_id,
-                        meta=meta,
-                        feed_name=self.feed_name,
-                        feed_dir=self.base_path / "data" / self.feed_name,
-                        record_format=self.record_format,
-                    )
-                finally:
-                    meta.release()
-        finally:
-            registry.close()
-
     def _wait_for_persisted_space(self, needed_records: int) -> None:
         while (
             self._persist
@@ -276,7 +201,6 @@ class RingWriter:
             start_pos = next_write_pos
         self._ring_data[write_pos:slice_end] = payload
         self.ring.update_live_header(next_write_pos, start_pos, generation, int(last_ts), record_count + 1)
-        self._segment_note_write(last_ts)
         return next_write_pos
 
     def write(self, timestamp: int, record_data: bytes) -> int:
@@ -294,7 +218,6 @@ class RingWriter:
             start_pos = next_write_pos
         self._ring_data[write_pos:slice_end] = record_data
         self.ring.update_live_header(next_write_pos, start_pos, generation, int(timestamp), record_count + 1)
-        self._segment_note_write(timestamp)
         return next_write_pos
 
     write_fast = write
@@ -317,7 +240,6 @@ class RingWriter:
         self._S.pack_into(self._ring_data, write_pos, *vals)
         last_ts_i = int(last_ts)
         self.ring.update_live_header(next_write_pos, start_pos, generation, last_ts_i, record_count + 1)
-        self._segment_note_write(last_ts_i)
         return next_write_pos
 
     def write_tuple(self, record: tuple) -> int:
@@ -388,7 +310,6 @@ class RingWriter:
         last_ts = unpack_from(data, n - rec_sz)[0]
         end_pos = end % ring_size
         self.ring.update_live_header(end_pos, start_pos, generation, last_ts if last_ts else last_ts_prev, new_record_count)
-        self._segment_note_batch(first_ts, last_ts, batch_records)
         return end_pos
 
     def close(self):
@@ -404,8 +325,6 @@ class RingWriter:
                         if int(self._ring_durable_record_count[0]) >= int(self._ring_record_count[0]):
                             break
                         _yield_cpu()
-        if self.segment_store is not None:
-            self.segment_store.close_open_segment("writer_close")
         if self._blob_writers is not None:
             self._blob_writers.close()
             self._blob_writers = None
@@ -424,11 +343,6 @@ class RingWriter:
                 pass
             self._writer_lock_fd = None
 
-    def mark_segment_boundary(self, reason: str = "disconnect") -> bool:
-        if self.segment_store is None:
-            return False
-        return self.segment_store.close_open_segment(reason)
-
 
 class ChunkWriter:
     __slots__ = (
@@ -437,10 +351,9 @@ class ChunkWriter:
         "current_chunk", "current_chunk_metadata", "current_chunk_id",
         "_S", "_rec_size", "_clock_level", "_key_min_set", "_u64", "_qmins", "_qmaxs",
         "_value_fields", "_blob_writers",
-        "segment_store", "_segment_note_write", "_segment_note_batch",
     )
 
-    def __init__(self, base_path, feed_name: str, *, segment_tracking: bool | None = None):
+    def __init__(self, base_path, feed_name: str):
         self.base_path = Path(base_path)
         self.feed_name = feed_name
         self.feed_metadata = load_feed_metadata(self.base_path, feed_name)
@@ -453,7 +366,6 @@ class ChunkWriter:
         self.registry = None
         self.current_chunk = None
         self.current_chunk_metadata = None
-        self.segment_store = None
         self._key_min_set = None
         self._blob_writers = None
 
@@ -469,16 +381,6 @@ class ChunkWriter:
             self._rec_size = self._S.size
             self._clock_level = self.feed_metadata.clock_level
             self._value_fields = tuple(f.name for f in self.record_format.fields if f.name != "_")
-            if bool(self.feed_metadata.segment_tracking if segment_tracking is None else segment_tracking):
-                self.segment_store = SegmentStore(self.data_dir, self.feed_name)
-                self._segment_note_write = self.segment_store.note_write_one
-                self._segment_note_batch = self.segment_store.note_batch
-                if self.segment_store.has_open_segment():
-                    self.segment_store.recover_open_segment(self._latest_level1_timestamp())
-            else:
-                self.segment_store = None
-                self._segment_note_write = _noop_note_write
-                self._segment_note_batch = _noop_note_batch
 
             self._create_new_chunk()
         except Exception:
@@ -498,12 +400,6 @@ class ChunkWriter:
                 except Exception:
                     pass
                 self.registry = None
-            if self.segment_store is not None:
-                try:
-                    self.segment_store.close_open_segment("writer_init_failed")
-                except Exception:
-                    pass
-                self.segment_store = None
             raise
 
     @property
@@ -658,7 +554,6 @@ class ChunkWriter:
         key_count = self._clock_level
         qmins = self._qmins
         qmaxs = self._qmaxs
-        self._segment_note_write(ts0)
         if not key_min_set[0]:
             key_min_set[0] = True
             qmins[0] = ts0
@@ -694,7 +589,6 @@ class ChunkWriter:
         qmins = self._qmins
         qmaxs = self._qmaxs
         ts0 = vals[0]
-        self._segment_note_write(ts0)
         if not key_min_set[0]:
             key_min_set[0] = True
             qmins[0] = ts0
@@ -765,7 +659,6 @@ class ChunkWriter:
         u64 = self._u64
         ts_first = u64.unpack_from(view, 0)[0]
         ts_last = u64.unpack_from(view, data_len - rec_sz)[0]
-        self._segment_note_batch(ts_first, ts_last, data_len // rec_sz)
         if not key_min_set[0]:
             key_min_set[0] = True
             qmins[0] = ts_first
@@ -821,10 +714,3 @@ class ChunkWriter:
                 if self._blob_writers is not None:
                     self._blob_writers.close()
                     self._blob_writers = None
-                if self.segment_store is not None:
-                    self.segment_store.close_open_segment("writer_close")
-
-    def mark_segment_boundary(self, reason: str = "disconnect") -> bool:
-        if self.current_chunk is None or self.segment_store is None:
-            return False
-        return self.segment_store.close_open_segment(reason)

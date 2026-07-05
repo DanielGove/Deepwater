@@ -20,11 +20,10 @@ from .metadata.discovery import (
     feed_metadata,
     feed_dir,
     feed_exists,
+    feed_intervals,
     get_record_format,
     list_feeds,
-    list_segments,
     recommended_train_validation,
-    suggested_reader_range,
 )
 
 
@@ -41,9 +40,8 @@ __all__ = [
     "feed_dir",
     "feed_exists",
     "feed_coverage",
+    "feed_intervals",
     "get_record_format",
     "list_feeds",
-    "list_segments",
     "recommended_train_validation",
-    "suggested_reader_range",
 ]

@@ -472,6 +472,13 @@ class FeedRegistry:
             return None
         return self.get_chunk_metadata(self._chunk_count[0])
 
+    def latest_timestamp(self, qoff: int = 0) -> int:
+        """Return latest initialized timestamp bound for a clock, or 0."""
+        idx = self._last_non_empty_idx(qoff)
+        if idx == 0:
+            return 0
+        return int(self._chunk_end_time(idx, qoff))
+
     def iter_chunks_meta(self) -> Iterator[ChunkMeta]:
         for i in range(1, int(self._chunk_count[0]) + 1):
             yield self.get_chunk_metadata(i)

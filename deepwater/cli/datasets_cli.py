@@ -9,7 +9,7 @@ from pathlib import Path
 
 import orjson
 
-from ..metadata.discovery import feed_exists, list_segments, recommended_train_validation
+from ..metadata.discovery import feed_exists, feed_intervals, recommended_train_validation
 from ..metadata.datasets import common_intervals, with_duration, recommend_train_validation, build_multi_manifest
 from .timefmt import add_ts_fmt_arg, format_timestamp_us, parse_ts_fmt
 
@@ -139,11 +139,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Multi-source mode comma-separated alias:feed refs",
     )
     parser.add_argument(
-        "--status",
-        default="usable",
-        help="Segment status filter (default: usable)",
-    )
-    parser.add_argument(
         "--min-duration-seconds",
         type=float,
         default=0.0,
@@ -213,15 +208,10 @@ def main(argv: list[str] | None = None) -> int:
                 if not feed_exists(p, feed):
                     print(f"ERROR: feed not found: {alias}:{feed}", file=sys.stderr)
                     return 1
-                segs = list_segments(p, feed, status=args.status)
                 intervals = []
-                for seg in segs:
-                    s = seg.get("start_us")
-                    e = seg.get("end_us")
-                    if s is None or e is None:
-                        continue
-                    s_i = int(s)
-                    e_i = int(e)
+                for start, end in feed_intervals(p, feed):
+                    s_i = int(start)
+                    e_i = int(end)
                     if s_i <= e_i:
                         intervals.append((s_i, e_i))
                 interval_sets.append(intervals)
@@ -232,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest = build_multi_manifest(
                 sources=sources,
                 feed_refs=feed_refs,
-                status_filter=args.status,
+                source="chunks",
                 intervals=intervals,
                 recommendation=recommendation,
             )
@@ -256,7 +246,6 @@ def main(argv: list[str] | None = None) -> int:
             manifest = recommended_train_validation(
                 args.base_path,
                 feeds,
-                status=args.status,
                 train_ratio=float(args.train_ratio),
                 min_duration_us=min_duration_us,
             )
@@ -280,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     rec = manifest.get("recommended")
     print(
         f"{display_name}={display_count} "
-        f"status_filter={manifest.get('status_filter')} "
+        f"source={manifest.get('source')} "
         f"common_windows={len(intervals)}"
     )
 

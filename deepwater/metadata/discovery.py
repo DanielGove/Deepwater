@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 from .admin import create_feed as _create_feed
 from .admin import delete_feed as _delete_feed
 from .datasets import build_manifest, common_intervals, recommend_train_validation, with_duration
+from .feed_registry import FeedRegistry, UINT64_MAX
 from .feed_metadata import (
     feed_exists as _feed_exists,
     list_feeds as _list_feeds,
@@ -14,7 +14,6 @@ from .feed_metadata import (
 )
 from .feed_schema import load_schema
 from .global_registry import GlobalRegistry
-from .segments import SegmentStore
 
 from ..network.path import parse_target
 from ..network.protocol import Op
@@ -80,7 +79,6 @@ def _local_describe_feed(base_path, feed_name: str) -> dict:
             "retention_hours": metadata.retention_hours,
             "persist": metadata.persist,
             "ring_size_bytes": metadata.ring_size_bytes,
-            "segment_tracking": metadata.segment_tracking,
             "prefault_ring": metadata.prefault_ring,
             "uses_ring": metadata.uses_ring,
             "storage": "ring" if metadata.uses_ring else "chunk",
@@ -95,25 +93,37 @@ def _local_describe_feed(base_path, feed_name: str) -> dict:
     }
 
 
-def _local_list_segments(base_path, feed_name: str, status: Optional[str] = None):
+def _local_feed_intervals(base_path, feed_name: str) -> list[tuple[int, int]]:
     if not _local_feed_exists(base_path, feed_name):
         raise KeyError(feed_name)
-    store = SegmentStore(feed_dir(base_path, feed_name), feed_name)
-    return store.list_segments(status=status)
-
-
-def _local_suggested_reader_range(base_path, feed_name: str):
-    if not _local_feed_exists(base_path, feed_name):
-        raise KeyError(feed_name)
-    store = SegmentStore(feed_dir(base_path, feed_name), feed_name)
-    return store.suggested_timestamp_range()
+    reg_path = feed_dir(base_path, feed_name) / f"{feed_name}.reg"
+    if not reg_path.exists():
+        return []
+    registry = FeedRegistry(reg_path, mode="r")
+    try:
+        intervals: list[tuple[int, int]] = []
+        latest = int(registry.get_latest_chunk_idx() or 0)
+        for chunk_id in range(1, latest + 1):
+            meta = registry.get_chunk_metadata(chunk_id)
+            if meta is None:
+                continue
+            try:
+                qmin = int(meta.get_qmin(0))
+                qmax = int(meta.get_qmax(0))
+                records = int(meta.num_records)
+            finally:
+                meta.release()
+            if records > 0 and qmin != UINT64_MAX and qmax >= qmin:
+                intervals.append((qmin, qmax))
+        return intervals
+    finally:
+        registry.close()
 
 
 def _local_common_time_windows(
     base_path,
     feed_names: list[str],
     *,
-    status: str = "usable",
     min_duration_us: int = 0,
     merge_touching: bool = True,
 ):
@@ -123,8 +133,7 @@ def _local_common_time_windows(
     for feed_name in feed_names:
         if not _local_feed_exists(base_path, feed_name):
             raise KeyError(feed_name)
-        segs = _local_list_segments(base_path, feed_name, status=status)
-        interval_sets.append([(int(seg["start_us"]), int(seg["end_us"])) for seg in segs])
+        interval_sets.append(_local_feed_intervals(base_path, feed_name))
     return with_duration(
         common_intervals(interval_sets, merge_touching=merge_touching),
         min_duration_us=min_duration_us,
@@ -135,17 +144,16 @@ def _local_recommended_train_validation(
     base_path,
     feed_names: list[str],
     *,
-    status: str = "usable",
     min_duration_us: int = 0,
     train_ratio: float = 0.8,
 ):
     feeds = list(feed_names)
-    intervals = _local_common_time_windows(base_path, feeds, status=status, min_duration_us=min_duration_us)
+    intervals = _local_common_time_windows(base_path, feeds, min_duration_us=min_duration_us)
     recommendation = recommend_train_validation(intervals, train_ratio=train_ratio)
     return build_manifest(
         base_path=str(_base(base_path)),
         feeds=feeds,
-        status_filter=status,
+        source="chunks",
         intervals=intervals,
         recommendation=recommendation,
     )
@@ -201,27 +209,19 @@ def describe_feed(base_path, feed_name: str) -> dict:
     return _local_describe_feed(_base(base_path), feed_name)
 
 
-def list_segments(base_path, feed_name: str, status: str | None = None):
-    remote_value = _with_remote(base_path, lambda remote: remote(Op.LIST_SEGMENTS, feed_name, status))
+def feed_intervals(base_path, feed_name: str):
+    remote_value = _with_remote(base_path, lambda remote: remote(Op.FEED_INTERVALS, feed_name))
     if remote_value is not None:
-        return remote_value
-    return _local_list_segments(_base(base_path), feed_name, status=status)
+        return [tuple(interval) for interval in remote_value]
+    return _local_feed_intervals(_base(base_path), feed_name)
 
 
-def suggested_reader_range(base_path, feed_name: str):
-    remote_value = _with_remote(base_path, lambda remote: remote(Op.SUGGESTED_READER_RANGE, feed_name))
-    if remote_value is not None:
-        return tuple(remote_value) if remote_value is not None else None
-    return _local_suggested_reader_range(_base(base_path), feed_name)
-
-
-def common_time_windows(base_path, feed_names, *, status: str = "usable", min_duration_us: int = 0, merge_touching: bool = True):
+def common_time_windows(base_path, feed_names, *, min_duration_us: int = 0, merge_touching: bool = True):
     remote_value = _with_remote(
         base_path,
         lambda remote: _remote_common_time_windows(
             remote,
             list(feed_names),
-            status=status,
             min_duration_us=min_duration_us,
             merge_touching=merge_touching,
         )
@@ -231,20 +231,18 @@ def common_time_windows(base_path, feed_names, *, status: str = "usable", min_du
     return _local_common_time_windows(
         _base(base_path),
         list(feed_names),
-        status=status,
         min_duration_us=min_duration_us,
         merge_touching=merge_touching,
     )
 
 
-def recommended_train_validation(base_path, feed_names, *, status: str = "usable", min_duration_us: int = 0, train_ratio: float = 0.8):
+def recommended_train_validation(base_path, feed_names, *, min_duration_us: int = 0, train_ratio: float = 0.8):
     remote_value = _with_remote(
         base_path,
         lambda remote: _remote_recommended_train_validation(
             str(base_path),
             remote,
             list(feed_names),
-            status=status,
             min_duration_us=min_duration_us,
             train_ratio=train_ratio,
         ),
@@ -254,7 +252,6 @@ def recommended_train_validation(base_path, feed_names, *, status: str = "usable
     return _local_recommended_train_validation(
         _base(base_path),
         list(feed_names),
-        status=status,
         min_duration_us=min_duration_us,
         train_ratio=train_ratio,
     )
@@ -264,7 +261,6 @@ def _remote_common_time_windows(
     remote,
     feed_names: list[str],
     *,
-    status: str = "usable",
     min_duration_us: int = 0,
     merge_touching: bool = True,
 ):
@@ -274,17 +270,7 @@ def _remote_common_time_windows(
     for feed_name in feed_names:
         if not bool(remote(Op.FEED_EXISTS, feed_name)):
             raise KeyError(feed_name)
-        intervals = []
-        for seg in remote(Op.LIST_SEGMENTS, feed_name, status):
-            start = seg.get("start_us")
-            end = seg.get("end_us")
-            if start is None or end is None:
-                continue
-            start_i = int(start)
-            end_i = int(end)
-            if start_i <= end_i:
-                intervals.append((start_i, end_i))
-        interval_sets.append(intervals)
+        interval_sets.append([tuple(interval) for interval in remote(Op.FEED_INTERVALS, feed_name)])
     return with_duration(
         common_intervals(interval_sets, merge_touching=merge_touching),
         min_duration_us=int(min_duration_us),
@@ -296,21 +282,19 @@ def _remote_recommended_train_validation(
     remote,
     feed_names: list[str],
     *,
-    status: str = "usable",
     min_duration_us: int = 0,
     train_ratio: float = 0.8,
 ):
     intervals = _remote_common_time_windows(
         remote,
         feed_names,
-        status=status,
         min_duration_us=min_duration_us,
     )
     recommendation = recommend_train_validation(intervals, train_ratio=train_ratio)
     return build_manifest(
         base_path=base_path,
         feeds=list(feed_names),
-        status_filter=status,
+        source="chunks",
         intervals=intervals,
         recommendation=recommendation,
     )

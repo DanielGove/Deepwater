@@ -39,8 +39,8 @@ This creates a local `./deepwater-starter` folder with:
 - `configs/feeds.json` (bundle format)
 - `apps/quickstart_app.py` (runnable integration skeleton)
 
-Also includes segmentation guidance so you can quickly answer:
-- what segments exist?
+Also includes dataset-window guidance so you can quickly answer:
+- what durable timestamp windows exist?
 - what timestamp range should be passed to readers/backtests?
 - how to run a Tailscale-scoped remote read agent and connect to it from another machine?
 
@@ -268,14 +268,12 @@ After installation (`pip install -e .`), these commands are available globally:
 - `deepwater-create-feed`
 - `deepwater-delete-feed`
 - `deepwater-feeds`
-- `deepwater-segments`
 - `deepwater-datasets`
 
 Read-only metadata commands accept the same local or remote base path syntax as the Python API:
 
 ```bash
 deepwater-feeds --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node
-deepwater-segments --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --feed trades --status usable
 deepwater-datasets --base-path deepwater-pioneer:/deepwater/data/hyperliquid-node --feed trades --json
 ```
 
@@ -367,33 +365,6 @@ deepwater-feeds --base-path ./data --feed trades
 
 # inspect all feeds in JSON for automation/tools
 deepwater-feeds --base-path ./data --all --json
-```
-
-### Segment Metadata (Automatic)
-
-Writers manage per-feed segments automatically:
-- starts on first write
-- closes on clean writer close
-- can be explicitly split without closing writer using `writer.mark_segment_boundary("disconnect")`
-- crash-open segment is closed on next writer start using last level-1 timestamp
-
-Query segments:
-
-```bash
-deepwater-segments --base-path ./data --feed trades --status usable --suggest-range
-```
-
-Text-mode timestamp fields default to human-readable local time.
-Use `--ts-fmt epoch` for raw microseconds, `--ts-fmt utc` for UTC, or `--ts-fmt America/New_York` for a specific timezone.
-
-Disconnect/reconnect boundary example:
-
-```python
-# websocket disconnected, but process stays alive
-trade_writer.mark_segment_boundary("disconnect")
-book_writer.mark_segment_boundary("disconnect")
-
-# on next write, a new segment starts automatically
 ```
 
 Plan common windows across multiple feeds:

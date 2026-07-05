@@ -39,7 +39,6 @@ class FeedSpec(msgspec.Struct, frozen=True, array_like=True):
     chunk_size_mb: float = 64.0
     ring_size_mb: float | None = None
     retention_hours: int = 0
-    segment_tracking: bool = True
     prefault_ring: bool = True
     aligned: bool = False
     sidecars: tuple[BlobSidecarSpec, ...] = ()
@@ -86,7 +85,6 @@ def feed_spec_from_mapping(spec: FeedSpec | Mapping[str, Any]) -> FeedSpec:
         chunk_size_mb=float(spec.get("chunk_size_mb", 64.0)),
         ring_size_mb=None if spec.get("ring_size_mb") is None else float(spec["ring_size_mb"]),
         retention_hours=int(spec.get("retention_hours", 0)),
-        segment_tracking=bool(spec.get("segment_tracking", True)),
         prefault_ring=bool(spec.get("prefault_ring", True)),
         aligned=bool(spec.get("aligned", False)),
         sidecars=tuple(_sidecar_spec(sidecar) for sidecar in spec.get("sidecars", ())),
@@ -189,7 +187,6 @@ def create_feed(base_path, spec: FeedSpec | Mapping[str, Any]) -> None:
             "retention_hours": spec.retention_hours,
             "persist": persist,
             "ring_size_bytes": ring_size_bytes,
-            "segment_tracking": spec.segment_tracking,
             "prefault_ring": spec.prefault_ring,
             "uses_ring": uses_ring,
         }
@@ -206,7 +203,6 @@ def create_feed(base_path, spec: FeedSpec | Mapping[str, Any]) -> None:
             "retention_hours": spec.retention_hours,
             "storage": "ring" if uses_ring else "chunk",
             "uses_ring": uses_ring,
-            "segment_tracking": spec.segment_tracking,
             "prefault_ring": spec.prefault_ring,
             "aligned": spec.aligned,
             "sidecars": [
