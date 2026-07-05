@@ -8,8 +8,6 @@ import tempfile
 import time
 from pathlib import Path
 
-import pytest
-
 from deepwater import Reader, Writer, create_feed
 from deepwater.metadata.global_registry import GlobalRegistry
 
