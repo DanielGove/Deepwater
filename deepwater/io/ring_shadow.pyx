@@ -4,7 +4,49 @@ from __future__ import annotations
 from cpython.buffer cimport PyBUF_WRITE
 from libc.errno cimport errno
 from libc.stddef cimport size_t
-from libc.stdint cimport intptr_t, uintptr_t
+from libc.stdint cimport intptr_t, uintptr_t, uint64_t
+
+
+cdef extern from *:
+    """
+    #include <stdint.h>
+    static inline uint64_t dw_atomic_load_u64(const uint64_t *p) {
+        return __atomic_load_n(p, __ATOMIC_SEQ_CST);
+    }
+    static inline void dw_atomic_store_u64(uint64_t *p, uint64_t value) {
+        __atomic_store_n(p, value, __ATOMIC_SEQ_CST);
+    }
+    static inline void dw_atomic_fence(void) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    }
+    """
+    uint64_t dw_atomic_load_u64(const uint64_t *p) noexcept
+    void dw_atomic_store_u64(uint64_t *p, uint64_t value) noexcept
+    void dw_atomic_fence() noexcept
+
+
+cdef uint64_t *_atomic_slot(unsigned char[::1] buffer, Py_ssize_t offset) except NULL:
+    if offset < 0 or offset > buffer.shape[0] - 8:
+        raise ValueError("atomic uint64 offset is outside the buffer")
+    if (<uintptr_t>&buffer[offset]) % 8:
+        raise ValueError("atomic uint64 address must be eight-byte aligned")
+    return <uint64_t *>&buffer[offset]
+
+
+def atomic_load_u64(unsigned char[::1] buffer, Py_ssize_t offset):
+    """Sequentially consistent, aligned shared-memory control load."""
+    return dw_atomic_load_u64(_atomic_slot(buffer, offset))
+
+
+def atomic_store_u64(unsigned char[::1] buffer, Py_ssize_t offset, uint64_t value):
+    """Sequentially consistent, aligned shared-memory control store."""
+    dw_atomic_store_u64(_atomic_slot(buffer, offset), value)
+
+
+def atomic_fence():
+    """Order payload memory accesses around shared-memory validity checks."""
+    dw_atomic_fence()
+
 
 
 ctypedef long off_t
@@ -127,6 +169,7 @@ def ensure_shm(str shm_name, Py_ssize_t size, bint create):
         close(fd)
         raise RuntimeError(f"shared memory size mismatch for {shm_name!r}: existing {st.st_size} bytes != expected {size} bytes")
     close(fd)
+    return bool(created)
 
 
 def unlink_shm(str shm_name):

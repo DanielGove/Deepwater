@@ -155,7 +155,8 @@ def test_persister_process_restart_resumes_without_gaps_or_duplicates():
                 _stop_process(proc2)
 
 
-def test_drain_records_overrun_when_durable_cursor_falls_behind_live_window():
+def test_drain_fails_closed_when_durable_cursor_falls_behind_live_window():
+    import pytest
     from deepwater.io.writer.persistent_ring import _drain, _FeedState, _FLUSHED
 
     with tempfile.TemporaryDirectory(prefix="dw-persister-overrun-") as td:
@@ -174,7 +175,10 @@ def test_drain_records_overrun_when_durable_cursor_falls_behind_live_window():
 
             state = _FeedState(base, "events")
             try:
-                assert _drain(base, state) == _FLUSHED
+                with pytest.raises(RuntimeError, match="unpersisted ring records were overwritten"):
+                    _drain(base, state)
+                assert state.failed
+                assert int(writer.ring.durable_record_count[0]) == 0
             finally:
                 state.close()
 

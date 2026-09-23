@@ -65,6 +65,7 @@ def _sidecar_spec(value) -> BlobSidecarSpec:
             chunk_size_mb=float(value.get("chunk_size_mb", 64.0)),
             retention=str(value.get("retention", "follows_parent")),
             storage=str(value.get("storage", "blob_chunks")),
+            ring_size_mb=None if value.get("ring_size_mb") is None else float(value["ring_size_mb"]),
         )
     raise TypeError(f"invalid blob sidecar spec: {value!r}")
 
@@ -212,6 +213,7 @@ def create_feed(base_path, spec: FeedSpec | Mapping[str, Any]) -> None:
                     "chunk_size_mb": sidecar.chunk_size_mb,
                     "retention": sidecar.retention,
                     "storage": sidecar.storage,
+                    "ring_size_mb": sidecar.ring_size_bytes / (1024 * 1024),
                 }
                 for sidecar in sidecars
             ],
@@ -254,10 +256,10 @@ def delete_feed(base_path, feed_name: str, *, missing_ok: bool = False) -> bool:
             finally:
                 os.close(fd)
 
+        RingBuffer.unlink_for_feed(base, feed_name)
+
         if fdir.exists():
             shutil.rmtree(fdir)
-
-        RingBuffer.unlink_for_feed(base, feed_name)
 
         removed = registry.unregister_feed(feed_name)
         return bool(on_disk or removed)

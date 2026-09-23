@@ -36,3 +36,19 @@ Shared fixtures live in `conftest.py`. Tests should use temp dirs, avoid externa
 - New hot-path changes need edge coverage for wraparound, chunk boundaries, malformed metadata, and empty inputs.
 - Blob support is first-class sidecar storage exercised through `Writer.write_blob()` and `Reader.blob*()`.
 - Network tests should remain loopback-only and avoid artificial teardown waits.
+
+For the blob-ring change, rebuild extensions before testing: compiled reader
+modules shadow edited Python sources.
+
+```bash
+python setup.py build_ext --inplace
+python -m pytest -q
+```
+
+`test_blob_ring.py`, `test_index_publication.py`, `test_blob_live_path.py`,
+`test_blob_reader_frontier.py`, `test_blob_publication_contract.py`,
+`test_blob_commit_failures.py`, `test_blob_recovery_integrity.py`, and
+`test_commit_journal.py` cover publication, wrap/reuse, durable ordering and
+recovery. `test_latency_probe.py` covers measurement accounting and isolation.
+Run this suite serially: the temporary shared-memory cleanup fixture assumes
+one pytest runner on the host.

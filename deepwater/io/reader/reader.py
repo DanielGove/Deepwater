@@ -19,7 +19,7 @@ from .traversal import (
     ring_lower_bound,
     ring_raw_batches,
 )
-from ...metadata.feed_registry import EXPIRED, ON_DISK, FeedRegistry
+from ...metadata.feed_registry import EXPIRED, IN_MEMORY, ON_DISK, FeedRegistry
 from ...metadata.feed_metadata import load_feed_metadata
 from ...metadata.feed_schema import load_record_schema_for_feed
 from ...network.path import DEFAULT_PORT, NetworkTarget, parse_target
@@ -152,6 +152,8 @@ class Reader:
             else:
                 self._ring_record_capacity = self._ring.data_size // self._rec_size
 
+        self._ensure_blob_readers()
+
     @property
     def format(self) -> str:
         return self.record_format.fmt
@@ -236,18 +238,23 @@ class Reader:
         if meta is None:
             raise RuntimeError(f"Chunk {chunk_id} metadata not found")
 
-        if meta.status == ON_DISK:
+        status = meta.status
+        if status == ON_DISK:
             chunk_path = self.data_dir / f"chunk_{chunk_id:08d}.bin"
             if not chunk_path.exists():
                 meta.release()
                 raise FileNotFoundError(f"Chunk file missing: {chunk_path}")
             chunk = Chunk.open(str(chunk_path))
-        elif meta.status == EXPIRED:
+        elif status == IN_MEMORY:
+            meta.release()
+            # Prepared index chunks are not in the readable durable prefix.
+            raise FileNotFoundError(f"Chunk {chunk_id} is not published")
+        elif status == EXPIRED:
             meta.release()
             raise RuntimeError(f"Chunk {chunk_id} is expired")
         else:
             meta.release()
-            raise RuntimeError(f"Unknown chunk status {meta.status}")
+            raise RuntimeError(f"Unknown chunk status {status}")
 
         self._chunk_meta = meta
         self._chunk = chunk
@@ -265,12 +272,95 @@ class Reader:
                 continue
             status = meta.status
             meta.release()
-            if status == EXPIRED:
+            if status in (EXPIRED, IN_MEMORY):
                 chunk_id -= 1
                 continue
             self._open_chunk(chunk_id)
             return
         raise RuntimeError(f"Feed '{self.feed_name}' has no available chunks (all expired/deleted)")
+
+    def _visible_chunk_write_pos(self, durable_seq, ring_epoch_tag) -> int:
+        meta = self._chunk_meta
+        write_pos = int(meta.write_pos)
+        if (durable_seq is not None and ring_epoch_tag is not None
+                and int(meta.ring_epoch_tag) == ring_epoch_tag):
+            count = int(meta.num_records)
+            start_seq = int(meta.ring_end_seq) - count
+            if start_seq < 0:
+                raise RuntimeError("invalid committed chunk sequence range")
+            allowed = min(count, max(0, durable_seq - start_seq))
+            write_pos = min(write_pos, allowed * self._rec_size)
+        return write_pos
+
+    def _capture_ring_tail(self, start_time=None, end_time=None, ts_off=0, *, limit=None, from_end=False):
+        """Own the live suffix before reading a potentially slow durable prefix.
+
+        A stable durable acknowledgement prevents the producer from reclaiming
+        these undurable slots during the copy. Chunk metadata is clipped to the
+        same acknowledgement so a commit cannot appear on both read surfaces.
+        """
+        ring = self._ring
+        for _ in range(16):
+            version = ring.write_sequence
+            if version & 1:
+                os.sched_yield()
+                continue
+            durable_seq = int(ring.durable_record_count[0]) if self._persistent else 0
+            record_count = int(ring.record_count[0])
+            earliest_seq = max(0, record_count - self._ring_record_capacity, ring.retained_record_floor)
+            if self._persistent and (durable_seq < earliest_seq or durable_seq > record_count):
+                if ring.write_sequence != version or int(ring.durable_record_count[0]) != durable_seq:
+                    continue
+                raise RuntimeError("live index window no longer covers its durable frontier")
+            start_seq = max(durable_seq, earliest_seq)
+            end_seq = record_count
+            start_pos = (earliest_seq * self._rec_size) % ring.data_size
+            if start_time is not None:
+                start_seq = self._ring_lower_bound(
+                    ring.data, start_pos, earliest_seq, start_seq, end_seq,
+                    int(start_time), ts_off, self._rec_size, ring.data_size,
+                )
+            if end_time is not None:
+                end_seq = self._ring_lower_bound(
+                    ring.data, start_pos, earliest_seq, start_seq, end_seq,
+                    int(end_time), ts_off, self._rec_size, ring.data_size,
+                )
+            if limit is not None:
+                if from_end:
+                    start_seq = max(start_seq, end_seq - limit)
+                else:
+                    end_seq = min(end_seq, start_seq + limit)
+            pos = (start_seq * self._rec_size) % ring.data_size
+            raw = bytes(ring.data[pos:pos + (end_seq - start_seq) * self._rec_size])
+            if ring.write_sequence != version or start_seq < ring.retained_record_floor:
+                continue
+            if self._persistent:
+                if int(ring.durable_record_count[0]) != durable_seq:
+                    continue
+            elif int(ring.record_count[0]) != record_count:
+                continue
+            return durable_seq, record_count, raw
+        raise BlockingIOError("live index changed during repeated snapshot attempts; retry the read")
+
+    def _copy_ring_window(self, start_seq: int, end_seq: int) -> bytes:
+        """Copy fixed rows while the producer's overwrite guard stays stable."""
+        ring = self._ring
+        for _ in range(16):
+            version = ring.write_sequence
+            if version & 1:
+                os.sched_yield()
+                continue
+            record_count = int(ring.record_count[0])
+            floor = max(0, record_count - self._ring_record_capacity, ring.retained_record_floor)
+            if start_seq < floor or end_seq > record_count:
+                if ring.write_sequence != version:
+                    continue
+                raise RuntimeError("reader fell behind the retained index window; resume from durable history")
+            pos = (start_seq * self._rec_size) % ring.data_size
+            raw = bytes(ring.data[pos:pos + (end_seq - start_seq) * self._rec_size])
+            if ring.write_sequence == version and start_seq >= ring.retained_record_floor:
+                return raw
+        raise BlockingIOError("live index changed during repeated copy attempts; retry the read")
 
     def _iter_durable_raw_range(
         self,
@@ -278,6 +368,9 @@ class Reader:
         end_us: Optional[int],
         ts_off: int,
         batch_records: Optional[int],
+        *,
+        durable_seq: int | None = None,
+        ring_epoch_tag: int | None = None,
     ) -> Iterator[memoryview]:
         """Yield owned raw batches from durable chunks for [start_us, end_us)."""
         rec_size = self._rec_size
@@ -296,7 +389,7 @@ class Reader:
             except FileNotFoundError:
                 continue
             buf = self._chunk.buffer
-            write_pos = self._chunk_meta.write_pos
+            write_pos = self._visible_chunk_write_pos(durable_seq, ring_epoch_tag)
             pos = self._chunk_lower_bound(buf, start_us, write_pos, self._rec_size, ts_off)
             end_pos = write_pos if end_us is None else self._chunk_lower_bound(
                 buf, end_us, write_pos, self._rec_size, ts_off
@@ -393,10 +486,8 @@ class Reader:
         if ring is not None:
             record_count = int(ring.record_count[0])
             if record_count > 0 and self._ring_record_capacity > 0:
-                earliest_seq = max(0, record_count - self._ring_record_capacity)
-                seq = record_count - 1
-                pos = (int(ring.start_pos[0]) + ((seq - earliest_seq) * self._rec_size)) % ring.data_size
-                return int.from_bytes(ring.data[pos + ts_off:pos + ts_off + 8], "little")
+                raw = self._copy_ring_window(record_count - 1, record_count)
+                return int.from_bytes(raw[ts_off:ts_off + 8], "little")
 
         if self.feed_registry is None:
             return None
@@ -425,94 +516,48 @@ class Reader:
         return None
 
     def _raw_seq_batches(
-        self,
-        start_pos: int,
-        earliest_seq: int,
-        start_seq: int,
-        end_seq: int,
-        ts_off: int = 0,
-        start_time: Optional[int] = None,
-        end_time: Optional[int] = None,
-        batch_records: int = 50_000,
+        self, start_pos: int, earliest_seq: int, start_seq: int, end_seq: int,
+        ts_off: int = 0, start_time: Optional[int] = None,
+        end_time: Optional[int] = None, batch_records: int = 50_000,
     ):
         if batch_records <= 0:
             raise ValueError("batch_records must be positive")
         if end_seq <= start_seq:
             return
-
+        raw = self._copy_ring_window(start_seq, end_seq)
+        begin, finish = 0, len(raw)
         if start_time is not None:
-            start_seq = self._ring_lower_bound(
-                self._ring.data, start_pos, earliest_seq, start_seq, end_seq,
-                int(start_time), ts_off, self._rec_size, self._ring.data_size,
-            )
+            begin = self._chunk_lower_bound(raw, int(start_time), finish, self._rec_size, ts_off)
         if end_time is not None:
-            end_seq = self._ring_lower_bound(
-                self._ring.data, start_pos, earliest_seq, start_seq, end_seq,
-                int(end_time), ts_off, self._rec_size, self._ring.data_size,
-            )
-        if end_seq <= start_seq:
-            return
-
-        yield from self._ring_raw_batches(
-            self._ring.data,
-            start_pos,
-            earliest_seq,
-            start_seq,
-            end_seq,
-            self._rec_size,
-            self._ring.data_size,
-            int(batch_records),
-        )
+            finish = self._chunk_lower_bound(raw, int(end_time), finish, self._rec_size, ts_off)
+        view = memoryview(raw)
+        batch_bytes = batch_records * self._rec_size
+        for pos in range(begin, finish, batch_bytes):
+            yield view[pos:min(pos + batch_bytes, finish)]
 
     def _stream_ring_raw(
-        self,
-        start_seq: int,
-        ts_off: int = 0,
+        self, start_seq: int, ts_off: int = 0,
         start_time: Optional[int] = None,
     ) -> Iterator[memoryview]:
         ring = self._ring
-        record_count = ring.record_count[0]
-        earliest_seq = max(0, record_count - self._ring_record_capacity)
-        records_read = max(start_seq, earliest_seq)
-        records_read = min(records_read, record_count)
-        start_pos = ring.start_pos[0]
-        if start_time is not None and records_read < record_count:
-            records_read = self._ring_lower_bound(
-                ring.data,
-                start_pos,
-                earliest_seq,
-                records_read,
-                record_count,
-                start_time,
-                ts_off,
-                self._rec_size,
-                ring.data_size,
-            )
-        ring_size = ring.data_size
-        read_pos = (
-            (start_pos + ((records_read - earliest_seq) * self._rec_size)) % ring_size
-            if records_read < record_count
-            else ring.write_pos[0]
-        )
-        data = ring.data
-        rec_sz = self._rec_size
-        ring_record_capacity = self._ring_record_capacity
-
+        records_read = int(start_seq)
         while True:
-            record_count = ring.record_count[0]
-            earliest_live_seq = max(0, record_count - ring_record_capacity)
-            if records_read < earliest_live_seq:
-                records_read = earliest_live_seq
-                read_pos = ring.start_pos[0]
+            record_count = int(ring.record_count[0])
             if records_read >= record_count:
                 os.sched_yield()
                 continue
-            if read_pos == ring_size:
-                read_pos = 0
-            pos = read_pos
-            read_pos += rec_sz
-            records_read += 1
-            yield data[pos:pos + rec_sz]
+            end_seq = min(record_count, records_read + 1024)
+            try:
+                raw = self._copy_ring_window(records_read, end_seq)
+            except BlockingIOError:
+                os.sched_yield()
+                continue
+            records_read = end_seq
+            view = memoryview(raw)
+            for pos in range(0, len(raw), self._rec_size):
+                if start_time is not None and self._u64.unpack_from(raw, pos + ts_off)[0] < start_time:
+                    continue
+                yield view[pos:pos + self._rec_size]
 
     def stream(
         self,
@@ -520,12 +565,7 @@ class Reader:
         format: str = "tuple",
         ts_key: Optional[str] = None,
     ) -> Iterator:
-        """Yield records forever.
-
-        With start=None, streaming begins at the current live head. With start
-        set, persistent feeds replay durable chunks first, then continue from
-        the live ring tail. format is one of tuple, dict, numpy, or raw.
-        """
+        """Yield records, optionally replaying one consistent historical prefix."""
         try:
             ts_off = self._primary_ts_off if ts_key is None else self._ts_offset_by_name[ts_key]
         except KeyError:
@@ -535,26 +575,21 @@ class Reader:
             if self.feed_registry is None or self.feed_registry.get_latest_chunk_idx() is None:
                 return
             raw_records = self._stream_durable_raw(start=start, ts_off=ts_off)
+        elif start is None:
+            raw_records = self._stream_ring_raw(int(self._ring.record_count[0]), ts_off=ts_off)
         else:
-            ring = self._ring
-            if start is None:
-                raw_records = self._stream_ring_raw(ring.record_count[0], ts_off=ts_off)
-            else:
-                durable_seq = ring.durable_record_count[0]
-                durable_last_ts = ring.durable_last_ts[0]
-                if durable_last_ts and start <= durable_last_ts:
-                    rec_size = self._rec_size
-                    for batch in self._iter_durable_raw_range(
-                        start,
-                        durable_last_ts + 1,
-                        ts_off=ts_off,
-                        batch_records=50_000,
-                    ):
-                        data = memoryview(batch).cast("B")
-                        for pos in range(0, data.nbytes, rec_size):
-                            yield format_raw_record(data[pos:pos + rec_size])
-                raw_records = self._stream_ring_raw(durable_seq, ts_off=ts_off, start_time=start)
-
+            durable_seq, record_count, tail = self._capture_ring_tail(start_time=start, ts_off=ts_off)
+            if self.feed_registry is not None:
+                for batch in self._iter_durable_raw_range(
+                    start, None, ts_off=ts_off, batch_records=50_000,
+                    durable_seq=durable_seq, ring_epoch_tag=self._ring.epoch_tag,
+                ):
+                    data = memoryview(batch).cast("B")
+                    for pos in range(0, data.nbytes, self._rec_size):
+                        yield format_raw_record(data[pos:pos + self._rec_size])
+            for pos in range(0, len(tail), self._rec_size):
+                yield format_raw_record(memoryview(tail)[pos:pos + self._rec_size])
+            raw_records = self._stream_ring_raw(record_count, ts_off=ts_off, start_time=start)
         for raw in raw_records:
             yield format_raw_record(raw)
 
@@ -565,82 +600,16 @@ class Reader:
         format: str = "tuple",
         ts_key: Optional[str] = None,
     ) -> list | memoryview | np.ndarray:
-        """Return all records in [start, end).
-
-        Reads durable chunks first, then the live ring tail when present, and
-        formats once from raw record bytes.
-        """
+        """Return owned records in [start, end) across one durable frontier."""
         try:
             ts_off = self._primary_ts_off if ts_key is None else self._ts_offset_by_name[ts_key]
         except KeyError:
             raise ValueError(f"Timestamp key '{ts_key}' not found, options are: {tuple(self._ts_offset_by_name)}") from None
         if end <= start:
             return format_empty_batch(format, self._dtype)
-        ring = self._ring
-        if (
-            ring is not None
-            and (
-                not self._persistent
-                or (ring.durable_record_count[0] > 0 and start > ring.durable_last_ts[0])
-            )
-        ):
-            record_count = ring.record_count[0]
-            durable_seq = ring.durable_record_count[0]
-            earliest_seq = max(0, record_count - self._ring_record_capacity)
-            start_seq = max(durable_seq, earliest_seq)
-            if record_count <= start_seq:
-                return format_empty_batch(format, self._dtype)
-            start_pos = ring.start_pos[0]
-            start_seq = self._ring_lower_bound(
-                ring.data, start_pos, earliest_seq, start_seq, record_count,
-                start, ts_off, self._rec_size, ring.data_size,
-            )
-            end_seq = self._ring_lower_bound(
-                ring.data, start_pos, earliest_seq, start_seq, record_count,
-                end, ts_off, self._rec_size, ring.data_size,
-            )
-            if end_seq <= start_seq:
-                return format_empty_batch(format, self._dtype)
-            pos = (start_pos + ((start_seq - earliest_seq) * self._rec_size)) % ring.data_size
-            byte_len = (end_seq - start_seq) * self._rec_size
-            raw = bytes(ring.data[pos:pos + byte_len])
-            return format_raw_batch(raw, format, self._unpack, self._rec_size, self._field_names, self._dtype)
-
         data = bytearray()
-        if self.feed_registry is not None and self.feed_registry.get_latest_chunk_idx() is not None:
-            for chunk_id in self.feed_registry.get_chunks_in_range(start, end, qoff=ts_off):
-                try:
-                    self._open_chunk(chunk_id)
-                except FileNotFoundError:
-                    continue
-                buf = self._chunk.buffer
-                write_pos = self._chunk_meta.write_pos
-                pos = self._chunk_lower_bound(buf, start, write_pos, self._rec_size, ts_off)
-                end_pos = self._chunk_lower_bound(buf, end, write_pos, self._rec_size, ts_off)
-                if end_pos > pos:
-                    data.extend(buf[pos:end_pos])
-
-        if ring is not None:
-            record_count = ring.record_count[0]
-            durable_seq = ring.durable_record_count[0]
-            if record_count > durable_seq:
-                earliest_seq = max(0, record_count - self._ring_record_capacity)
-                start_seq = max(durable_seq, earliest_seq)
-                if record_count > start_seq:
-                    start_pos = ring.start_pos[0]
-                    start_seq = self._ring_lower_bound(
-                        ring.data, start_pos, earliest_seq, start_seq, record_count,
-                        start, ts_off, self._rec_size, ring.data_size,
-                    )
-                    end_seq = self._ring_lower_bound(
-                        ring.data, start_pos, earliest_seq, start_seq, record_count,
-                        end, ts_off, self._rec_size, ring.data_size,
-                    )
-                    if end_seq > start_seq:
-                        pos = (start_pos + ((start_seq - earliest_seq) * self._rec_size)) % ring.data_size
-                        byte_len = (end_seq - start_seq) * self._rec_size
-                        data.extend(ring.data[pos:pos + byte_len])
-
+        for raw in self._iter_raw_range(start, end, ts_off):
+            data.extend(raw)
         if not data:
             return format_empty_batch(format, self._dtype)
         return format_raw_batch(memoryview(data), format, self._unpack, self._rec_size, self._field_names, self._dtype)
@@ -659,7 +628,7 @@ class Reader:
     def _ensure_blob_readers(self) -> BlobSidecarReaders:
         readers = self._blob_readers
         if readers is None:
-            readers = BlobSidecarReaders(self.base_path, self.feed_name)
+            readers = BlobSidecarReaders(self.base_path, self.feed_name, parent_ring=self._ring, persistent=self._persistent)
             self._blob_readers = readers
             self._sidecars = readers.sidecars
         return readers
@@ -689,14 +658,14 @@ class Reader:
             crc=int(self._row_value(row, fields.crc)),
         )
 
-    def blob(self, row, *, sidecar: str) -> bytes:
+    def blob(self, row, *, sidecar: str, memory_only: bool = False) -> bytes:
         """Read one blob sidecar payload referenced by a formatted index row."""
         readers = self._ensure_blob_readers()
-        return readers[sidecar].read(self.blob_ref(row, sidecar=sidecar))
+        return readers[sidecar].read(self.blob_ref(row, sidecar=sidecar), memory_only=memory_only)
 
-    def blobs(self, rows, *, sidecar: str) -> list[bytes]:
+    def blobs(self, rows, *, sidecar: str, memory_only: bool = False) -> list[bytes]:
         """Read blob sidecar payloads for formatted index rows."""
-        return [self.blob(row, sidecar=sidecar) for row in rows]
+        return [self.blob(row, sidecar=sidecar, memory_only=memory_only) for row in rows]
 
     def range_with_blobs(
         self,
@@ -719,50 +688,25 @@ class Reader:
         ts_off: int,
         batch_records: int = 50_000,
     ) -> Iterator[memoryview]:
-        """Yield raw record batches for [start, end)."""
+        """Yield owned batches without double-reading a concurrent commit."""
         if end <= start:
             return
         if batch_records <= 0:
             raise ValueError("batch_records must be positive")
-
-        if self._ring is None:
-            if self.feed_registry is not None and self.feed_registry.get_latest_chunk_idx() is not None:
-                yield from self._iter_durable_raw_range(
-                    start,
-                    end,
-                    ts_off=ts_off,
-                    batch_records=batch_records,
-                )
-            return
-
-        ring = self._ring
-        durable_seq = ring.durable_record_count[0]
+        durable_seq = ring_epoch_tag = None
+        tail = b""
+        if self._ring is not None:
+            durable_seq, _record_count, tail = self._capture_ring_tail(start, end, ts_off)
+            ring_epoch_tag = self._ring.epoch_tag
         if self.feed_registry is not None and self.feed_registry.get_latest_chunk_idx() is not None:
             yield from self._iter_durable_raw_range(
-                start,
-                end,
-                ts_off=ts_off,
-                batch_records=batch_records,
+                start, end, ts_off=ts_off, batch_records=batch_records,
+                durable_seq=durable_seq, ring_epoch_tag=ring_epoch_tag,
             )
-
-        record_count = ring.record_count[0]
-        if record_count <= durable_seq:
-            return
-
-        earliest_seq = max(0, record_count - self._ring_record_capacity)
-        start_seq = max(durable_seq, earliest_seq)
-        if record_count <= start_seq:
-            return
-        yield from self._raw_seq_batches(
-            ring.start_pos[0],
-            earliest_seq,
-            start_seq,
-            record_count,
-            ts_off=ts_off,
-            start_time=start,
-            end_time=end,
-            batch_records=batch_records,
-        )
+        batch_bytes = batch_records * self._rec_size
+        view = memoryview(tail)
+        for pos in range(0, len(tail), batch_bytes):
+            yield view[pos:pos + batch_bytes]
 
     def range_batches(
         self,
@@ -789,118 +733,79 @@ class Reader:
             yield format_raw_batch(raw, format, self._unpack, self._rec_size, self._field_names, dtype)
 
     def first_after(
-        self,
-        start: int,
-        format: str = "tuple",
-        ts_key: Optional[str] = None,
+        self, start: int, format: str = "tuple", ts_key: Optional[str] = None,
     ):
         """Return the first record with key >= start, or None."""
         try:
             ts_off = self._primary_ts_off if ts_key is None else self._ts_offset_by_name[ts_key]
         except KeyError:
             raise ValueError(f"Timestamp key '{ts_key}' not found, options are: {tuple(self._ts_offset_by_name)}") from None
-        dtype = self._dtype
-
+        durable_seq = ring_epoch_tag = None
+        tail = b""
+        if self._ring is not None:
+            durable_seq, _, tail = self._capture_ring_tail(start_time=start, ts_off=ts_off, limit=1)
+            ring_epoch_tag = self._ring.epoch_tag
         if self.feed_registry is not None:
             for chunk_id in self.feed_registry.get_chunks_after(start, qoff=ts_off):
-                self._open_chunk(chunk_id)
-                pos = self._chunk_lower_bound(
-                    self._chunk.buffer, start, self._chunk_meta.write_pos, self._rec_size, ts_off
-                )
-                if pos < self._chunk_meta.write_pos:
-                    return format_record_at(
-                        self._chunk.buffer, pos, format, self._unpack,
-                        self._rec_size, self._field_names, dtype,
-                    )
-        if self._ring is not None:
-            record_count = self._ring.record_count[0]
-            earliest_seq = max(0, record_count - self._ring_record_capacity)
-            start_seq = max(earliest_seq, self._ring.durable_record_count[0])
-            if record_count > start_seq:
-                start_pos = self._ring.start_pos[0]
-                seq = self._ring_lower_bound(
-                    self._ring.data, start_pos, earliest_seq, start_seq, record_count,
-                    start, ts_off, self._rec_size, self._ring.data_size,
-                )
-                if seq < record_count:
-                    pos = (start_pos + ((seq - earliest_seq) * self._rec_size)) % self._ring.data_size
-                    return format_record_at(
-                        self._ring.data, pos, format, self._unpack,
-                        self._rec_size, self._field_names, dtype,
-                    )
+                try:
+                    self._open_chunk(chunk_id)
+                except FileNotFoundError:
+                    continue
+                write_pos = self._visible_chunk_write_pos(durable_seq, ring_epoch_tag)
+                pos = self._chunk_lower_bound(self._chunk.buffer, start, write_pos, self._rec_size, ts_off)
+                if pos < write_pos:
+                    raw = bytes(self._chunk.buffer[pos:pos + self._rec_size])
+                    return format_record_at(raw, 0, format, self._unpack, self._rec_size, self._field_names, self._dtype)
+        if tail:
+            return format_record_at(tail, 0, format, self._unpack, self._rec_size, self._field_names, self._dtype)
         return None
 
     def first_before(
-        self,
-        ts: int,
-        format: str = "tuple",
-        ts_key: Optional[str] = None,
+        self, ts: int, format: str = "tuple", ts_key: Optional[str] = None,
     ):
         """Return the nearest record at or before ts, or None."""
         try:
             ts_off = self._primary_ts_off if ts_key is None else self._ts_offset_by_name[ts_key]
         except KeyError:
             raise ValueError(f"Timestamp key '{ts_key}' not found, options are: {tuple(self._ts_offset_by_name)}") from None
-        dtype = self._dtype
-
+        durable_seq = ring_epoch_tag = None
         if self._ring is not None:
-            record_count = self._ring.record_count[0]
-            earliest_seq = max(0, record_count - self._ring_record_capacity)
-            start_seq = max(earliest_seq, self._ring.durable_record_count[0])
-            if record_count > start_seq:
-                start_pos = self._ring.start_pos[0]
-                seq = self._ring_lower_bound(
-                    self._ring.data, start_pos, earliest_seq, start_seq, record_count,
-                    ts + 1, ts_off, self._rec_size, self._ring.data_size,
-                ) - 1
-                if seq >= start_seq:
-                    pos = (start_pos + ((seq - earliest_seq) * self._rec_size)) % self._ring.data_size
-                    return format_record_at(
-                        self._ring.data, pos, format, self._unpack,
-                        self._rec_size, self._field_names, dtype,
-                    )
+            durable_seq, _, tail = self._capture_ring_tail(end_time=ts + 1, ts_off=ts_off, limit=1, from_end=True)
+            ring_epoch_tag = self._ring.epoch_tag
+            if tail:
+                return format_record_at(tail, len(tail) - self._rec_size, format, self._unpack, self._rec_size, self._field_names, self._dtype)
         if self.feed_registry is not None:
             for chunk_id in self.feed_registry.get_chunks_in_range_reverse(0, ts, qoff=ts_off):
-                self._open_chunk(chunk_id)
-                pos = self._chunk_lower_bound(
-                    self._chunk.buffer, ts + 1, self._chunk_meta.write_pos, self._rec_size, ts_off
-                ) - self._rec_size
+                try:
+                    self._open_chunk(chunk_id)
+                except FileNotFoundError:
+                    continue
+                write_pos = self._visible_chunk_write_pos(durable_seq, ring_epoch_tag)
+                pos = self._chunk_lower_bound(self._chunk.buffer, ts + 1, write_pos, self._rec_size, ts_off) - self._rec_size
                 if pos >= 0:
-                    return format_record_at(
-                        self._chunk.buffer, pos, format, self._unpack,
-                        self._rec_size, self._field_names, dtype,
-                    )
+                    raw = bytes(self._chunk.buffer[pos:pos + self._rec_size])
+                    return format_record_at(raw, 0, format, self._unpack, self._rec_size, self._field_names, self._dtype)
         return None
-    
+
     def _read_available_ring(self, max_records=None, format: str = "tuple"):
-        dtype = self._dtype
-        ring = self._ring
-        record_count = ring.record_count[0]
+        record_count = int(self._ring.record_count[0])
         tail_seq = self._tail_read_seq
         if tail_seq is None:
             self._tail_read_seq = record_count
-            return format_empty_batch(format, dtype)
+            return format_empty_batch(format, self._dtype)
         if record_count <= tail_seq:
-            return format_empty_batch(format, dtype)
-
-        earliest_seq = max(0, record_count - self._ring_record_capacity)
-        if tail_seq < earliest_seq:
-            tail_seq = earliest_seq
-
+            return format_empty_batch(format, self._dtype)
         end_seq = record_count
         if max_records is not None:
             end_seq = min(end_seq, tail_seq + int(max_records))
         if end_seq <= tail_seq:
-            return format_empty_batch(format, dtype)
-
+            return format_empty_batch(format, self._dtype)
+        try:
+            raw = self._copy_ring_window(tail_seq, end_seq)
+        except BlockingIOError:
+            return format_empty_batch(format, self._dtype)
         self._tail_read_seq = end_seq
-        n_records = end_seq - tail_seq
-        start_pos = ring.start_pos[0]
-        pos = (start_pos + ((tail_seq - earliest_seq) * self._rec_size)) % ring.data_size
-        raw = self._ring_copy_records(
-            ring.data, pos, n_records, self._rec_size, ring.data_size
-        )
-        return format_raw_batch(raw, format, self._unpack, self._rec_size, self._field_names, dtype)
+        return format_raw_batch(raw, format, self._unpack, self._rec_size, self._field_names, self._dtype)
 
     def _read_available_durable(self, max_records=None, format: str = "tuple"):
         dtype = self._dtype
@@ -961,6 +866,9 @@ class Reader:
     def close(self) -> None:
         """Release open chunk, registry, and ring resources."""
         self._close_chunk()
+        if self._blob_readers is not None:
+            self._blob_readers.close()
+            self._blob_readers = None
         if self.feed_registry is not None:
             self.feed_registry.close()
             self.feed_registry = None

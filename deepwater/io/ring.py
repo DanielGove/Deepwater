@@ -2,9 +2,12 @@ import hashlib
 import math
 import os
 import time
+import uuid
 from pathlib import Path
 from multiprocessing import resource_tracker, shared_memory
 from typing import Optional
+
+from .ring_shadow import atomic_load_u64, atomic_store_u64
 
 _DRAIN_REQUEST_FLAG = 1 << 63
 _COUNT_MASK = _DRAIN_REQUEST_FLAG - 1
@@ -70,6 +73,12 @@ class RingBuffer:
         """Remove every shared-memory object owned by a feed ring."""
         from .ring_shadow import unlink_shm
 
+        from ..metadata.sidecar import load_sidecars
+        from .blob_ring import BlobRing
+
+        for sidecar in load_sidecars(base_path, feed_name):
+            BlobRing.unlink(base_path, feed_name, sidecar.name)
+
         for shm_name in ring_buffer_shm_names(base_path, feed_name):
             try:
                 shm = shared_memory.SharedMemory(name=shm_name, create=False)
@@ -131,7 +140,15 @@ class RingBuffer:
                 self.shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
             from .ring_shadow import ensure_shm
 
-            ensure_shm(_ring_data_shm_name(self.shm_name), data_size, True)
+            try:
+                ensure_shm(_ring_data_shm_name(self.shm_name), data_size, self.created)
+            except BaseException:
+                if self.created:
+                    self.shm.unlink()
+                else:
+                    resource_tracker.unregister(self.shm._name, "shared_memory")
+                self.shm.close()
+                raise
         else:
             last_error = None
             for candidate in (self.shm_name, *fallback_names):
@@ -175,6 +192,7 @@ class RingBuffer:
         if self.created:
             self.buf[:self.HEADER_SIZE] = b"\x00" * self.HEADER_SIZE
             self.buf[self._OFF_DATA_SIZE:self._OFF_DATA_SIZE + 8] = int(data_size).to_bytes(8, "little")
+            self.buf[80:96] = uuid.uuid4().bytes
         self._write_pos = self.buf[self._OFF_WRITE_POS:self._OFF_START_POS].cast("Q")
         self._start_pos = self.buf[self._OFF_START_POS:self._OFF_GENERATION].cast("Q")
         self._generation = self.buf[self._OFF_GENERATION:self._OFF_LAST_TS].cast("Q")
@@ -197,6 +215,55 @@ class RingBuffer:
 
         self._shadow_map = map_shadow(self.data_shm_name, 0, self.data_size)
         self.data = self._shadow_map.view
+
+    @property
+    def epoch(self) -> str:
+        value = bytes(self.buf[80:96])
+        if value == bytes(16):
+            raise RuntimeError("legacy ring has no epoch; open its sole writer with the new engine first")
+        return str(uuid.UUID(bytes=value))
+
+    @property
+    def epoch_tag(self) -> int:
+        return int.from_bytes(hashlib.blake2b(uuid.UUID(self.epoch).bytes, digest_size=8).digest(), "little")
+
+    def initialize_epoch(self) -> None:
+        """Upgrade the reserved header area while holding the feed writer lock."""
+        if bytes(self.buf[80:96]) == bytes(16):
+            self.buf[80:96] = uuid.uuid4().bytes
+
+    @property
+    def write_sequence(self) -> int:
+        return atomic_load_u64(self.buf, 96)
+
+    @property
+    def retained_record_floor(self) -> int:
+        return atomic_load_u64(self.buf, 104)
+
+    def begin_write(self, record_count: int, batch_records: int, capacity: int) -> None:
+        sequence = self.write_sequence
+        if sequence & 1:
+            raise RuntimeError("interrupted ring write; reopen the sole writer")
+        atomic_store_u64(self.buf, 96, sequence + 1)
+        atomic_store_u64(self.buf, 104, max(self.retained_record_floor, record_count + batch_records - capacity))
+
+    def end_write(self) -> None:
+        sequence = self.write_sequence
+        if not sequence & 1:
+            raise RuntimeError("no ring write in progress")
+        atomic_store_u64(self.buf, 96, sequence + 1)
+
+    def recover_write(self, record_size: int) -> None:
+        """Reconstruct cursors after a producer interruption, under its lock."""
+        if self.write_sequence & 1:
+            count = int(self._record_count[0])
+            capacity = self.data_size // record_size
+            write_pos = (count * record_size) % self.data_size
+            start_pos = (max(0, count - capacity) * record_size) % self.data_size
+            last_ts = 0 if count <= self.retained_record_floor else int.from_bytes(
+                self.data[((count - 1) * record_size) % self.data_size:((count - 1) * record_size) % self.data_size + 8], "little")
+            self.update_live_header(write_pos, start_pos, int(self._generation[0]), last_ts, count)
+            self.end_write()
 
     @property
     def write_pos(self):
@@ -234,17 +301,10 @@ class RingBuffer:
         self._overrun_count[0] = flag | (int(value) & _COUNT_MASK)
 
     def _header_snapshot(self) -> tuple[int, int, int, int, int, int, int, int, int]:
-        """
-        Return a stable header snapshot.
+        """Best-effort diagnostic counters from consecutive matching reads.
 
-        Live writers update the shared-memory header field-by-field, so a single
-        read can observe a torn mix of old/new values. Readers depend on these
-        values to map sequence numbers into byte offsets; a torn snapshot can
-        point at the wrong slot and decode garbage.
-
-        We avoid that by requiring two consecutive identical snapshots before
-        returning. This is cheap relative to a record decode and dramatically
-        more reliable under concurrent writer activity.
+        Producer and persister counters are independent. This is not a record
+        snapshot: readers must validate write_sequence around owned data copies.
         """
         prev = None
         for _ in range(64):
@@ -287,7 +347,7 @@ class RingBuffer:
         self._start_pos[0] = int(start_pos)
         self._generation[0] = int(generation)
         self._last_ts[0] = int(last_ts)
-        self._record_count[0] = int(record_count)
+        atomic_store_u64(self.buf, self._OFF_RECORD_COUNT, int(record_count))
 
     def update_durable_header(
         self,
@@ -296,8 +356,6 @@ class RingBuffer:
         overrun_count: Optional[int] = None,
         lost_records: Optional[int] = None,
     ) -> None:
-        if durable_record_count is not None:
-            self._durable_record_count[0] = int(durable_record_count)
         if durable_last_ts is not None:
             self._durable_last_ts[0] = int(durable_last_ts)
         if overrun_count is not None:
@@ -305,6 +363,8 @@ class RingBuffer:
             self._overrun_count[0] = flag | (int(overrun_count) & _COUNT_MASK)
         if lost_records is not None:
             self._lost_records[0] = int(lost_records)
+        if durable_record_count is not None:
+            atomic_store_u64(self.buf, self._OFF_DURABLE_RECORD_COUNT, int(durable_record_count))
 
     def drain_requested(self) -> bool:
         return bool(self._overrun_count[0] & _DRAIN_REQUEST_FLAG)

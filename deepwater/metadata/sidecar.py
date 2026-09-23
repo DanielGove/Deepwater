@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+import math
+import os
 
 import msgspec
 
@@ -16,6 +18,7 @@ class BlobSidecarSpec(msgspec.Struct, frozen=True, array_like=True):
     chunk_size_mb: float = 64.0
     retention: str = "follows_parent"
     storage: str = "blob_chunks"
+    ring_size_mb: float | None = None
 
 
 class SidecarRefFields(msgspec.Struct, frozen=True, array_like=True):
@@ -36,6 +39,7 @@ class BlobSidecar(msgspec.Struct, frozen=True, array_like=True):
     retention: str
     storage: str
     ref_fields: SidecarRefFields
+    ring_size_bytes: int = 0
 
 
 class _SidecarFile(msgspec.Struct, frozen=True, array_like=True):
@@ -99,13 +103,19 @@ def build_sidecars(specs: tuple[BlobSidecarSpec, ...]) -> Sidecars:
     names: set[str] = set()
     items: list[BlobSidecar] = []
     for spec in specs:
-        if not spec.name:
+        if not spec.name or spec.name in {".", ".."} or any(c in spec.name for c in "/\\\0"):
             raise ValueError("blob sidecar name is required")
         if spec.name in names:
             raise ValueError(f"duplicate blob sidecar: {spec.name!r}")
         if spec.storage != "blob_chunks":
             raise ValueError("blob sidecar storage must be 'blob_chunks'")
         names.add(spec.name)
+        chunk_bytes = _chunk_size_bytes(spec.chunk_size_mb)
+        requested = 2 * chunk_bytes if spec.ring_size_mb is None else int(spec.ring_size_mb * 1024 * 1024)
+        if requested < 2 * chunk_bytes:
+            raise ValueError("blob ring must hold at least two payload chunks")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        ring_bytes = math.ceil(requested / page_size) * page_size
         items.append(
             BlobSidecar(
                 name=spec.name,
@@ -115,6 +125,7 @@ def build_sidecars(specs: tuple[BlobSidecarSpec, ...]) -> Sidecars:
                 retention=spec.retention,
                 storage=spec.storage,
                 ref_fields=_ref_fields(spec.name),
+                ring_size_bytes=ring_bytes,
             )
         )
     return Sidecars(tuple(items))

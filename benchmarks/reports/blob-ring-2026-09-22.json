@@ -1,0 +1,1112 @@
+[
+  {
+    "kind": "baseline",
+    "pair": 1,
+    "started_utc": "2026-09-23T00:06:01Z",
+    "workload": {
+      "samples": 1000,
+      "warmup": 100,
+      "rate": 1000,
+      "payload_bytes": 256,
+      "ring_kib": 64,
+      "writer_cpu": 2,
+      "reader_cpu": 3
+    },
+    "environment": {
+      "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+      "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.39",
+      "affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "filesystem": {
+        "mount": "/",
+        "type": "ext4",
+        "device": "/dev/nvme0n1p1"
+      },
+      "load_average": [
+        3.564453125,
+        2.78662109375,
+        2.33203125
+      ]
+    },
+    "code": {
+      "commit": "e2e643b55903a81ea287e6b77b02706bf37ab857",
+      "source_sha256": "42ec4a5dd5652d4a7d83345de718305df7dacc428cf8a0a8a4f69e717735b7b1",
+      "native_modules": {
+        "deepwater.io.ring_shadow": {
+          "file": "ring_shadow.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "a42160a674b2539fd9ffdb5489f0eabcc1590dbc64b1e1104805ec35420f3313"
+        },
+        "deepwater.io.reader.traversal": {
+          "file": "traversal.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "6b92441faf85ef278bbcb20f9f38f91cf94fcf0f1d872a54b0ced3e548dbd34e"
+        },
+        "deepwater.io.reader.reader": {
+          "file": "reader.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "41b495fb36a1f51503159ab2e1586dfddb1f0b023227bf5f919e93f52c9a69e4"
+        }
+      },
+      "probe_sha256": "47ce1e285125feb53b1e424292b41e0de56fa8ea71a88c71e1421faa88b9241b"
+    },
+    "cases": [
+      {
+        "mode": "inline",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 2.432881,
+            "p50_us": 1.843,
+            "p95_us": 4.699,
+            "p99_us": 7.264,
+            "max_us": 80.863
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 99.930021,
+            "p50_us": 53.792,
+            "p95_us": 64.262,
+            "p99_us": 1896.079,
+            "max_us": 2898.896
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 265.416261,
+            "p50_us": 108.761,
+            "p95_us": 1948.809,
+            "p99_us": 3006.867,
+            "max_us": 3949.011
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 165.48623999999998,
+            "p50_us": 54.741,
+            "p95_us": 954.775,
+            "p99_us": 2944.864,
+            "max_us": 2964.79
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 17574,
+          "delivery_ns": 63831,
+          "scheduled_delivery_ns": 69311,
+          "producer_lateness_ns": 5480
+        },
+        "writer_open_us": 1234.226,
+        "final_index_drain_us": 1066.559,
+        "ring_bytes": 135168,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      },
+      {
+        "mode": "blob",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 15.433736999999999,
+            "p50_us": 13.305,
+            "p95_us": 25.378,
+            "p99_us": 30.818,
+            "max_us": 130.667
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 119.14537,
+            "p50_us": 77.096,
+            "p95_us": 126.84,
+            "p99_us": 1791.261,
+            "max_us": 3001.852
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 259.103323,
+            "p50_us": 132.331,
+            "p95_us": 1151.021,
+            "p99_us": 3056.787,
+            "max_us": 3413.437
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 139.957953,
+            "p50_us": 55.175,
+            "p95_us": 280.771,
+            "p99_us": 2865.665,
+            "max_us": 2994.089
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 747895,
+          "delivery_ns": 1261307,
+          "scheduled_delivery_ns": 1268350,
+          "producer_lateness_ns": 7043
+        },
+        "writer_open_us": 1189.001,
+        "final_index_drain_us": 1066.489,
+        "ring_bytes": 65536,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      }
+    ]
+  },
+  {
+    "kind": "current",
+    "pair": 1,
+    "started_utc": "2026-09-23T00:16:02Z",
+    "workload": {
+      "samples": 1000,
+      "warmup": 100,
+      "rate": 1000,
+      "payload_bytes": 256,
+      "ring_kib": 64,
+      "writer_cpu": 2,
+      "reader_cpu": 3
+    },
+    "environment": {
+      "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+      "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.39",
+      "affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "filesystem": {
+        "mount": "/",
+        "type": "ext4",
+        "device": "/dev/nvme0n1p1"
+      },
+      "load_average": [
+        2.73486328125,
+        2.63330078125,
+        2.38916015625
+      ]
+    },
+    "code": {
+      "commit": "e2e643b55903a81ea287e6b77b02706bf37ab857",
+      "source_sha256": "3faf4011c785bda50b632128e7bd927ff0df612da45f158d15c93fc2b6efe71c",
+      "native_modules": {
+        "deepwater.io.ring_shadow": {
+          "file": "ring_shadow.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "81c1ad4edf1c0f991dbc930859726ddf8aa8f87ad30e556ccd82ba95a02fb000"
+        },
+        "deepwater.io.reader.traversal": {
+          "file": "traversal.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "530c91a23b4b7459fa30ec2c14204a6ebed771e5526f1562284c989f8646d17a"
+        },
+        "deepwater.io.reader.reader": {
+          "file": "reader.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "daf37a4f6e5ab847b8982ba882ce745a469f57b60686ffa47195e6544c970606"
+        }
+      },
+      "probe_sha256": "47ce1e285125feb53b1e424292b41e0de56fa8ea71a88c71e1421faa88b9241b"
+    },
+    "cases": [
+      {
+        "mode": "inline",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 4.438013,
+            "p50_us": 3.898,
+            "p95_us": 7.314,
+            "p99_us": 9.358,
+            "max_us": 12.593
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 148.842269,
+            "p50_us": 50.466,
+            "p95_us": 939.327,
+            "p99_us": 996.817,
+            "max_us": 4331.72
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 269.72496,
+            "p50_us": 105.299,
+            "p95_us": 1003.431,
+            "p99_us": 3060.489,
+            "max_us": 4996.872
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 120.88269100000001,
+            "p50_us": 54.715,
+            "p95_us": 57.009,
+            "p99_us": 2749.927,
+            "max_us": 3740.689
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 33252,
+          "delivery_ns": 1008008,
+          "scheduled_delivery_ns": 1013358,
+          "producer_lateness_ns": 5350
+        },
+        "writer_open_us": 1074.173,
+        "final_index_drain_us": 4237.351,
+        "ring_bytes": 135168,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      },
+      {
+        "mode": "blob",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 22.528963,
+            "p50_us": 20.239,
+            "p95_us": 33.113,
+            "p99_us": 39.926,
+            "max_us": 84.029
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 86.68509399999999,
+            "p50_us": 64.121,
+            "p95_us": 86.053,
+            "p99_us": 447.818,
+            "max_us": 3025.547
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 179.848872,
+            "p50_us": 110.202,
+            "p95_us": 138.6,
+            "p99_us": 2157.684,
+            "max_us": 3139.431
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 93.16377800000001,
+            "p50_us": 45.935,
+            "p95_us": 55.078,
+            "p99_us": 2085.528,
+            "max_us": 3048.318
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 117062,
+          "delivery_ns": 201341,
+          "scheduled_delivery_ns": 207994,
+          "producer_lateness_ns": 6653
+        },
+        "writer_open_us": 1354.354,
+        "final_index_drain_us": 4235.978,
+        "ring_bytes": 65536,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      }
+    ]
+  },
+  {
+    "kind": "baseline",
+    "pair": 2,
+    "started_utc": "2026-09-23T00:16:05Z",
+    "workload": {
+      "samples": 1000,
+      "warmup": 100,
+      "rate": 1000,
+      "payload_bytes": 256,
+      "ring_kib": 64,
+      "writer_cpu": 2,
+      "reader_cpu": 3
+    },
+    "environment": {
+      "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+      "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.39",
+      "affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "filesystem": {
+        "mount": "/",
+        "type": "ext4",
+        "device": "/dev/nvme0n1p1"
+      },
+      "load_average": [
+        2.595703125,
+        2.60595703125,
+        2.38134765625
+      ]
+    },
+    "code": {
+      "commit": "e2e643b55903a81ea287e6b77b02706bf37ab857",
+      "source_sha256": "42ec4a5dd5652d4a7d83345de718305df7dacc428cf8a0a8a4f69e717735b7b1",
+      "native_modules": {
+        "deepwater.io.ring_shadow": {
+          "file": "ring_shadow.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "a42160a674b2539fd9ffdb5489f0eabcc1590dbc64b1e1104805ec35420f3313"
+        },
+        "deepwater.io.reader.traversal": {
+          "file": "traversal.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "6b92441faf85ef278bbcb20f9f38f91cf94fcf0f1d872a54b0ced3e548dbd34e"
+        },
+        "deepwater.io.reader.reader": {
+          "file": "reader.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "41b495fb36a1f51503159ab2e1586dfddb1f0b023227bf5f919e93f52c9a69e4"
+        }
+      },
+      "probe_sha256": "47ce1e285125feb53b1e424292b41e0de56fa8ea71a88c71e1421faa88b9241b"
+    },
+    "cases": [
+      {
+        "mode": "inline",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 2.297027,
+            "p50_us": 1.703,
+            "p95_us": 4.318,
+            "p99_us": 7.103,
+            "max_us": 48.992
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 65.373363,
+            "p50_us": 37.662,
+            "p95_us": 54.002,
+            "p99_us": 999.842,
+            "max_us": 2938.322
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 176.73134299999998,
+            "p50_us": 92.364,
+            "p95_us": 115.855,
+            "p99_us": 2992.836,
+            "max_us": 3991.534
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 111.35798,
+            "p50_us": 54.653,
+            "p95_us": 57.148,
+            "p99_us": 2024.171,
+            "max_us": 3006.199
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 17423,
+          "delivery_ns": 1989376,
+          "scheduled_delivery_ns": 1995708,
+          "producer_lateness_ns": 6332
+        },
+        "writer_open_us": 1320.559,
+        "final_index_drain_us": 1069.926,
+        "ring_bytes": 135168,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      },
+      {
+        "mode": "blob",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 15.273652,
+            "p50_us": 13.676,
+            "p95_us": 22.553,
+            "p99_us": 26.49,
+            "max_us": 67.277
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 135.57369599999998,
+            "p50_us": 87.586,
+            "p95_us": 141.939,
+            "p99_us": 2216.085,
+            "max_us": 3203.124
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 268.877766,
+            "p50_us": 143.044,
+            "p95_us": 1340.67,
+            "p99_us": 3247.53,
+            "max_us": 3318.696
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 133.30407,
+            "p50_us": 55.232,
+            "p95_us": 234.375,
+            "p99_us": 2215.333,
+            "max_us": 3209.095
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 680448,
+          "delivery_ns": 1164895,
+          "scheduled_delivery_ns": 1171477,
+          "producer_lateness_ns": 6582
+        },
+        "writer_open_us": 1298.178,
+        "final_index_drain_us": 1064.865,
+        "ring_bytes": 65536,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      }
+    ]
+  },
+  {
+    "kind": "current",
+    "pair": 2,
+    "started_utc": "2026-09-23T00:16:08Z",
+    "workload": {
+      "samples": 1000,
+      "warmup": 100,
+      "rate": 1000,
+      "payload_bytes": 256,
+      "ring_kib": 64,
+      "writer_cpu": 2,
+      "reader_cpu": 3
+    },
+    "environment": {
+      "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+      "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.39",
+      "affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "filesystem": {
+        "mount": "/",
+        "type": "ext4",
+        "device": "/dev/nvme0n1p1"
+      },
+      "load_average": [
+        2.4677734375,
+        2.5791015625,
+        2.37353515625
+      ]
+    },
+    "code": {
+      "commit": "e2e643b55903a81ea287e6b77b02706bf37ab857",
+      "source_sha256": "3faf4011c785bda50b632128e7bd927ff0df612da45f158d15c93fc2b6efe71c",
+      "native_modules": {
+        "deepwater.io.ring_shadow": {
+          "file": "ring_shadow.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "81c1ad4edf1c0f991dbc930859726ddf8aa8f87ad30e556ccd82ba95a02fb000"
+        },
+        "deepwater.io.reader.traversal": {
+          "file": "traversal.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "530c91a23b4b7459fa30ec2c14204a6ebed771e5526f1562284c989f8646d17a"
+        },
+        "deepwater.io.reader.reader": {
+          "file": "reader.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "daf37a4f6e5ab847b8982ba882ce745a469f57b60686ffa47195e6544c970606"
+        }
+      },
+      "probe_sha256": "47ce1e285125feb53b1e424292b41e0de56fa8ea71a88c71e1421faa88b9241b"
+    },
+    "cases": [
+      {
+        "mode": "inline",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 4.949569,
+            "p50_us": 4.047,
+            "p95_us": 8.967,
+            "p99_us": 11.441,
+            "max_us": 26.14
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 76.816867,
+            "p50_us": 63.531,
+            "p95_us": 70.473,
+            "p99_us": 274.289,
+            "max_us": 2959.071
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 225.13032199999998,
+            "p50_us": 120.41,
+            "p95_us": 1066.773,
+            "p99_us": 3058.237,
+            "max_us": 3190.26
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 148.31345499999998,
+            "p50_us": 54.775,
+            "p95_us": 561.408,
+            "p99_us": 2992.984,
+            "max_us": 3004.791
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 33824,
+          "delivery_ns": 60464,
+          "scheduled_delivery_ns": 68149,
+          "producer_lateness_ns": 7685
+        },
+        "writer_open_us": 1091.356,
+        "final_index_drain_us": 4238.784,
+        "ring_bytes": 135168,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      },
+      {
+        "mode": "blob",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 25.333108,
+            "p50_us": 21.961,
+            "p95_us": 39.635,
+            "p99_us": 45.186,
+            "max_us": 89.65
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 104.65630499999999,
+            "p50_us": 66.406,
+            "p95_us": 85.252,
+            "p99_us": 1970.33,
+            "max_us": 3024.415
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 245.460232,
+            "p50_us": 124.172,
+            "p95_us": 1091.43,
+            "p99_us": 3078.541,
+            "max_us": 6021.615
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 140.803927,
+            "p50_us": 55.219,
+            "p95_us": 96.337,
+            "p99_us": 2995.133,
+            "max_us": 2999.335
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 117392,
+          "delivery_ns": 208454,
+          "scheduled_delivery_ns": 214836,
+          "producer_lateness_ns": 6382
+        },
+        "writer_open_us": 1759.07,
+        "final_index_drain_us": 5298.029,
+        "ring_bytes": 65536,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      }
+    ]
+  },
+  {
+    "kind": "baseline",
+    "pair": 3,
+    "started_utc": "2026-09-23T00:16:12Z",
+    "workload": {
+      "samples": 1000,
+      "warmup": 100,
+      "rate": 1000,
+      "payload_bytes": 256,
+      "ring_kib": 64,
+      "writer_cpu": 2,
+      "reader_cpu": 3
+    },
+    "environment": {
+      "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+      "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.39",
+      "affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "filesystem": {
+        "mount": "/",
+        "type": "ext4",
+        "device": "/dev/nvme0n1p1"
+      },
+      "load_average": [
+        2.4677734375,
+        2.5791015625,
+        2.37353515625
+      ]
+    },
+    "code": {
+      "commit": "e2e643b55903a81ea287e6b77b02706bf37ab857",
+      "source_sha256": "42ec4a5dd5652d4a7d83345de718305df7dacc428cf8a0a8a4f69e717735b7b1",
+      "native_modules": {
+        "deepwater.io.ring_shadow": {
+          "file": "ring_shadow.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "a42160a674b2539fd9ffdb5489f0eabcc1590dbc64b1e1104805ec35420f3313"
+        },
+        "deepwater.io.reader.traversal": {
+          "file": "traversal.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "6b92441faf85ef278bbcb20f9f38f91cf94fcf0f1d872a54b0ced3e548dbd34e"
+        },
+        "deepwater.io.reader.reader": {
+          "file": "reader.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "41b495fb36a1f51503159ab2e1586dfddb1f0b023227bf5f919e93f52c9a69e4"
+        }
+      },
+      "probe_sha256": "47ce1e285125feb53b1e424292b41e0de56fa8ea71a88c71e1421faa88b9241b"
+    },
+    "cases": [
+      {
+        "mode": "inline",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 2.335852,
+            "p50_us": 1.773,
+            "p95_us": 4.849,
+            "p99_us": 7.003,
+            "max_us": 47.811
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 126.414108,
+            "p50_us": 43.252,
+            "p95_us": 517.089,
+            "p99_us": 2084.105,
+            "max_us": 2942.981
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 262.166121,
+            "p50_us": 98.156,
+            "p95_us": 1675.498,
+            "p99_us": 2999.163,
+            "max_us": 3995.254
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 135.752013,
+            "p50_us": 54.74,
+            "p95_us": 216.703,
+            "p99_us": 2385.845,
+            "max_us": 3006.217
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 18585,
+          "delivery_ns": 1056270,
+          "scheduled_delivery_ns": 1062832,
+          "producer_lateness_ns": 6562
+        },
+        "writer_open_us": 1340.557,
+        "final_index_drain_us": 1067.992,
+        "ring_bytes": 135168,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      },
+      {
+        "mode": "blob",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 18.950415,
+            "p50_us": 18.465,
+            "p95_us": 27.121,
+            "p99_us": 30.869,
+            "max_us": 68.94
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 156.304508,
+            "p50_us": 88.708,
+            "p95_us": 164.592,
+            "p99_us": 2931.95,
+            "max_us": 3134.895
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 285.20371500000005,
+            "p50_us": 147.058,
+            "p95_us": 1188.285,
+            "p99_us": 3102.1,
+            "max_us": 6057.729
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 128.899207,
+            "p50_us": 56.71,
+            "p95_us": 87.686,
+            "p99_us": 2096.607,
+            "max_us": 2990.831
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 747134,
+          "delivery_ns": 1248413,
+          "scheduled_delivery_ns": 1258262,
+          "producer_lateness_ns": 9849
+        },
+        "writer_open_us": 1499.519,
+        "final_index_drain_us": 1080.555,
+        "ring_bytes": 65536,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      }
+    ]
+  },
+  {
+    "kind": "current",
+    "pair": 3,
+    "started_utc": "2026-09-23T00:16:15Z",
+    "workload": {
+      "samples": 1000,
+      "warmup": 100,
+      "rate": 1000,
+      "payload_bytes": 256,
+      "ring_kib": 64,
+      "writer_cpu": 2,
+      "reader_cpu": 3
+    },
+    "environment": {
+      "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+      "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.39",
+      "affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "filesystem": {
+        "mount": "/",
+        "type": "ext4",
+        "device": "/dev/nvme0n1p1"
+      },
+      "load_average": [
+        2.35009765625,
+        2.552734375,
+        2.36572265625
+      ]
+    },
+    "code": {
+      "commit": "e2e643b55903a81ea287e6b77b02706bf37ab857",
+      "source_sha256": "3faf4011c785bda50b632128e7bd927ff0df612da45f158d15c93fc2b6efe71c",
+      "native_modules": {
+        "deepwater.io.ring_shadow": {
+          "file": "ring_shadow.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "81c1ad4edf1c0f991dbc930859726ddf8aa8f87ad30e556ccd82ba95a02fb000"
+        },
+        "deepwater.io.reader.traversal": {
+          "file": "traversal.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "530c91a23b4b7459fa30ec2c14204a6ebed771e5526f1562284c989f8646d17a"
+        },
+        "deepwater.io.reader.reader": {
+          "file": "reader.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "daf37a4f6e5ab847b8982ba882ce745a469f57b60686ffa47195e6544c970606"
+        }
+      },
+      "probe_sha256": "47ce1e285125feb53b1e424292b41e0de56fa8ea71a88c71e1421faa88b9241b"
+    },
+    "cases": [
+      {
+        "mode": "inline",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 4.927755,
+            "p50_us": 4.118,
+            "p95_us": 9.028,
+            "p99_us": 11.653,
+            "max_us": 15.449
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 88.16931100000001,
+            "p50_us": 64.462,
+            "p95_us": 70.554,
+            "p99_us": 1893.745,
+            "max_us": 2956.717
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 224.16448,
+            "p50_us": 119.614,
+            "p95_us": 1016.187,
+            "p99_us": 3008.524,
+            "max_us": 5010.069
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 135.995169,
+            "p50_us": 54.915,
+            "p95_us": 279.48,
+            "p99_us": 2261.797,
+            "max_us": 3021.636
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 35758,
+          "delivery_ns": 68540,
+          "scheduled_delivery_ns": 75142,
+          "producer_lateness_ns": 6602
+        },
+        "writer_open_us": 1008.419,
+        "final_index_drain_us": 4238.914,
+        "ring_bytes": 135168,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      },
+      {
+        "mode": "blob",
+        "summary": {
+          "write_call": {
+            "count": 1000,
+            "mean_us": 23.991772,
+            "p50_us": 21.17,
+            "p95_us": 38.252,
+            "p99_us": 43.843,
+            "max_us": 88.658
+          },
+          "delivery": {
+            "count": 1000,
+            "mean_us": 131.07041,
+            "p50_us": 75.052,
+            "p95_us": 101.542,
+            "p99_us": 2400.213,
+            "max_us": 3386.3
+          },
+          "scheduled_delivery": {
+            "count": 1000,
+            "mean_us": 266.701113,
+            "p50_us": 130.674,
+            "p95_us": 1463.492,
+            "p99_us": 3463.538,
+            "max_us": 5444.572
+          },
+          "producer_lateness": {
+            "count": 1000,
+            "mean_us": 135.630703,
+            "p50_us": 55.126,
+            "p95_us": 323.665,
+            "p99_us": 2438.353,
+            "max_us": 3419.619
+          }
+        },
+        "first_record": {
+          "sequence": 0,
+          "write_call_ns": 115128,
+          "delivery_ns": 202995,
+          "scheduled_delivery_ns": 209958,
+          "producer_lateness_ns": 6963
+        },
+        "writer_open_us": 1644.954,
+        "final_index_drain_us": 5306.184,
+        "ring_bytes": 65536,
+        "index_durable_before_final_drain": 1024,
+        "index_durable_count": 1100,
+        "overrun_count": 0,
+        "lost_records": 0
+      }
+    ]
+  }
+]

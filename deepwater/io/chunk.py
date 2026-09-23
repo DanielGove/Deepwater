@@ -47,13 +47,21 @@ class Chunk:
 
     def close_file(self):
         self.buffer.release()
-        mm = self.closeables[0]
-        fd = self.closeables[1]
-        if not self.read_only:
-            mm.flush()
-            os.fsync(fd)
-        mm.close()
-        os.close(fd)
+        mm, fd = self.closeables
+        if mm is None:
+            return
+        # Cleanup is also required when flush/fsync fails; a later abort must
+        # never close a descriptor number which the OS has already reused.
+        self.closeables = [None, None]
+        try:
+            if not self.read_only:
+                mm.flush()
+                os.fsync(fd)
+        finally:
+            try:
+                mm.close()
+            finally:
+                os.close(fd)
 
     def close(self):
         if self.is_shm:
