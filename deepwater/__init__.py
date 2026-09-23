@@ -10,6 +10,7 @@ except PackageNotFoundError:
     __version__ = "0+unknown"
 
 from .io import Reader, Writer
+from .io.blob_ring import PayloadUnavailable
 from .metadata.catalog import catalog, feed_coverage
 from .metadata.discovery import (
     codec,
@@ -30,6 +31,7 @@ from .metadata.discovery import (
 __all__ = [
     "Reader",
     "Writer",
+    "PayloadUnavailable",
     "catalog",
     "codec",
     "common_time_windows",

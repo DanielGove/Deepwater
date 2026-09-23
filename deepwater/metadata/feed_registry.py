@@ -23,7 +23,8 @@ from typing import Iterator, Optional
 # 88  q1_max          Q
 # 96  q2_min          Q
 # 104 q2_max          Q
-# 112 pad             16x
+# 112 ring_end_seq    Q  (persistent-ring batches; zero for legacy/direct chunks)
+# 120 ring_epoch_tag  Q
 CHUNK_STRUCT = struct.Struct("<QQQQQQQBB6xQQQQQQ16x")
 HEADER_STRUCT = struct.Struct("<Q120x")  # chunk_count + padding = 128 bytes
 
@@ -148,6 +149,22 @@ class ChunkMeta:
         self._qmins[idx] = min_v
         self._qmaxs[idx] = max_v
 
+    @property
+    def ring_end_seq(self) -> int:
+        return int.from_bytes(self._mv[112:120], "little")
+
+    @ring_end_seq.setter
+    def ring_end_seq(self, value: int) -> None:
+        self._mv[112:120] = int(value).to_bytes(8, "little")
+
+    @property
+    def ring_epoch_tag(self) -> int:
+        return int.from_bytes(self._mv[120:128], "little")
+
+    @ring_epoch_tag.setter
+    def ring_epoch_tag(self, value: int) -> None:
+        self._mv[120:128] = int(value).to_bytes(8, "little")
+
     # Optional helpers
     def as_tuple(self) -> tuple[int,int,int,int,int]:
         return (self.start_time, self.end_time, self.chunk_id, self.size, self.status)
@@ -254,19 +271,19 @@ class FeedRegistry:
         if self._mv is not None:
             self._mv.release()
             self._mv = None
-        if self.mm is not None:
-            self.flush()
-            self.mm.close()
-            self.mm = None
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-        except Exception:
-            pass
-        try:
-            os.close(self.fd)
-        except Exception:
-            pass
-        self.fd = None
+            if self.mm is not None:
+                try:
+                    self.flush()
+                finally:
+                    self.mm.close()
+                    self.mm = None
+        finally:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
 
     def flush(self) -> None:
         self.mm.flush()

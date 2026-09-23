@@ -119,7 +119,8 @@ create_feed(base, FeedSpec(
     clock_level=1,
     persist=True,
     uses_ring=True,
-    sidecars=(BlobSidecarSpec(name="snapshot", codec="msgpack"),),
+    sidecars=(BlobSidecarSpec(name="snapshot", codec="msgpack",
+                              chunk_size_mb=4, ring_size_mb=16),),
 ))
 
 payload = msgspec.msgpack.encode({"bids": [[100.0, 2.0]], "asks": [[101.0, 1.5]]})
@@ -132,6 +133,21 @@ with Reader(base, "book_snapshots") as reader:
     assert reader.blob_ref(row, sidecar="snapshot") == ref
     assert reader.blob(row, sidecar="snapshot") == payload
 ```
+
+For ring-backed feeds, both the index and live payload bytes are published in
+shared memory. The persister saves payloads before acknowledging their index
+rows. `ring_size_mb` on the sidecar bounds payload memory separately from the
+index ring; persistent writers wait when either buffer fills.
+
+`reader.blob(row, sidecar="snapshot", memory_only=True)` requires a retained
+memory copy and raises `PayloadUnavailable` after expiration. The default reads
+memory first and uses durable files for evicted persisted payloads. Direct chunk
+feeds continue writing sidecars to files. Additional index columns can be set
+with `writer.write_blob(..., index_values={"block_number": 123})`.
+
+See the [storage contract](.agents/blob-ring.md) for commit/recovery and upgrade
+requirements, and the [latency probe](benchmarks/README.md) for iteration checks.
+
 
 ---
 
