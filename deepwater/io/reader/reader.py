@@ -773,8 +773,20 @@ class Reader:
         format: str = "tuple",
         ts_key: Optional[str] = None,
         batch_records: int = 50_000,
+        *,
+        durable_only: bool = False,
+        read_ahead_chunks: int = 0,
+        read_buffer_bytes: int = 64 * 1024 * 1024,
     ) -> Iterator:
-        """Yield formatted batches for [start, end)."""
+        """Yield formatted batches for [start, end).
+
+        Historical scans can opt into bounded parallel pread with
+        durable_only=True and read_ahead_chunks=1..64. The default keeps the
+        existing mmap/live-ring path. read_buffer_bytes caps submitted/current
+        chunk payloads; formatting/filter temporaries and consumer-held batches
+        are additional memory. Chunks are yielded in capture order, and each
+        batch has at most batch_records rows (batch boundaries may differ).
+        """
         if batch_records <= 0:
             raise ValueError("batch_records must be positive")
         try:
@@ -782,7 +794,18 @@ class Reader:
         except KeyError:
             raise ValueError(f"Timestamp key '{ts_key}' not found, options are: {tuple(self._ts_offset_by_name)}") from None
         dtype = self._dtype
-        for raw in self._iter_raw_range(
+        if read_ahead_chunks:
+            if not durable_only:
+                raise ValueError('Chunk read-ahead requires durable_only=True')
+            from .prefetch import iter_raw
+            for raw in iter_raw(self, start, end, ts_off, batch_records,
+                                read_ahead_chunks, read_buffer_bytes, skip_missing=True):
+                yield format_raw_batch(raw, format, self._unpack, self._rec_size, self._field_names, dtype)
+            return
+        if durable_only and self.feed_registry is None:
+            return
+        iterator = self._iter_durable_raw_range if durable_only else self._iter_raw_range
+        for raw in iterator(
             start,
             end,
             ts_off=ts_off,
