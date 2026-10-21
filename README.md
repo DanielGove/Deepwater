@@ -94,6 +94,25 @@ with Reader(base, 'trades') as reader:
 delete_feed(base, 'trades')
 ```
 
+### Bounded local historical scans
+
+For persistent local fixed-row feeds, opt into parallel chunk reads:
+
+```python
+with Reader(base, 'trades') as reader:
+    for batch in reader.range_batches(start_us, end_us, format='numpy',
+            durable_only=True, read_ahead_chunks=32,
+            read_buffer_bytes=64 * 1024 * 1024):
+        process(batch)
+```
+
+The default keeps the existing mmap/live-ring path. Read-ahead supports 1–64
+workers, preserves capture order and timestamp filtering, and excludes the live
+ring. The byte budget covers submitted/current chunk payloads; formatting
+buffers and batches retained by the consumer use additional memory. A chunk
+larger than the budget fails explicitly. This option is local-only; choose
+concurrency for the storage workload rather than assuming more is faster.
+
 ### Storage Modes
 
 - `persist=True`, `uses_ring=False` or omitted: direct durable chunk writer.
