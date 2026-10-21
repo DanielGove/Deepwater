@@ -238,10 +238,11 @@ class Reader:
 
         if meta.status == ON_DISK:
             chunk_path = self.data_dir / f"chunk_{chunk_id:08d}.bin"
-            if not chunk_path.exists():
+            try:
+                chunk = Chunk.open(str(chunk_path))
+            except BaseException:
                 meta.release()
-                raise FileNotFoundError(f"Chunk file missing: {chunk_path}")
-            chunk = Chunk.open(str(chunk_path))
+                raise
         elif meta.status == EXPIRED:
             meta.release()
             raise RuntimeError(f"Chunk {chunk_id} is expired")
