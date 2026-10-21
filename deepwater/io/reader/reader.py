@@ -295,6 +295,7 @@ class Reader:
                 self._open_chunk(chunk_id)
             except FileNotFoundError:
                 continue
+            self._chunk.advise_sequential()
             buf = self._chunk.buffer
             write_pos = self._chunk_meta.write_pos
             pos = self._chunk_lower_bound(buf, start_us, write_pos, self._rec_size, ts_off)

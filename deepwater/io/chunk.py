@@ -45,6 +45,18 @@ class Chunk:
     def open(cls, file_path: str):
         return cls.open_file(file_path)
 
+    def advise_sequential(self):
+        """Best-effort read-ahead hint for a sequential file scan."""
+        if self.is_shm:
+            return
+        advice = getattr(mmap, "MADV_SEQUENTIAL", None)
+        advise = getattr(self.closeables[0], "madvise", None)
+        if advice is not None and advise is not None:
+            try:
+                advise(advice)
+            except OSError:
+                pass  # An optional performance hint must not prevent reads.
+
     def close_file(self):
         self.buffer.release()
         mm = self.closeables[0]
